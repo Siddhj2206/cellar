@@ -2,6 +2,8 @@
 
 Status: accepted (wayfinder #19, 2026-08)
 
+Amendment (2026-08, implemented in #30): the install session also writes *artifact content* into the bound prefix directory — an installer runs inside it (its own writes create the wine environment), and an archive extracts at the prefix's `drive_c` root. Metadata files stay exclusively the adapter's; "writes are the app service's" now covers the session's artifact handling, not just metadata.
+
 Cellar keeps its entire source-of-truth file tree — settings, prefixes, apps, and the managed runtime inventory — under one root, `$XDG_DATA_HOME/cellar` (default `~/.local/share/cellar`), deliberately deviating from the XDG Base Directory spec's letter (which would put config files in `$XDG_CONFIG_HOME`). The whole tree is one movable unit: prefix directories (potentially gigabytes) and the metadata describing them must move together, and one root matches the umu precedent (`~/.local/share/umu`) that the managed runtime already follows.
 
 ## Considered options

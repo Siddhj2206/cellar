@@ -94,6 +94,67 @@ impl TreeStore {
         self.root.join("cache/launch-logs")
     }
 
+    /// The Start Menu / Desktop areas of one prefix (glossary: Discovery):
+    /// each user's Desktop and Start Menu (the Programs folder is under it
+    /// — one recursive sweep covers both), plus the all-users Start Menu —
+    /// the wine directories installers write shortcuts into. Missing areas
+    /// are skipped: a fresh prefix has none, and an unreadable area must
+    /// not fail the session scanning it (the doctor flags deeper tree
+    /// damage; discovery stays best-effort).
+    fn menu_areas(&self, slug: &str) -> Vec<PathBuf> {
+        const START_MENU: &str = "AppData/Roaming/Microsoft/Windows/Start Menu";
+        let drive_c = self.prefix_dir(slug).join("drive_c");
+        let mut areas = Vec::new();
+        // Every user profile that exists — wine picks the user name; Cellar
+        // must not guess which one an installer wrote to.
+        let users = drive_c.join("users");
+        if let Ok(user_dirs) = read_dir_sorted(&users) {
+            for user in user_dirs {
+                areas.push(user.join("Desktop"));
+                areas.push(user.join(START_MENU));
+            }
+        }
+        // The all-users Start Menu (ProgramData, wine's `Public` profile).
+        areas.push(drive_c.join("ProgramData/Microsoft/Windows/Start Menu"));
+        areas
+    }
+
+    /// Collect `*.exe` regular files under `dir`, recursively, in
+    /// deterministic (sorted) order — the flat counterpart of the `.lnk`
+    /// decode (#31). Symlinks are skipped, not followed: an installer may
+    /// have planted anything in a prefix, and the scan must stay inside the
+    /// prefix's areas — no escapes, no link cycles.
+    fn collect_exes(dir: &Path, out: &mut Vec<Candidate>) -> Result<(), StorageError> {
+        let Ok(entries) = read_dir_sorted(dir) else {
+            // Missing or unreadable area: nothing to collect there (the
+            // area sweep already degrades gracefully — see `menu_areas`).
+            return Ok(());
+        };
+        for path in entries {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                Self::collect_exes(&path, out)?;
+            } else if meta.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            {
+                let label = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push(Candidate { exe: path, label });
+            }
+        }
+        Ok(())
+    }
+
     fn settings_path(&self) -> PathBuf {
         self.root.join("settings.toml")
     }
@@ -528,10 +589,16 @@ impl Storage for TreeStore {
         Ok(health)
     }
 
-    fn discover_executables(&self, _prefix: &Prefix) -> Result<Vec<Candidate>, StorageError> {
-        Err(StorageError::Unimplemented(
-            ".lnk discovery lands with the installer/archive slice (#30)".to_owned(),
-        ))
+    fn discover_executables(&self, prefix: &Prefix) -> Result<Vec<Candidate>, StorageError> {
+        // The flat scan (this slice, #30): every `*.exe` regular file found
+        // recursively under the prefix's menu and desktop areas. `.lnk` target
+        // decoding lands with the discovery slice (#31) — shortcuts are not
+        // candidates until then. Never auto-registers (blueprint §8).
+        let mut candidates = Vec::new();
+        for area in self.menu_areas(&prefix.slug) {
+            Self::collect_exes(&area, &mut candidates)?;
+        }
+        Ok(candidates)
     }
 
     fn install_managed(&self, _manifest: &RunnerManifest) -> Result<PathBuf, StorageError> {
@@ -597,6 +664,84 @@ mod tests {
         }
         let settings = file_text(&root, "settings.toml");
         assert!(settings.starts_with("schema_version = 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_flat_scan_finds_exes_across_menu_and_desktop_areas() -> Result<(), StorageError> {
+        // An installer dropped a game next to its shortcut — nested Start
+        // Menu dirs, several user profiles, an all-users shortcut, and
+        // non-exe noise the scan must ignore (the `.lnk` itself waits for
+        // the decode slice, #31).
+        let (store, root) = store("discovery");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default");
+        let me_desktop = prefix_dir.join("drive_c/users/me/Desktop");
+        let me_menu = prefix_dir
+            .join("drive_c/users/me/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/My Game");
+        let other_desktop = prefix_dir.join("drive_c/users/another/Desktop");
+        let all_users =
+            prefix_dir.join("drive_c/ProgramData/Microsoft/Windows/Start Menu/Programs");
+        for dir in [&me_desktop, &me_menu, &other_desktop, &all_users] {
+            fs::create_dir_all(dir).unwrap_or_else(|e| panic!("mkdir {dir:?}: {e}"));
+        }
+        fs::write(me_desktop.join("Tool.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(me_desktop.join("readme.txt"), "hi").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(me_menu.join("Nested Game.EXE"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(me_menu.join("My Game.lnk"), "opaque").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(other_desktop.join("Other.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(all_users.join("Shared.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let candidates = store.discover_executables(&prefix)?;
+        let found: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            found,
+            ["Other", "Tool", "Nested Game", "Shared"],
+            "every user's areas (sorted) and the all-users menu, exes only"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.exe.starts_with(&prefix_dir) && c.exe.extension().is_some()),
+            "candidates are real files under the prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discovery_skips_symlinks_and_stays_inside_the_prefix() -> Result<(), StorageError> {
+        use std::os::unix::fs::symlink;
+
+        let (store, root) = store("discovery-links");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default");
+        let desktop = prefix_dir.join("drive_c/users/me/Desktop");
+        fs::create_dir_all(&desktop).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        // An outside directory carrying an exe, linked into the menu area —
+        // the scan must not follow it out of the prefix.
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(outside.join("sneaky.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        symlink(&outside, desktop.join("escape")).unwrap_or_else(|e| panic!("symlink: {e}"));
+        // A link cycle (a menu subdir linking back up) must terminate too.
+        symlink(&desktop, desktop.join("cycle")).unwrap_or_else(|e| panic!("symlink: {e}"));
+        fs::write(desktop.join("Real.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let candidates = store.discover_executables(&prefix)?;
+        let found: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(
+            found,
+            ["Real"],
+            "no escapes, no cycles — the scan stays inside the prefix's areas"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_on_a_fresh_prefix_is_empty() -> Result<(), StorageError> {
+        // No drive_c yet, no areas — the scan yields nothing, never fails.
+        let (store, _root) = store("discovery-empty");
+        let prefix = store.create_prefix("default")?;
+        assert_eq!(store.discover_executables(&prefix)?, Vec::new());
         Ok(())
     }
 
@@ -1041,13 +1186,24 @@ mod tests {
     }
 
     #[test]
-    fn discover_and_installer_stubs_are_loud() -> Result<(), StorageError> {
+    fn installer_pipeline_stub_is_loud() {
+        // The managed-runner pipeline is the last storage stub — it stays
+        // loud until the managed-runtime slice (#34). Discovery is real
+        // since #30.
         let (store, _) = store("stubs");
-        let prefix = store.create_prefix("games")?;
+        let manifest = RunnerManifest {
+            provider_id: "proton".to_owned(),
+            source: cellar_core::manifest::ReleaseSource {
+                url_template: "https://example.test/proton-{tag}-{arch}.tar.gz".to_owned(),
+                checksum_url_template: None,
+            },
+            checksum: cellar_core::manifest::ChecksumScheme::Sha512,
+            archive: cellar_core::manifest::ArchiveLayout::ExtractsToSingleRootDir,
+            install_kind: cellar_core::manifest::InstallKind::CompatTool,
+        };
         assert!(matches!(
-            store.discover_executables(&prefix),
+            store.install_managed(&manifest),
             Err(StorageError::Unimplemented(_))
         ));
-        Ok(())
     }
 }

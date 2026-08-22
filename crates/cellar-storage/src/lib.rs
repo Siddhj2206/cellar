@@ -1,13 +1,15 @@
 //! The Cellar storage layer (blueprint §6, ADR 0001): the sole writer of the
-//! file tree — TOML mapping, `.lnk` discovery, the shared installer pipeline,
-//! XDG path resolution — implementing the `core::ports::Storage` seam. One
-//! external system, one port.
+//! file tree — TOML mapping, the flat discovery scan of the prefix's
+//! menu/desktop areas, the shared installer pipeline, XDG path resolution —
+//! implementing the `core::ports::Storage` seam. One external system, one
+//! port.
 //!
-//! This slice (#26) delivers the tree: root resolution, first-run
+//! This slice (#26) delivered the tree: root resolution, first-run
 //! initialization, settings and prefix/app file mapping, atomic writes, and
-//! the tree-health report the doctor renders. `.lnk` discovery and the
-//! installer pipeline land with their own slices (#27, #34) and currently
-//! return the honest `StorageError::Unimplemented`.
+//! the tree-health report the doctor renders. The flat discovery scan lands
+//! with #30 (`.lnk` target decoding follows with #31); the managed-runner
+//! installer pipeline lands with #34 and currently returns the honest
+//! `StorageError::Unimplemented`.
 
 pub mod tree;
 

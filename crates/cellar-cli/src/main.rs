@@ -6,28 +6,31 @@
 //! future `cellar-gui` leaf; flipping primary is `default-members`, zero
 //! edits below presentation.
 //!
-//! Surface for this slice (#29): `cellar launch <app>` executes the frozen
-//! plan — foreground by default with the game's exit code propagated raw,
-//! `--detach` releasing the process from the terminal, `-n/--dry-run`
-//! printing the plan spawn-free — on top of #27's install/list/uninstall,
-//! #26's `cellar prefix …` and `cellar doctor`. Exit codes (ADR 0004):
+//! Surface for this slice (#30): `cellar install <path>` handles all three
+//! artifact branches — `--artifact standalone` registers without executing
+//! (the #27 branch, unchanged), `installer` runs inside the prefix with its
+//! exit awaited, `archive` extracts into it — each followed by the flat
+//! discovery scan of the prefix's menu/desktop areas (the keep/hide review
+//! lands with #31) — on top of #29's `cellar launch <app>`, #27's
+//! install/list/uninstall, #26's `cellar prefix …` and `cellar doctor`.
+//! Exit codes (ADR 0004):
 //! 0 success, 1 operation error or doctor problems, 2 usage; `launch`
 //! propagates the game's exit code raw (§7), the collision with 1
 //! documented, not mapped.
 
 use clap::{Args, Parser, Subcommand};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use cellar_app::{
-    DoctorService, InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService,
+    ArtifactKind, DoctorService, InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService,
 };
 use cellar_core::ports::{__sealed, RunnerResolver};
 use cellar_core::{
-    AppEntry, AppKind, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerRef, RunnerSpec,
-    TreeHealth,
+    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerRef,
+    RunnerSpec, TreeHealth,
 };
 use cellar_providers::all_resolvers;
 use cellar_storage::TreeStore;
@@ -42,7 +45,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Register a standalone Windows exe without executing anything.
+    /// Install a Windows artifact — standalone exe, installer, or archive
+    /// (three-armed handling, blueprint §8).
     Install(InstallArgs),
     /// List every registered app with its status.
     List(ListArgs),
@@ -61,7 +65,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct InstallArgs {
-    /// Path to the Windows executable to register.
+    /// Path to the Windows artifact to install.
     path: PathBuf,
     /// Prefix to bind the entry to; created when missing.
     #[arg(long, default_value = "default")]
@@ -73,6 +77,14 @@ struct InstallArgs {
     /// tools → wine).
     #[arg(long, value_parser = AppKind::from_str, default_value = "game")]
     kind: AppKind,
+    /// How to handle the artifact: standalone registers without executing;
+    /// installer runs inside the prefix with its exit awaited; archive
+    /// extracts into the prefix. Defaults to `standalone` — the #27
+    /// behavior, unchanged for existing invocations; the interactive
+    /// question with its filename-hint default lands with the discovery
+    /// slice (#31).
+    #[arg(long, value_parser = ArtifactKind::from_str, default_value = "standalone")]
+    artifact: ArtifactKind,
 }
 
 #[derive(Debug, Args)]
@@ -156,28 +168,9 @@ fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let store = TreeStore::from_env()?;
     match cli.command {
-        Command::Install(args) => {
-            let service = InstallService::new(store.clone());
-            let result =
-                service.install(&args.path, &args.prefix, args.name.as_deref(), args.kind)?;
-            // The flagship summary (blueprint §8 step 4): what was
-            // registered, plus the next command.
-            let verb = if result.was_update {
-                "Updated"
-            } else {
-                "Registered"
-            };
-            println!(
-                "{verb} '{}' ({}) in prefix '{}'",
-                result.entry.slug,
-                result.entry.kind.as_str(),
-                result.entry.prefix
-            );
-            println!("Run it with: cellar launch {}", result.entry.slug);
-            Ok(ExitCode::SUCCESS)
-        }
+        Command::Install(args) => run_install(&store, &args),
         Command::List(args) => {
-            let service = InstallService::new(store.clone());
+            let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
             let entries = service.list()?;
             print!("{}", render_app_list(&entries, args.json)?);
             Ok(ExitCode::SUCCESS)
@@ -213,7 +206,7 @@ fn run() -> anyhow::Result<ExitCode> {
             Ok(exit_code_for(status))
         }
         Command::Uninstall(args) => {
-            let service = InstallService::new(store);
+            let service = InstallService::new(store, ResolverSet::new(all_resolvers()));
             service.uninstall(&args.slug)?;
             // Glossary: Uninstall — entry removal for now; Cellar never
             // deletes the app's own files.
@@ -281,6 +274,90 @@ fn exit_code_for(status: ExitStatus) -> ExitCode {
 /// rather than silently truncating a code the terminal never reported.
 fn raw_exit_code(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
+}
+
+/// The `cellar install` handler (blueprint §8): the session over the
+/// artifact branch, then the per-branch summary and the discovery review
+/// preview. The standalone summary is the #27 surface, unchanged.
+fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode> {
+    let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+    let outcome = service.install(
+        &args.path,
+        &args.prefix,
+        args.name.as_deref(),
+        args.kind,
+        args.artifact,
+    )?;
+    match args.artifact {
+        // The flagship summary (blueprint §8 step 4): what was registered,
+        // plus the next command.
+        ArtifactKind::Standalone => {
+            let result = outcome
+                .registrations
+                .first()
+                .expect("a standalone session registers exactly once");
+            let verb = if result.was_update {
+                "Updated"
+            } else {
+                "Registered"
+            };
+            println!(
+                "{verb} '{}' ({}) in prefix '{}'",
+                result.entry.slug,
+                result.entry.kind.as_str(),
+                result.entry.prefix
+            );
+            println!("Run it with: cellar launch {}", result.entry.slug);
+        }
+        ArtifactKind::Installer => {
+            println!(
+                "Ran installer '{}' in prefix '{}'",
+                file_name(&args.path),
+                outcome.prefix_slug
+            );
+            if let Some(log) = &outcome.log_path {
+                println!("output: {}", log.display());
+            }
+            print_candidates(&outcome.candidates);
+        }
+        ArtifactKind::Archive => {
+            println!(
+                "Extracted '{}' into prefix '{}'",
+                file_name(&args.path),
+                outcome.prefix_slug
+            );
+            print_candidates(&outcome.candidates);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The last path component for presentation, or the whole path when it has
+/// none (e.g. `install /tmp/setup.exe` → `setup.exe`).
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// The discovery review preview (blueprint §8 step 3). This slice presents
+/// the flat scan only — the interactive keep/hide review and registration
+/// land with the discovery slice (#31).
+fn print_candidates(candidates: &[Candidate]) {
+    if candidates.is_empty() {
+        println!("No executable candidates in the prefix's menu/desktop areas");
+        return;
+    }
+    println!("Executable candidates found in the prefix's menu/desktop areas:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        println!(
+            "  {}. {} — {}",
+            index + 1,
+            candidate.label,
+            candidate.exe.display()
+        );
+    }
 }
 
 /// A column table: header row, blank line, then padded, two-space-separated
@@ -571,13 +648,23 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use cellar_app::{EntryStatus, InstallService, ListedEntry, PrefixService};
+    use cellar_app::{
+        EntryStatus, InstallOutcome, InstallResult, InstallService, ListedEntry, PrefixService,
+    };
     use cellar_core::ports::Storage as _;
     use cellar_core::{
         AppEntry, AppKind, Overrides, PrefixDefaults, RunnerFamily, RunnerInstall, RunnerRef,
     };
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// The one registration of a standalone session — e2e tests unwrap it
+    /// (sessions may register many once review lands, #31).
+    fn only_registration(outcome: InstallOutcome) -> InstallResult {
+        let mut registrations = outcome.registrations;
+        assert_eq!(registrations.len(), 1, "expected exactly one registration");
+        registrations.pop().expect("length asserted above")
+    }
 
     #[test]
     fn parses_prefix_create() {
@@ -690,6 +777,11 @@ mod tests {
             "the name defaults to the exe file name"
         );
         assert_eq!(args.kind, AppKind::Game, "the default kind is `game`");
+        assert_eq!(
+            args.artifact,
+            ArtifactKind::Standalone,
+            "the unchanged default keeps `cellar install <exe>` behavior"
+        );
         let cli = Cli::try_parse_from([
             "cellar",
             "install",
@@ -708,6 +800,26 @@ mod tests {
         assert_eq!(args.prefix, "games");
         assert_eq!(args.name.as_deref(), Some("Balatro"));
         assert_eq!(args.kind, AppKind::Tool);
+    }
+
+    #[test]
+    fn parses_the_artifact_branch_flag() {
+        for (flag, expected) in [
+            ("installer", ArtifactKind::Installer),
+            ("archive", ArtifactKind::Archive),
+            ("standalone", ArtifactKind::Standalone),
+        ] {
+            let cli = Cli::try_parse_from(["cellar", "install", "x.exe", "--artifact", flag])
+                .unwrap_or_else(|e| panic!("parse --artifact {flag}: {e}"));
+            let Command::Install(args) = cli.command else {
+                panic!("unexpected command");
+            };
+            assert_eq!(args.artifact, expected);
+        }
+        assert!(
+            Cli::try_parse_from(["cellar", "install", "x.exe", "--artifact", "bundle"]).is_err(),
+            "an unknown artifact branch is a usage error"
+        );
     }
 
     #[test]
@@ -931,12 +1043,18 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("cellar-cli-e2e-apps-{}-{seq}", std::process::id()));
         let store = TreeStore::new(root.clone());
-        let service = InstallService::new(store.clone());
+        let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
         let exe = root.join("drive_c/My Game.exe");
         std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))
             .unwrap_or_else(|e| panic!("mkdir: {e}"));
         std::fs::write(&exe, "MZ").unwrap_or_else(|e| panic!("write: {e}"));
-        let first = service.install(&exe, "default", None, AppKind::Game)?;
+        let first = only_registration(service.install(
+            &exe,
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Standalone,
+        )?);
         assert!(!first.was_update);
         assert_eq!(first.entry.slug, "my-game");
         assert_eq!(
@@ -944,7 +1062,13 @@ mod tests {
             std::fs::canonicalize(&exe).unwrap_or_else(|e| panic!("canonicalize: {e}")),
             "identity is the canonical exe path"
         );
-        let second = service.install(&exe, "default", None, AppKind::Tool)?;
+        let second = only_registration(service.install(
+            &exe,
+            "default",
+            None,
+            AppKind::Tool,
+            ArtifactKind::Standalone,
+        )?);
         assert!(second.was_update, "re-install updates the same entry");
         assert_eq!(second.entry.slug, "my-game");
         assert_eq!(service.list()?.len(), 1);
@@ -1141,12 +1265,15 @@ mod tests {
         let exe = root.join("drive_c/tool.exe");
         std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(&exe, "MZ")?;
-        let registered = InstallService::new(store.clone()).install(
-            &exe,
-            "default",
-            Some("My Tool"),
-            AppKind::Tool,
-        )?;
+        let registered = only_registration(
+            InstallService::new(store.clone(), ResolverSet::new(all_resolvers())).install(
+                &exe,
+                "default",
+                Some("My Tool"),
+                AppKind::Tool,
+                ArtifactKind::Standalone,
+            )?,
+        );
         let mut prefix = store.load_prefix("default")?;
         prefix.defaults.runner = Some(RunnerSpec::with_configured(
             RunnerFamily::Wine,
@@ -1245,12 +1372,15 @@ mod tests {
         let exe = root.join("drive_c/tool.exe");
         std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(&exe, "MZ")?;
-        let registered = InstallService::new(store.clone()).install(
-            &exe,
-            "default",
-            Some("My Tool"),
-            AppKind::Tool,
-        )?;
+        let registered = only_registration(
+            InstallService::new(store.clone(), ResolverSet::new(all_resolvers())).install(
+                &exe,
+                "default",
+                Some("My Tool"),
+                AppKind::Tool,
+                ArtifactKind::Standalone,
+            )?,
+        );
         let mut prefix = store.load_prefix("default")?;
         prefix.defaults.runner = Some(RunnerSpec::with_configured(
             RunnerFamily::Wine,
@@ -1299,18 +1429,173 @@ mod tests {
         std::fs::create_dir_all(&game_root)?;
         let game_exe = game_root.join("game.exe");
         std::fs::write(&game_exe, "MZ")?;
-        let game = InstallService::new(store.clone()).install(
-            &game_exe,
-            &games.slug,
-            None,
-            AppKind::Game,
-        )?;
+        let game = only_registration(
+            InstallService::new(store.clone(), ResolverSet::new(all_resolvers())).install(
+                &game_exe,
+                &games.slug,
+                None,
+                AppKind::Game,
+                ArtifactKind::Standalone,
+            )?,
+        );
         let app = LaunchApp::new(second_store, ResolverSet::new(all_resolvers()));
         let err = app.plan(&game.entry.slug, &[]).expect_err("no proton yet");
         assert!(
             err.to_string().contains("proton"),
             "the SuggestInstall message names the family: {err}"
         );
+        Ok(())
+    }
+
+    /// Build a ZIP with the given `(name, contents)` pairs — the CLI's
+    /// mirror of the fixtures cellar-app owns (a shared harness crate stays
+    /// out per the locked §4 graph); kept write→close so it cannot drift.
+    fn build_zip(path: &Path, entries: &[(&str, &str)]) {
+        use std::io::Write;
+
+        use zip::write::SimpleFileOptions;
+
+        let file = std::fs::File::create(path).unwrap_or_else(|e| panic!("create: {e}"));
+        let mut zip = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        for (name, contents) in entries {
+            zip.start_file(*name, options)
+                .unwrap_or_else(|e| panic!("start {name}: {e}"));
+            zip.write_all(contents.as_bytes())
+                .unwrap_or_else(|e| panic!("write {name}: {e}"));
+        }
+        zip.finish().unwrap_or_else(|e| panic!("finish: {e}"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_installer_branch_end_to_end_with_a_stub_wine() -> anyhow::Result<()> {
+        use cellar_core::ConfiguredRunner;
+
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-installer-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        // The configured stub runner plays wine; the stub installer plants
+        // an exe in the prefix's Desktop area and reports success — the
+        // full installer → awaited exit → discovery loop, in one binary.
+        let wine = root.join("stub-wine");
+        write_stub_script(
+            &wine,
+            "mkdir -p \"$WINEPREFIX/drive_c/users/me/Desktop\"\n\
+             echo \"MZ\" > \"$WINEPREFIX/drive_c/users/me/Desktop/game.exe\"\n\
+             exit 0\n",
+        )?;
+        let installer = root.join("setup.exe");
+        std::fs::write(&installer, "MZ-setup")?;
+        PrefixService::new(store.clone()).create("default")?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(wine),
+        ));
+        store.save_prefix(&prefix)?;
+        let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let outcome = service.install(
+            &installer,
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Installer,
+        )?;
+        assert!(outcome.registrations.is_empty(), "nothing registers yet");
+        assert_eq!(outcome.prefix_slug, "default");
+        let log = outcome.log_path.expect("the installer run has a log");
+        assert!(log.starts_with(store.launch_logs_dir()));
+        assert!(log.is_file());
+        assert_eq!(outcome.candidates.len(), 1, "the planted exe is found");
+        assert_eq!(outcome.candidates[0].label, "game");
+        assert!(
+            outcome.candidates[0].exe.ends_with("Desktop/game.exe"),
+            "candidate path: {}",
+            outcome.candidates[0].exe.display()
+        );
+        // A failed installer aborts the session with the raw exit code.
+        let failing = root.join("stub-failing-wine");
+        write_stub_script(&failing, "exit 7\n")?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(failing),
+        ));
+        store.save_prefix(&prefix)?;
+        let service = InstallService::new(store, ResolverSet::new(all_resolvers()));
+        let err = service
+            .install(
+                &installer,
+                "default",
+                None,
+                AppKind::Game,
+                ArtifactKind::Installer,
+            )
+            .expect_err("failed installer aborts");
+        assert!(
+            matches!(
+                &err,
+                cellar_app::InstallError::InstallerFailed {
+                    code: Some(7),
+                    signal: None
+                }
+            ),
+            "the exit code is reported raw: {err}"
+        );
+        assert!(err.to_string().contains("session aborted"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn install_archive_branch_end_to_end() -> anyhow::Result<()> {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-archive-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let bundle = root.join("bundle.zip");
+        build_zip(
+            &bundle,
+            &[("game/Game.exe", "MZ"), ("game/data/level.bin", "level")],
+        );
+        let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let outcome = service.install(
+            &bundle,
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Archive,
+        )?;
+        // The archive landed at the prefix's wine root, structure intact.
+        let drive_c = root.join("prefixes/default/drive_c");
+        assert_eq!(
+            std::fs::read(drive_c.join("game/Game.exe")).unwrap_or_default(),
+            b"MZ"
+        );
+        assert!(drive_c.join("game/data/level.bin").is_file());
+        assert!(outcome.candidates.is_empty(), "no menu areas yet");
+        assert!(
+            service.list()?.is_empty(),
+            "an archive registers nothing yet"
+        );
+        // Path-traversal is refused end-to-end, naming the entry.
+        let evil = root.join("evil.zip");
+        build_zip(&evil, &[("../evil.exe", "MZ")]);
+        let err = service
+            .install(&evil, "default", None, AppKind::Game, ArtifactKind::Archive)
+            .expect_err("traversal must be refused");
+        assert!(
+            err.to_string().contains("escape the prefix"),
+            "the refusal is named: {err}"
+        );
+        assert!(!root.join("prefixes").join("evil.exe").exists());
         Ok(())
     }
 }

@@ -8,15 +8,21 @@
 //! list with status, uninstall) on top of #26's prefix lifecycle and
 //! tree-health doctor; the launch pipeline ships as `LaunchApp::plan`
 //! (#28, dry-run) and `LaunchApp::spawn` (#29, execute — `--detach` and
-//! per-launch logs are the presentation's policy). `FirstRunInstall`'s
-//! interactive session lands with its own slice (#30+), as do the managed
-//! install and runner-integrity doctor sections.
+//! per-launch logs are the presentation's policy); the install session's
+//! other two artifact branches — installer (run inside the prefix, exit
+//! awaited) and archive (extract into it, path-traversal-safe) — ship with
+//! the flat discovery scan in #30 (candidate review and multi-registration
+//! land with #31). `FirstRunInstall`'s interactive session lands with #31+,
+//! as do the managed install and runner-integrity doctor sections.
 
+pub mod archive;
 pub mod services;
 
+pub use archive::{ArchiveError, extract_zip};
+
 pub use services::{
-    DoctorService, EntryStatus, InstallResult, InstallService, LaunchApp, ListedEntry,
-    PrefixService,
+    ArtifactKind, DoctorService, EntryStatus, InstallError, InstallOutcome, InstallResult,
+    InstallService, LaunchApp, ListedEntry, PrefixService,
 };
 
 // The launch surface presentations consume — through `app`, never directly

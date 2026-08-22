@@ -108,8 +108,11 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// is on disk, never initializes anything.
     fn tree_health(&self) -> Result<TreeHealth, StorageError>;
 
-    /// Discovery: read the prefix's Start Menu / Desktop `.lnk` files and
-    /// list candidate executables for user review. Never auto-registers.
+    /// Discovery: the prefix's Start Menu / Desktop areas, scanned for
+    /// executable candidates the user reviews. Never auto-registers. This
+    /// slice (#30) implements the flat scan — the `*.exe` files found in
+    /// the areas, recursively, in deterministic order; `.lnk` target
+    /// decoding lands with the discovery slice (#31).
     fn discover_executables(&self, prefix: &Prefix) -> Result<Vec<Candidate>, StorageError>;
 
     /// The shared installer pipeline — fetch, verify, extract, flock,

@@ -1,13 +1,15 @@
-//! Application use-cases: the `AppEntry` registry — standalone install
-//! (registered without executing), app list with per-entry status, uninstall
-//! degrading to entry removal (#27) — the prefix lifecycle and the
-//! tree-health doctor check (#26), and the `LaunchApp` use-case (#28):
-//! resolve → check → plan with nothing spawning. Thin orchestration over
-//! the `Storage` port — concrete adapters are injected only at the
+//! Application use-cases: the `AppEntry` registry — install with the
+//! three-armed artifact handling (standalone registers without executing,
+//! installer runs inside the prefix with its exit awaited, archive extracts
+//! into it — each followed by the flat discovery scan, #30) — app list with
+//! per-entry status, uninstall degrading to entry removal (#27), the prefix
+//! lifecycle and the tree-health doctor check (#26), and the `LaunchApp`
+//! use-case (#28/#29): resolve → check → plan → execute. Thin orchestration
+//! over the `core` ports — concrete adapters are injected only at the
 //! composition root.
 
 use cellar_core::Prefix;
-use cellar_core::entities::{AppEntry, AppKind, Overrides};
+use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
 use cellar_core::errors::StorageError;
 use cellar_core::health::TreeHealth;
 use cellar_core::ports::{RunnerResolver, Storage};
@@ -16,7 +18,12 @@ use cellar_core::types::{LaunchPlan, RunnerSpec};
 use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::str::FromStr;
+
+use crate::archive::{ArchiveError, extract_zip};
 
 /// The check-phase status of a registered entry (blueprint §7: the check
 /// phase applied entry-wide). This slice checks the registered exe's
@@ -55,7 +62,7 @@ pub struct ListedEntry {
     pub prefix_runner: Option<RunnerSpec>,
 }
 
-/// The result of a standalone registration.
+/// The result of a registration that happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallResult {
     pub entry: AppEntry,
@@ -64,71 +71,252 @@ pub struct InstallResult {
     pub was_update: bool,
 }
 
-/// The `AppEntry` registry: standalone install, list with status, uninstall.
-/// Identity is the canonical exe path — re-installing the same exe updates
-/// the same entry (blueprint §6, §8); the slug is the display/file name with
-/// `-2` dedupe.
-pub struct InstallService<S: Storage> {
-    storage: S,
+/// The result of one session (glossary: InstallSession): the prefix it
+/// touched, the entries registered — this slice: standalone only; candidate
+/// review and multi-registration land with #31 — and, for the running and
+/// extracting branches, the flat discovery scan of the prefix's menu and
+/// desktop areas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallOutcome {
+    /// The prefix the session touched — the bound one, created when missing.
+    pub prefix_slug: String,
+    pub registrations: Vec<InstallResult>,
+    /// Executable candidates found after the artifact ran or extracted
+    /// (flat scan, `.lnk` decoding lands with #31). Empty for standalone.
+    pub candidates: Vec<Candidate>,
+    /// The artifact-run log under the disposable cache (installer branch —
+    /// the run's output always lands in a per-launch log, blueprint §7).
+    pub log_path: Option<PathBuf>,
 }
 
-impl<S: Storage> InstallService<S> {
-    /// The service over one storage adapter.
-    pub fn new(storage: S) -> Self {
-        Self { storage }
+/// The artifact branch of `cellar install` (blueprint §8 step 2): how the
+/// artifact is handled inside the session. The flag replaces the interactive
+/// question with its filename-hint default, which lands with the discovery
+/// slice (#31) — the branch is never guessed silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    /// Register the exe without executing anything (the #27 branch).
+    Standalone,
+    /// Run the installer inside the bound prefix, awaiting its exit.
+    Installer,
+    /// Extract the archive into the bound prefix.
+    Archive,
+}
+
+impl FromStr for ArtifactKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "standalone" => Ok(Self::Standalone),
+            "installer" => Ok(Self::Installer),
+            "archive" => Ok(Self::Archive),
+            other => Err(format!(
+                "expected standalone, installer, or archive, got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Session failures of `cellar install` (blueprint §8 step 2): the storage
+/// and launch taxonomies passed through, the installer's own exit, and
+/// archive extraction — each in its own vocabulary, with the fix where the
+/// pipeline defines one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallError {
+    Storage(StorageError),
+    /// The installer's plan could not be built, spawned, or captured — the
+    /// launch pipeline's taxonomy (the installer running but failing is
+    /// [`InstallError::InstallerFailed`]).
+    Launch(LaunchError),
+    /// The installer ran but failed: the session aborts, nothing is
+    /// registered. The exit facts are reported raw (Runtime family,
+    /// blueprint §7) — no magic mapping.
+    InstallerFailed {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    Archive(ArchiveError),
+}
+
+impl From<StorageError> for InstallError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<LaunchError> for InstallError {
+    fn from(error: LaunchError) -> Self {
+        Self::Launch(error)
+    }
+}
+
+impl From<ArchiveError> for InstallError {
+    fn from(error: ArchiveError) -> Self {
+        Self::Archive(error)
+    }
+}
+
+impl fmt::Display for InstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(error) => write!(f, "{error}"),
+            Self::Launch(error) => write!(f, "{error}"),
+            Self::InstallerFailed { code, signal } => match (code, signal) {
+                (Some(code), _) => write!(
+                    f,
+                    "the installer failed: exited with code {code} — the session aborted"
+                ),
+                (None, Some(signal)) => write!(
+                    f,
+                    "the installer failed: terminated by signal {signal} — the session aborted"
+                ),
+                (None, None) => write!(f, "the installer failed — the session aborted"),
+            },
+            Self::Archive(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
+
+/// The `AppEntry` registry and install session (blueprint §8: `cellar
+/// install <path>` is the flagship flow). Identity is the canonical exe
+/// path — re-installing the same exe updates the same entry (blueprint §6,
+/// §8); the slug is the display/file name with `-2` dedupe. This slice
+/// (#30) delivers the closed three-armed artifact handling (blueprint §5):
+/// standalone, installer (run inside the bound prefix, exit awaited),
+/// archive (extract into it) — the running/extracting branches then
+/// collect the prefix's menu/desktop candidates for review.
+pub struct InstallService<S: Storage, R: RunnerResolver> {
+    storage: S,
+    resolver: R,
+}
+
+impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
+    /// The service over one storage adapter and one resolver — the
+    /// composition root injects the concrete registry composite (#28).
+    pub fn new(storage: S, resolver: R) -> Self {
+        Self { storage, resolver }
     }
 
-    /// Register a standalone Windows exe without executing anything
-    /// (blueprint §8: the standalone branch of the flagship flow). Binds the
-    /// entry to `prefix`, picking or creating it. Re-installing the same exe
-    /// updates the same entry — its slug and identity stay, its kind and
-    /// prefix binding take the new flags.
+    /// The flagship flow's artifact handling (blueprint §8 steps 1–3 for
+    /// now; the interactive review and summary complete the flow with #31):
+    /// bind or create the prefix, then handle the artifact per its
+    /// [`ArtifactKind`]. Standalone registers without executing (the #27
+    /// branch, unchanged); installer runs inside the prefix with its exit
+    /// awaited — a failed installer aborts the session with
+    /// [`InstallError::InstallerFailed`]; archive extracts into the
+    /// prefix's wine root, path-traversal-safe. The running/extracting
+    /// branches then collect the prefix's menu/desktop executable
+    /// candidates for review (flat scan; `.lnk` decoding lands with #31).
     pub fn install(
         &self,
-        exe: &Path,
+        path: &Path,
         prefix: &str,
         name: Option<&str>,
         kind: AppKind,
-    ) -> Result<InstallResult, StorageError> {
-        let canonical = self.storage.canonicalize_exe(exe)?;
-        if !is_exe(&canonical) {
-            return Err(StorageError::Invalid(format!(
-                "{}: not a Windows executable — only .exe files are registered standalone",
-                canonical.display()
-            )));
-        }
+        artifact: ArtifactKind,
+    ) -> Result<InstallOutcome, InstallError> {
         if !slug::is_valid_slug(prefix) {
-            return Err(StorageError::Invalid(format!(
-                "invalid prefix slug {prefix:?}"
-            )));
+            return Err(StorageError::Invalid(format!("invalid prefix slug {prefix:?}")).into());
         }
-        // Determine the display name up front — an unslugifiable name is
-        // rejected before any side effect. On a re-install the entry keeps
-        // its slug, so an unusable `name` is a user error to surface, never
-        // silently ignored.
-        let display_name = match name {
-            Some(name) => name.to_owned(),
-            None => canonical
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+        // The file-exists preflight every branch shares; the shape check is
+        // branch-specific (an archive may be any regular file — the content
+        // decides, `NotAnArchive`).
+        let canonical = self.storage.canonicalize_exe(path)?;
+        if artifact != ArtifactKind::Archive && !is_exe(&canonical) {
+            return Err(StorageError::Invalid(format!(
+                "{}: not a Windows executable — only .exe files are installed \
+                 standalone or as installers",
+                canonical.display()
+            ))
+            .into());
+        }
+        // The standalone branch's naming is decided up front — an
+        // unslugifiable display name is rejected before any side effect
+        // (the #27 behavior, unchanged).
+        let standalone_base = if artifact == ArtifactKind::Standalone {
+            let display_name = match name {
+                Some(name) => name.to_owned(),
+                None => canonical
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            };
+            let base = slug::slugify(&display_name);
+            if base.is_empty() {
+                return Err(StorageError::Invalid(format!(
+                    "cannot form an app slug from {display_name:?}"
+                ))
+                .into());
+            }
+            Some(base)
+        } else {
+            None
         };
-        let base = slug::slugify(&display_name);
-        if base.is_empty() {
-            return Err(StorageError::Invalid(format!(
-                "cannot form an app slug from {display_name:?}"
-            )));
-        }
         // Pick or create the bound prefix (blueprint §8 step 1, default
         // `default`). A missing or broken hand-edited prefix yields a fresh
         // sibling via the storage dedupe — never a clobber (ADR 0001).
-        let prefix_slug = match self.storage.load_prefix(prefix) {
-            Ok(_) => prefix.to_owned(),
+        let bound = match self.storage.load_prefix(prefix) {
+            Ok(existing) => existing,
             Err(StorageError::NotFound(_) | StorageError::Invalid(_)) => {
-                self.storage.create_prefix(prefix)?.slug
+                self.storage.create_prefix(prefix)?
             }
-            Err(other) => return Err(other),
+            Err(other) => return Err(InstallError::Storage(other)),
         };
+        let prefix_slug = bound.slug.clone();
+        match artifact {
+            ArtifactKind::Standalone => {
+                let base = standalone_base
+                    .as_deref()
+                    .expect("the standalone base was computed above");
+                let result = self.register_standalone(&canonical, &prefix_slug, kind, base)?;
+                Ok(InstallOutcome {
+                    prefix_slug,
+                    registrations: vec![result],
+                    candidates: Vec::new(),
+                    log_path: None,
+                })
+            }
+            ArtifactKind::Installer => {
+                let (log_path, candidates) = self.run_installer(&canonical, &bound)?;
+                Ok(InstallOutcome {
+                    prefix_slug,
+                    registrations: Vec::new(),
+                    candidates,
+                    log_path: Some(log_path),
+                })
+            }
+            ArtifactKind::Archive => {
+                let dest = self.storage.prefix_dir(&prefix_slug).join("drive_c");
+                extract_zip(&canonical, &dest)?;
+                let candidates = self
+                    .storage
+                    .discover_executables(&bound)
+                    .map_err(InstallError::Storage)?;
+                Ok(InstallOutcome {
+                    prefix_slug,
+                    registrations: Vec::new(),
+                    candidates,
+                    log_path: None,
+                })
+            }
+        }
+    }
+
+    /// The standalone branch (blueprint §8: register without executing) —
+    /// the #27 logic, unchanged. Re-installing the same exe updates the
+    /// same entry — its slug and identity stay, its kind and prefix binding
+    /// take the new flags. The display name was already judged usable by
+    /// the session preflight (no side effects on a bad name).
+    fn register_standalone(
+        &self,
+        canonical: &Path,
+        prefix_slug: &str,
+        kind: AppKind,
+        base: &str,
+    ) -> Result<InstallResult, StorageError> {
         // Identity is the canonical exe path: re-install finds the existing
         // entry and updates it in place.
         if let Some(mut existing) = self
@@ -138,7 +326,7 @@ impl<S: Storage> InstallService<S> {
             .find(|app| app.exe == canonical)
         {
             existing.kind = kind;
-            existing.prefix = prefix_slug;
+            prefix_slug.clone_into(&mut existing.prefix);
             self.storage.save_app(&existing)?;
             return Ok(InstallResult {
                 entry: existing,
@@ -149,10 +337,10 @@ impl<S: Storage> InstallService<S> {
         // entry is sidestepped, never overwritten (ADR 0001).
         let taken: BTreeSet<String> = self.storage.list_app_slugs()?.into_iter().collect();
         let app = AppEntry {
-            slug: slug::dedupe_slug(&base, &taken),
-            exe: canonical,
+            slug: slug::dedupe_slug(base, &taken),
+            exe: canonical.to_path_buf(),
             kind,
-            prefix: prefix_slug,
+            prefix: prefix_slug.to_owned(),
             overrides: Overrides::default(),
             runner: None,
             source_installer: None,
@@ -163,6 +351,57 @@ impl<S: Storage> InstallService<S> {
             entry: app,
             was_update: false,
         })
+    }
+
+    /// The installer branch (blueprint §8 step 2: "installer: run inside
+    /// the prefix, exit awaited", §7: "`InstallSession` always awaits the
+    /// artifact's exit"). The installer runs through the launch pipeline as
+    /// a tool artifact — the prefix's runner default, or the tool floor
+    /// (wine) on a prefix without one; the app's own kind applies at
+    /// registration (#31). A non-zero exit aborts the session; a clean run
+    /// moves on to discovery.
+    fn run_installer(
+        &self,
+        canonical: &Path,
+        bound: &Prefix,
+    ) -> Result<(PathBuf, Vec<Candidate>), InstallError> {
+        let stem = canonical
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let slug = slug::slugify(&stem);
+        if slug.is_empty() {
+            return Err(StorageError::Invalid(format!(
+                "cannot form a slug from the installer name {stem:?}"
+            ))
+            .into());
+        }
+        // A synthetic entry: no overrides, kind Tool — the artifact run is
+        // a tool operation, so the defaults floor is wine unless the prefix
+        // pins a runner.
+        let entry = AppEntry {
+            slug: slug.clone(),
+            exe: canonical.to_path_buf(),
+            kind: AppKind::Tool,
+            prefix: bound.slug.clone(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        };
+        let plan = plan_for(&self.storage, &self.resolver, &entry, bound, &[])?;
+        let log_path = launch_log_path(&self.storage, &slug);
+        let process = cellar_launch::spawn(&plan, &log_path, LaunchMode::Foreground)?;
+        let status = process.wait()?;
+        let (code, signal) = exit_info(status);
+        if code != Some(0) {
+            return Err(InstallError::InstallerFailed { code, signal });
+        }
+        let candidates = self
+            .storage
+            .discover_executables(bound)
+            .map_err(InstallError::Storage)?;
+        Ok((log_path, candidates))
     }
 
     /// Every registered entry with its status, the `cellar list` data
@@ -211,6 +450,69 @@ impl<S: Storage> InstallService<S> {
             return Err(StorageError::Invalid(format!("invalid app slug {slug:?}")));
         }
         self.storage.delete_app(slug)
+    }
+}
+
+/// The frozen plan for one entry over already-loaded state — the pipeline
+/// tail (selection → resolution → check → plan, blueprint §7) shared by
+/// registered launches (#28) and the install session's artifact runs (#30).
+fn plan_for<S: Storage, R: RunnerResolver>(
+    storage: &S,
+    resolver: &R,
+    entry: &AppEntry,
+    prefix: &Prefix,
+    args: &[String],
+) -> Result<LaunchPlan, LaunchError> {
+    let settings = storage.load_settings().map_err(LaunchError::Storage)?;
+    // Selection: app override → prefix default → defaults floor picks the
+    // spec; the resolver runs the family's order (configured → managed →
+    // PATH, research #18).
+    let spec = select_spec(entry, prefix, &settings);
+    let runner = resolver.resolve(&spec).map_err(LaunchError::Resolve)?;
+    // The check stage: exactly this launch's dependencies — the exe must
+    // still be a regular file.
+    storage
+        .canonicalize_exe(&entry.exe)
+        .map_err(|err| match err {
+            StorageError::NotFound(_) | StorageError::Invalid(_) => LaunchError::ExeMissing {
+                slug: entry.slug.clone(),
+                exe: entry.exe.clone(),
+            },
+            other => LaunchError::Storage(other),
+        })?;
+    // The plan stage: the pure, printable plan. The wrapper chain is empty
+    // this slice (no wrapper activation rules yet, #34).
+    let prefix_dir = storage.prefix_dir(&prefix.slug);
+    build_plan(entry, prefix, &runner, &prefix_dir, &[], args)
+}
+
+/// The per-launch log file: `<slug>-<timestamp>.log` under the disposable
+/// cache (blueprint §7 naming; the directory is the adapter's layout via
+/// [`Storage::launch_logs_dir`]). The timestamp is epoch nanoseconds from
+/// the system clock (with a defensive 0 fallback) — practically unique per
+/// launch, so two launches of the same app never fight over one log; the
+/// open is append-only, never truncate, as a second guard. Shared by
+/// launches and the install session's artifact runs (#30).
+fn launch_log_path<S: Storage>(storage: &S, slug: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    storage
+        .launch_logs_dir()
+        .join(format!("{slug}-{nanos}.log"))
+}
+
+/// The exit facts of a run: the code plus, on Unix, the terminating signal
+/// — the Runtime-family payload the session reports raw (blueprint §7).
+fn exit_info(status: ExitStatus) -> (Option<i32>, Option<i32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        (status.code(), None)
     }
 }
 
@@ -274,27 +576,8 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
                 }
                 other => LaunchError::Storage(other),
             })?;
-        let settings = self.storage.load_settings().map_err(LaunchError::Storage)?;
-        // Resolve stage, resolution: app override → prefix default → floor
-        // picks the spec; the resolver runs the family's order (configured
-        // → managed → PATH, research #18).
-        let spec = select_spec(&entry, &prefix, &settings);
-        let resolved = self.resolver.resolve(&spec).map_err(LaunchError::Resolve)?;
-        // Check stage: exactly this launch's dependencies — the registered
-        // exe must still be a regular file.
-        self.storage
-            .canonicalize_exe(&entry.exe)
-            .map_err(|err| match err {
-                StorageError::NotFound(_) | StorageError::Invalid(_) => LaunchError::ExeMissing {
-                    slug: entry.slug.clone(),
-                    exe: entry.exe.clone(),
-                },
-                other => LaunchError::Storage(other),
-            })?;
-        // Plan stage: the pure, printable plan. The wrapper chain is empty
-        // this slice (no wrapper activation rules yet, #34).
-        let prefix_dir = self.storage.prefix_dir(&prefix_slug);
-        build_plan(&entry, &prefix, &resolved, &prefix_dir, &[], args)
+        // The shared pipeline tail: selection → resolution → check → plan.
+        plan_for(&self.storage, &self.resolver, &entry, &prefix, args)
     }
 
     /// The execute phase (blueprint §7): freeze the plan exactly as
@@ -311,22 +594,8 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
         mode: LaunchMode,
     ) -> Result<SpawnedProcess, LaunchError> {
         let plan = self.plan(slug, args)?;
-        let log_path = self.launch_log_path(slug);
+        let log_path = launch_log_path(&self.storage, slug);
         cellar_launch::spawn(&plan, &log_path, mode)
-    }
-
-    /// The per-launch log file: `<slug>-<timestamp>.log` under the
-    /// disposable cache (blueprint §7). The timestamp is epoch nanoseconds
-    /// from the system clock (with a defensive 0 fallback) — practically
-    /// unique per launch, so two launches of the same app never fight over
-    /// one log; the open is append-only, never truncate, as a second guard.
-    fn launch_log_path(&self, slug: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        self.storage
-            .launch_logs_dir()
-            .join(format!("{slug}-{nanos}.log"))
     }
 }
 
@@ -405,7 +674,10 @@ impl<S: Storage> DoctorService<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorService, InstallService, LaunchApp, PrefixService, Storage};
+    use super::{
+        ArtifactKind, DoctorService, InstallError, InstallOutcome, InstallResult, InstallService,
+        LaunchApp, PrefixService, Storage,
+    };
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
@@ -439,9 +711,15 @@ mod tests {
         canonicalized: Mutex<Vec<PathBuf>>,
         /// Exe paths that fail the launch check (canonicalize → `NotFound`).
         missing_exes: Mutex<Vec<PathBuf>>,
+        /// The canned discovery scan (the flat scan's result for the
+        /// session's running/extracting branches).
+        candidates: Mutex<Vec<Candidate>>,
         /// Where per-launch logs go (the real store: the tree's
         /// `cache/launch-logs`); spawn tests point it at a temp dir.
         log_dir: PathBuf,
+        /// The prefix layout base — extraction tests point it at a temp dir
+        /// so the archive branch writes real files.
+        prefix_base: PathBuf,
         health: TreeHealth,
     }
 
@@ -456,7 +734,9 @@ mod tests {
                 broken_prefixes: Mutex::new(Vec::new()),
                 canonicalized: Mutex::new(Vec::new()),
                 missing_exes: Mutex::new(Vec::new()),
+                candidates: Mutex::new(Vec::new()),
                 log_dir: PathBuf::from("/mock/cache/launch-logs"),
+                prefix_base: PathBuf::from("/mock/prefixes"),
                 health,
             }
         }
@@ -464,6 +744,19 @@ mod tests {
         fn with_log_dir(mut self, log_dir: PathBuf) -> Self {
             self.log_dir = log_dir;
             self
+        }
+
+        fn with_prefix_base(mut self, prefix_base: PathBuf) -> Self {
+            self.prefix_base = prefix_base;
+            self
+        }
+
+        /// Canned discovery candidates the session presents after a run.
+        fn push_candidate(&self, candidate: Candidate) {
+            self.candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(candidate);
         }
 
         fn created(&self) -> Vec<String> {
@@ -532,7 +825,7 @@ mod tests {
         }
 
         fn prefix_dir(&self, slug: &str) -> PathBuf {
-            PathBuf::from("/mock/prefixes").join(slug)
+            self.prefix_base.join(slug)
         }
 
         fn launch_logs_dir(&self) -> PathBuf {
@@ -685,7 +978,11 @@ mod tests {
         }
 
         fn discover_executables(&self, _prefix: &Prefix) -> Result<Vec<Candidate>, StorageError> {
-            Err(StorageError::Unimplemented("mock".to_owned()))
+            Ok(self
+                .candidates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
         }
 
         fn install_managed(&self, _manifest: &RunnerManifest) -> Result<PathBuf, StorageError> {
@@ -765,16 +1062,25 @@ mod tests {
         }
     }
 
+    /// The one registration of a standalone session — install tests unwrap
+    /// it (sessions may register many once review lands, #31).
+    fn registered(outcome: InstallOutcome) -> InstallResult {
+        let mut registrations = outcome.registrations;
+        assert_eq!(registrations.len(), 1, "expected exactly one registration");
+        registrations.pop().expect("length asserted above")
+    }
+
     #[test]
-    fn install_registers_a_new_entry_without_executing() -> Result<(), StorageError> {
+    fn install_registers_a_new_entry_without_executing() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock);
-        let result = service.install(
+        let service = InstallService::new(mock, StubResolver::ok());
+        let result = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
             AppKind::Game,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert!(!result.was_update);
         assert_eq!(result.entry.slug, "balatro");
         assert_eq!(result.entry.exe, PathBuf::from("/games/balatro.exe"));
@@ -787,20 +1093,32 @@ mod tests {
         );
         assert_eq!(service.storage.created(), ["default"]);
         assert_eq!(service.storage.list_apps()?.len(), 1);
+        assert!(
+            registered(service.install(
+                Path::new("/games/balatro.exe"),
+                "default",
+                None,
+                AppKind::Game,
+                ArtifactKind::Standalone,
+            )?)
+            .was_update,
+            "re-install updates; the standalone branch itself is unchanged"
+        );
         Ok(())
     }
 
     #[test]
-    fn install_uses_the_flag_name_and_dedupes_the_slug() -> Result<(), StorageError> {
+    fn install_uses_the_flag_name_and_dedupes_the_slug() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
         mock.take_app_slugs(&["my-game", "my-game-2"]);
-        let service = InstallService::new(mock);
-        let result = service.install(
+        let service = InstallService::new(mock, StubResolver::ok());
+        let result = registered(service.install(
             Path::new("/games/game.exe"),
             "default",
             Some("My Game"),
             AppKind::Game,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert_eq!(
             result.entry.slug, "my-game-3",
             "-2 dedupe against the slug domain"
@@ -809,22 +1127,24 @@ mod tests {
     }
 
     #[test]
-    fn reinstalling_the_same_exe_updates_the_same_entry() -> Result<(), StorageError> {
+    fn reinstalling_the_same_exe_updates_the_same_entry() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock);
-        let first = service.install(
+        let service = InstallService::new(mock, StubResolver::ok());
+        let first = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
             AppKind::Game,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert!(!first.was_update);
-        let second = service.install(
+        let second = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
             AppKind::Tool,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert!(second.was_update);
         assert_eq!(
             second.entry.slug, first.entry.slug,
@@ -841,21 +1161,23 @@ mod tests {
     }
 
     #[test]
-    fn reinstalling_rebinds_the_prefix() -> Result<(), StorageError> {
+    fn reinstalling_rebinds_the_prefix() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock);
-        service.install(
+        let service = InstallService::new(mock, StubResolver::ok());
+        registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
             AppKind::Game,
-        )?;
-        let rebound = service.install(
+            ArtifactKind::Standalone,
+        )?);
+        let rebound = registered(service.install(
             Path::new("/games/balatro.exe"),
             "games",
             None,
             AppKind::Game,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert!(rebound.was_update);
         assert_eq!(rebound.entry.prefix, "games");
         assert_eq!(service.storage.list_apps()?.len(), 1);
@@ -863,55 +1185,58 @@ mod tests {
     }
 
     #[test]
-    fn install_uses_an_existing_prefix_without_creating_it() -> Result<(), StorageError> {
+    fn install_uses_an_existing_prefix_without_creating_it() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
         mock.add_prefix(Prefix {
             slug: "default".to_owned(),
             defaults: PrefixDefaults::default(),
         });
-        let service = InstallService::new(mock);
-        service.install(
+        let service = InstallService::new(mock, StubResolver::ok());
+        registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
             AppKind::Game,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert!(service.storage.created().is_empty());
         Ok(())
     }
 
     #[test]
-    fn install_sidesteps_a_broken_hand_edited_prefix() -> Result<(), StorageError> {
+    fn install_sidesteps_a_broken_hand_edited_prefix() -> Result<(), InstallError> {
         // A broken prefix.toml is never clobbered (ADR 0001): the install
         // binds to a freshly deduped sibling — the same dedupe `prefix
         // create` applies, so the requested slug is never silently reused.
         let mock = MockStorage::new(healthy_tree());
         mock.mark_broken_prefix("default");
-        let service = InstallService::new(mock);
-        let result = service.install(
+        let service = InstallService::new(mock, StubResolver::ok());
+        let result = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
             AppKind::Game,
-        )?;
+            ArtifactKind::Standalone,
+        )?);
         assert_eq!(service.storage.created(), ["default"]);
         assert_eq!(result.entry.prefix, "default-2", "the fresh sibling binds");
         Ok(())
     }
 
     #[test]
-    fn install_rejects_bad_inputs_before_touching_the_tree() -> Result<(), StorageError> {
+    fn install_rejects_bad_inputs_before_touching_the_tree() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock);
-        // A non-exe is not a standalone artifact.
+        let service = InstallService::new(mock, StubResolver::ok());
+        // A non-exe is not a standalone or installer artifact.
         assert!(matches!(
             service.install(
                 Path::new("/games/readme.txt"),
                 "default",
                 None,
-                AppKind::Game
+                AppKind::Game,
+                ArtifactKind::Standalone
             ),
-            Err(StorageError::Invalid(_))
+            Err(InstallError::Storage(StorageError::Invalid(_)))
         ));
         // An escaping prefix slug is rejected up front.
         assert!(matches!(
@@ -919,9 +1244,10 @@ mod tests {
                 Path::new("/games/balatro.exe"),
                 "../escape",
                 None,
-                AppKind::Game
+                AppKind::Game,
+                ArtifactKind::Installer
             ),
-            Err(StorageError::Invalid(_))
+            Err(InstallError::Storage(StorageError::Invalid(_)))
         ));
         // An unslugifiable display name cannot name an entry.
         assert!(matches!(
@@ -929,9 +1255,10 @@ mod tests {
                 Path::new("/games/balatro.exe"),
                 "default",
                 Some("!!!"),
-                AppKind::Game
+                AppKind::Game,
+                ArtifactKind::Standalone
             ),
-            Err(StorageError::Invalid(_))
+            Err(InstallError::Storage(StorageError::Invalid(_)))
         ));
         assert!(
             service.storage.list_apps()?.is_empty(),
@@ -942,13 +1269,275 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn installer_branch_runs_the_installer_awaits_its_exit_and_presents_candidates()
+    -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-installer-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs)?;
+        // The configured stub runner plays wine; the installer artifact
+        // itself needs no real file — the mock canonicalizes by echo.
+        let wine = dir.join("stub-wine");
+        write_stub_script(&wine, "echo \"install-line\"\nexit 0\n")?;
+        let mock = MockStorage::new(healthy_tree())
+            .with_log_dir(logs.clone())
+            .with_prefix_base(dir.join("prefixes"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Wine)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let dropped = Candidate {
+            exe: dir.join("prefixes/default/drive_c/users/me/Desktop/game.exe"),
+            label: "game".to_owned(),
+        };
+        mock.push_candidate(dropped.clone());
+        let service = InstallService::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let outcome = service.install(
+            Path::new("/tmp/setup.exe"),
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Installer,
+        )?;
+        assert!(outcome.registrations.is_empty(), "nothing registers yet");
+        assert_eq!(outcome.prefix_slug, "default");
+        let log = outcome.log_path.expect("the installer run has a log");
+        assert!(
+            log.starts_with(&logs),
+            "the run's output lands under the disposable cache"
+        );
+        let text = std::fs::read_to_string(&log)?;
+        assert!(text.contains("install-line"), "run output missing:\n{text}");
+        assert_eq!(
+            outcome.candidates,
+            [dropped],
+            "the flat scan's candidates are presented for review"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_failure_aborts_the_session() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-installer-fail-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs)?;
+        let wine = dir.join("stub-wine");
+        write_stub_script(&wine, "exit 7\n")?;
+        let mock = MockStorage::new(healthy_tree())
+            .with_log_dir(dir.join("logs"))
+            .with_prefix_base(dir.join("prefixes"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Wine)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let service = InstallService::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let err = service
+            .install(
+                Path::new("/tmp/setup.exe"),
+                "default",
+                None,
+                AppKind::Game,
+                ArtifactKind::Installer,
+            )
+            .expect_err("a failed installer aborts the session");
+        assert!(
+            matches!(
+                &err,
+                InstallError::InstallerFailed {
+                    code: Some(7),
+                    signal: None
+                }
+            ),
+            "the exit code is reported raw: {err}"
+        );
+        assert!(
+            err.to_string().contains("the installer failed"),
+            "the disposition names the failure: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installer_runs_under_the_prefix_runner_or_the_tool_floor() {
+        // The artifact run is a tool operation: the prefix's runner default
+        // when pinned, else the Tool floor (wine) — never the Game floor
+        // (Proton), which would demand a managed runner for a setup.exe.
+        // The resolver fails before any spawn; the selection walk's spec is
+        // what the test records (the stub records it before failing).
+        let seek_spec = |pinned: Option<RunnerSpec>| -> Result<RunnerSpec, String> {
+            let mock = MockStorage::new(healthy_tree());
+            mock.add_prefix(Prefix {
+                slug: "default".to_owned(),
+                defaults: PrefixDefaults {
+                    runner: pinned,
+                    ..PrefixDefaults::default()
+                },
+            });
+            let resolver = StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Wine,
+            }));
+            let service = InstallService::new(mock, resolver);
+            let _ = service
+                .install(
+                    Path::new("/tmp/setup.exe"),
+                    "default",
+                    None,
+                    AppKind::Game,
+                    ArtifactKind::Installer,
+                )
+                .expect_err("resolution fails before any spawn");
+            service
+                .resolver
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| "the selection walk never ran".to_owned())
+        };
+        let pinned = seek_spec(Some(RunnerSpec::new(RunnerFamily::Proton)))
+            .expect("the selection walk records the spec");
+        assert_eq!(
+            pinned.family,
+            RunnerFamily::Proton,
+            "the prefix default pins"
+        );
+        let floor = seek_spec(None).expect("the selection walk records the spec");
+        assert_eq!(floor.family, RunnerFamily::Wine, "the tool floor applies");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_branch_extracts_into_the_prefix_and_presents_candidates() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-archive-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let bundle = dir.join("bundle.zip");
+        crate::archive::build_zip(
+            &bundle,
+            &[
+                ("game/Game.exe", "MZ"),
+                ("game/data/level.bin", "level"),
+                ("readme.txt", "hi"),
+            ],
+        );
+        let mock = MockStorage::new(healthy_tree()).with_prefix_base(dir.join("prefixes"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        let candidate = Candidate {
+            exe: dir.join("prefixes/default/drive_c/game/Game.exe"),
+            label: "Game".to_owned(),
+        };
+        mock.push_candidate(candidate.clone());
+        let service = InstallService::new(mock, StubResolver::ok());
+        let outcome = service.install(
+            &bundle,
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Archive,
+        )?;
+        assert!(outcome.registrations.is_empty());
+        assert_eq!(outcome.log_path, None, "no run, no log");
+        // The archive landed at the prefix's wine root, structure intact.
+        let drive_c = dir.join("prefixes/default/drive_c");
+        assert_eq!(
+            std::fs::read(drive_c.join("game/Game.exe")).unwrap_or_default(),
+            b"MZ"
+        );
+        assert!(drive_c.join("game/data/level.bin").is_file());
+        assert!(drive_c.join("readme.txt").is_file());
+        assert_eq!(
+            outcome.candidates,
+            [candidate],
+            "the scan's candidates are presented for review"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_branch_refuses_traversal() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-archive-evil-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let bundle = dir.join("evil.zip");
+        crate::archive::build_zip(&bundle, &[("../evil.exe", "MZ")]);
+        let mock = MockStorage::new(healthy_tree()).with_prefix_base(dir.join("prefixes"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        let service = InstallService::new(mock, StubResolver::ok());
+        let err = service
+            .install(
+                &bundle,
+                "default",
+                None,
+                AppKind::Game,
+                ArtifactKind::Archive,
+            )
+            .expect_err("traversal is refused");
+        assert!(
+            matches!(
+                &err,
+                InstallError::Archive(crate::archive::ArchiveError::Traversal { entry })
+                    if entry == "../evil.exe"
+            ),
+            "the refusing entry is named: {err}"
+        );
+        assert!(
+            !dir.join("prefixes").join("evil.exe").exists(),
+            "nothing escaped the prefix"
+        );
+        assert!(!dir.join("prefixes/default/drive_c").exists());
+        Ok(())
+    }
+
+    #[test]
     fn list_joins_tree_health_for_entry_status() -> Result<(), StorageError> {
         let mut health = healthy_tree();
         health.missing_exes.push("balatro".to_owned());
         let mock = MockStorage::new(health);
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.add_app(entry("warpinator", "/prefix/drive_c/warpinator.exe"));
-        let service = InstallService::new(mock);
+        let service = InstallService::new(mock, StubResolver::ok());
         let listed = service.list()?;
         let statuses: Vec<_> = listed
             .iter()
@@ -967,7 +1556,7 @@ mod tests {
         let mock = MockStorage::new(healthy_tree());
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.add_app(entry("warpinator", "/prefix/drive_c/warpinator.exe"));
-        let service = InstallService::new(mock);
+        let service = InstallService::new(mock, StubResolver::ok());
         service.uninstall("balatro")?;
         let apps = service.storage.list_apps()?;
         let remaining: Vec<_> = apps.iter().map(|app| app.slug.as_str()).collect();
@@ -1331,7 +1920,7 @@ mod tests {
                 ..PrefixDefaults::default()
             },
         });
-        let service = InstallService::new(mock);
+        let service = InstallService::new(mock, StubResolver::ok());
         let listed = service.list()?;
         assert_eq!(
             listed[0].prefix_runner,
@@ -1346,7 +1935,7 @@ mod tests {
         let mock = MockStorage::new(healthy_tree());
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.mark_broken_prefix("default");
-        let service = InstallService::new(mock);
+        let service = InstallService::new(mock, StubResolver::ok());
         let listed = service.list()?;
         assert_eq!(
             listed[0].prefix_runner, None,
