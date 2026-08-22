@@ -76,6 +76,7 @@ dependencies = [
  "cellar-providers",
  "cellar-storage",
  "clap",
+ "serde",
  "serde_json",
 ]
 

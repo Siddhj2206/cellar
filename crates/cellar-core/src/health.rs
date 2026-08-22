@@ -28,17 +28,53 @@ pub struct TreeHealth {
     /// Prefix directories without a `prefix.toml` (debris or an interrupted
     /// create).
     pub orphan_prefix_dirs: Vec<PathBuf>,
+    /// App slugs whose registered exe is missing from disk (deleted or
+    /// moved). File-oriented lists above use tree-relative paths; entry
+    /// checks use slugs — entry identity is domain vocabulary, file layout
+    /// is storage's.
+    pub missing_exes: Vec<String>,
     /// The schema version the tree is read at.
     pub schema_version: u32,
 }
 
 impl TreeHealth {
-    /// Whether the tree is healthy: present, complete, and every file valid.
+    /// Whether the tree is healthy: present, complete, every file valid, and
+    /// every registered exe still on disk (blueprint §7 check phase applied
+    /// tree-wide).
     pub fn is_healthy(&self) -> bool {
         self.tree_exists
             && self.missing_dirs.is_empty()
             && self.missing_files.is_empty()
             && self.invalid_files.is_empty()
             && self.orphan_prefix_dirs.is_empty()
+            && self.missing_exes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TreeHealth;
+
+    use std::path::PathBuf;
+
+    fn report() -> TreeHealth {
+        TreeHealth {
+            root: PathBuf::from("/tmp/cellar"),
+            tree_exists: true,
+            missing_dirs: Vec::new(),
+            missing_files: Vec::new(),
+            invalid_files: Vec::new(),
+            orphan_prefix_dirs: Vec::new(),
+            missing_exes: Vec::new(),
+            schema_version: 1,
+        }
+    }
+
+    #[test]
+    fn missing_registered_exes_make_the_tree_unhealthy() {
+        let mut health = report();
+        assert!(health.is_healthy());
+        health.missing_exes.push("balatro".to_owned());
+        assert!(!health.is_healthy());
     }
 }

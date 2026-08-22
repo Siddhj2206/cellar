@@ -247,6 +247,26 @@ impl TreeStore {
             Err(other) => Err(other),
         }
     }
+
+    /// Flag an entry whose registered exe is missing from disk — the
+    /// tree-wide sweep of the launch check phase (blueprint §7 disposition:
+    /// "exe missing → re-register"). Only a regular file at the exe path
+    /// counts as present (a directory squatting the path flags too); real
+    /// I/O errors propagate loudly.
+    fn flag_missing_exe(app: &AppEntry, health: &mut TreeHealth) -> Result<(), StorageError> {
+        match fs::metadata(&app.exe) {
+            Ok(meta) if meta.is_file() => Ok(()),
+            Ok(_) => {
+                health.missing_exes.push(app.slug.clone());
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                health.missing_exes.push(app.slug.clone());
+                Ok(())
+            }
+            Err(err) => Err(io_err(&app.exe, &err)),
+        }
+    }
 }
 
 impl cellar_core::ports::__sealed::Sealed for TreeStore {}
@@ -379,6 +399,35 @@ impl Storage for TreeStore {
         fs::remove_file(&file).map_err(|e| io_err(&file, &e))
     }
 
+    fn list_app_slugs(&self) -> Result<Vec<String>, StorageError> {
+        self.ensure_tree()?;
+        let mut slugs = Vec::new();
+        for path in read_dir_sorted(&self.root.join("apps"))? {
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            // Every stem counts — a broken hand-edited entry is part of the
+            // dedupe domain, so a fresh install never overwrites it
+            // (ADR 0001), mirroring how prefix creates sidestep broken
+            // directories.
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                slugs.push(stem.to_owned());
+            }
+        }
+        Ok(slugs)
+    }
+
+    fn canonicalize_exe(&self, path: &Path) -> Result<PathBuf, StorageError> {
+        let canonical = fs::canonicalize(path).map_err(|e| io_err(path, &e))?;
+        if !canonical.is_file() {
+            return Err(StorageError::Invalid(format!(
+                "{} is not a file",
+                canonical.display()
+            )));
+        }
+        Ok(canonical)
+    }
+
     fn tree_health(&self) -> Result<TreeHealth, StorageError> {
         let mut health = TreeHealth {
             root: self.root.clone(),
@@ -387,6 +436,7 @@ impl Storage for TreeStore {
             missing_files: Vec::new(),
             invalid_files: Vec::new(),
             orphan_prefix_dirs: Vec::new(),
+            missing_exes: Vec::new(),
             schema_version: SCHEMA_VERSION,
         };
         if !self.root.exists() {
@@ -442,7 +492,12 @@ impl Storage for TreeStore {
                         .and_then(|n| n.to_str())
                         .unwrap_or_default(),
                 );
-                Self::flag_invalid(Self::read_app_at(&path), relative, &mut health)?;
+                match Self::read_app_at(&path) {
+                    Ok(app) => Self::flag_missing_exe(&app, &mut health)?,
+                    Err(StorageError::NotFound(_)) => {}
+                    Err(StorageError::Invalid(_)) => health.invalid_files.push(relative),
+                    Err(other) => return Err(other),
+                }
             }
         }
         Ok(health)
@@ -450,7 +505,7 @@ impl Storage for TreeStore {
 
     fn discover_executables(&self, _prefix: &Prefix) -> Result<Vec<Candidate>, StorageError> {
         Err(StorageError::Unimplemented(
-            ".lnk discovery lands with the AppEntry slice (#27)".to_owned(),
+            ".lnk discovery lands with the installer/archive slice (#30)".to_owned(),
         ))
     }
 
@@ -733,6 +788,101 @@ mod tests {
             store.load_app("warpinator"),
             Err(StorageError::NotFound(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn canonicalize_exe_resolves_real_files_only() -> Result<(), StorageError> {
+        let (store, root) = store("canonical-exe");
+        let dir = root.join("bin");
+        fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let exe = dir.join("game.exe");
+        fs::write(&exe, "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let canonical = store.canonicalize_exe(&exe)?;
+        assert_eq!(
+            canonical,
+            fs::canonicalize(&exe).unwrap_or_else(|e| panic!("canon: {e}"))
+        );
+        assert!(matches!(
+            store.canonicalize_exe(&dir.join("gone.exe")),
+            Err(StorageError::NotFound(_))
+        ));
+        assert!(matches!(
+            store.canonicalize_exe(&dir),
+            Err(StorageError::Invalid(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn app_slug_domain_covers_broken_hand_edits() -> Result<(), StorageError> {
+        let (store, root) = store("app-slugs");
+        store.save_app(&AppEntry {
+            slug: "alpha".to_owned(),
+            exe: PathBuf::from("/x/alpha.exe"),
+            kind: AppKind::Game,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        })?;
+        fs::write(root.join("apps/broken.toml"), "not toml {{{")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(root.join("apps/notes.txt"), "ignored").unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(
+            store.list_app_slugs()?,
+            ["alpha", "broken"],
+            "the dedupe domain must include broken entries and skip non-toml"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tree_health_flags_entries_whose_exe_disappeared() -> Result<(), StorageError> {
+        let (store, root) = store("missing-exe");
+        let exe = root.join("drive_c/game.exe");
+        fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(&exe, "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        store.save_app(&AppEntry {
+            slug: "game".to_owned(),
+            exe: exe.clone(),
+            kind: AppKind::Game,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        })?;
+        assert!(store.tree_health()?.is_healthy());
+        fs::remove_file(&exe).unwrap_or_else(|e| panic!("remove: {e}"));
+        let health = store.tree_health()?;
+        assert_eq!(health.missing_exes, ["game"]);
+        assert!(!health.is_healthy());
+        // The entry stays registered — only its status changes.
+        assert_eq!(store.list_apps()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_squatting_the_exe_path_is_flagged_too() -> Result<(), StorageError> {
+        let (store, root) = store("exe-dir-squat");
+        let exe = root.join("drive_c/game.exe");
+        fs::create_dir_all(&exe).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        store.save_app(&AppEntry {
+            slug: "game".to_owned(),
+            exe: exe.clone(),
+            kind: AppKind::Game,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        })?;
+        let health = store.tree_health()?;
+        assert_eq!(health.missing_exes, ["game"]);
+        assert!(!health.is_healthy());
         Ok(())
     }
 

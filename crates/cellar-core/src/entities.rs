@@ -52,9 +52,48 @@ pub struct PrefixDefaults {
 /// Metadata on an `AppEntry` — Game or Tool. The presets hook (Game →
 /// GE-Proton, Tool → wine); never a storage location (glossary: kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AppKind {
     Game,
     Tool,
+}
+
+impl AppKind {
+    /// The human label, e.g. for CLI flags and tables.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Game => "game",
+            Self::Tool => "tool",
+        }
+    }
+
+    /// The kind's preset at the defaults floor (blueprint §7): the fallback
+    /// family when neither an app override nor a prefix default selects a
+    /// runner — Game → Proton (GE-Proton), Tool → wine. Selection walks app
+    /// override → prefix default → this floor; the walk lands with the launch
+    /// slice (#28), this is the floor itself. Settings-driven floor overrides
+    /// land once the schema has consumers (#34+).
+    pub const fn default_family(self) -> RunnerFamily {
+        match self {
+            Self::Game => RunnerFamily::Proton,
+            Self::Tool => RunnerFamily::Wine,
+        }
+    }
+}
+
+impl std::str::FromStr for AppKind {
+    type Err = String;
+
+    /// The flag/table vocabulary (`game`, `tool`) — the same strings
+    /// [`AppKind::as_str`] emits, so CLI parsing and rendering can never
+    /// drift.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "game" => Ok(Self::Game),
+            "tool" => Ok(Self::Tool),
+            other => Err(format!("unknown kind {other:?} — use `game` or `tool`")),
+        }
+    }
 }
 
 /// Per-AppEntry replacement of a prefix default — including the prefix
@@ -102,4 +141,26 @@ pub struct Candidate {
     pub exe: PathBuf,
     /// Human label, typically the shortcut's display name.
     pub label: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppKind;
+
+    use crate::types::RunnerFamily;
+
+    #[test]
+    fn kind_labels_are_lowercase_cli_vocabulary() {
+        assert_eq!(AppKind::Game.as_str(), "game");
+        assert_eq!(AppKind::Tool.as_str(), "tool");
+    }
+
+    #[test]
+    fn kind_presets_hold_at_the_defaults_floor() {
+        // Blueprint §7: the defaults floor is kind-driven — Game → Proton
+        // (GE-Proton), Tool → wine. Launch selection walks app override →
+        // prefix default → this floor (#28); the floor itself never moves.
+        assert_eq!(AppKind::Game.default_family(), RunnerFamily::Proton);
+        assert_eq!(AppKind::Tool.default_family(), RunnerFamily::Wine);
+    }
 }

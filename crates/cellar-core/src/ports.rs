@@ -78,6 +78,18 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     fn save_app(&self, app: &AppEntry) -> Result<(), StorageError>;
     fn delete_app(&self, slug: &str) -> Result<(), StorageError>;
 
+    /// The app-slug dedupe domain: every `apps/*.toml` file stem, valid or
+    /// not. A fresh install dedupes against this set so a broken hand-edited
+    /// entry is never overwritten (ADR 0001).
+    fn list_app_slugs(&self) -> Result<Vec<String>, StorageError>;
+
+    /// The canonical absolute path of an executable — the `AppEntry`
+    /// identity (blueprint §6: "identity stays the canonical exe path").
+    /// Validates the path resolves and is a file — the registration-time
+    /// pre-flight (a registered entry always points at a real file; an exe
+    /// deleted later is flagged by `tree_health`).
+    fn canonicalize_exe(&self, path: &Path) -> Result<PathBuf, StorageError>;
+
     /// Health of the tree (blueprint §7: the doctor applied tree-wide):
     /// which nodes are missing, which files are invalid, which prefix dirs
     /// are orphaned. Deliberately no side effects — it reports exactly what
