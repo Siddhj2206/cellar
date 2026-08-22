@@ -2,6 +2,8 @@
 
 Status: accepted (wayfinder #21, 2026-08)
 
+Amendment (2026-08, implemented in #28): `Storage` gains `prefix_dir()` — pure layout math the launch plan needs for the wine `WINEPREFIX` contract. Still exactly five sealed traits; sealed methods are non-breaking workspace additions, and layout knowledge stays in the adapter.
+
 Cellar's extension surface is exactly five sealed traits in `core::ports` — `RunnerResolver`, `ManagedRunner` (declarative `manifest()`; Managed vs Discover-only is trait membership), `WrapperContributor` (with a `Layer` enum ordering the chain; env contracts are wrapper data, not launch machinery), `Storage` (file-tree mapping, `.lnk` discovery, and the shared `Installer` pipeline under one port — one external system, one port), and `DesktopIntegrator` — implemented by the provider crates, `cellar-storage`, and `cellar-desktop`. Install strategies, components, runtime plugins, and any `Platform` abstraction are deliberately not ports. Cellar is Linux-first; a future macOS edition enters through the existing seams (additive provider crates, per-platform storage/desktop implementations), never a platform trait.
 
 ## Considered options

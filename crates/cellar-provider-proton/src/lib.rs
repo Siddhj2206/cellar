@@ -4,16 +4,17 @@
 //! Implements `RunnerResolver` (both modes) and `ManagedRunner` (a declarative
 //! manifest for the storage-owned installer pipeline, research #18: SHA-512
 //! verification, the `<tag>-<arch>.tar.gz` asset shape, single-root-dir
-//! extraction). Discover-only Steam compat-dir scanning arrives with the
-//! launch slice (#28); until then [`ProtonProvider::resolve`] answers
-//! `Unresolvable`.
+//! extraction). Resolution — configured path → runtime-tree install → Steam
+//! compat dirs — lands with the managed-runner pipeline (#34); until then
+//! every Proton spec is exhausted by construction, which is the honest
+//! pre-#34 answer (a planned Proton launch needs the umu chain anyway).
 
 use cellar_core::errors::ResolveError;
 use cellar_core::manifest::{
     ArchiveLayout, ChecksumScheme, InstallKind, ReleaseSource, RunnerManifest,
 };
 use cellar_core::ports::{__sealed, ManagedRunner, RunnerResolver};
-use cellar_core::types::{ResolvedRunner, RunnerSpec};
+use cellar_core::types::{ResolvedRunner, RunnerFamily, RunnerSpec};
 
 /// Managed GE-Proton provider.
 #[derive(Debug)]
@@ -59,10 +60,13 @@ impl RunnerResolver for ProtonProvider {
         Self::ID
     }
 
-    // Resolution (configured path → managed → Steam compat dirs) lands with
-    // the launch slice (#28); the scaffold only locks the port shapes.
+    // Resolution (configured path → managed install → Steam compat dirs)
+    // lands with the managed-runner pipeline (#34); until then every Proton
+    // spec is exhausted by construction — the honest pre-#34 answer.
     fn resolve(&self, _spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
-        Err(ResolveError::Unresolvable)
+        Err(ResolveError::Unresolvable {
+            family: RunnerFamily::Proton,
+        })
     }
 }
 

@@ -12,12 +12,14 @@ use crate::types::{RunnerFamily, RunnerRef, RunnerSpec};
 /// config. Per-file `schema_version` lives in storage's file mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Settings {
-    /// Order in which runner families are tried during resolution.
+    /// The defaults-floor order: when nonempty, `resolution_order[0]`
+    /// replaces the kind preset at the defaults floor (blueprint §7:
+    /// "defaults floor (settings.toml + kind presets)").
     ///
-    /// Defaults to empty: selection semantics (app override → prefix default →
-    /// kind presets, Game → GE-Proton / Tool → wine) land with the storage
-    /// (#26) and launch (#28) slices. Wine is never an automatic fallback for
-    /// a failed Proton selection (blueprint §7).
+    /// The floor is kind-driven by default — Game → Proton (GE-Proton),
+    /// Tool → wine. Wine is never an *automatic* fallback, so the later
+    /// entries are not a fallback chain; the full order's semantics land
+    /// once settings have real consumers (#34+).
     pub resolution_order: Vec<RunnerFamily>,
     // umu/proton configuration fields land with the runner-managed slices
     // (#34+), once the settings schema has real consumers.
@@ -36,9 +38,15 @@ pub struct Prefix {
 /// (runner, environment, graphics, Windows version).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PrefixDefaults {
-    /// Default runner selection (family plus optional pin).
+    /// Default runner selection (family plus optional pin). Missing in
+    /// hand-edited files reads as "no default" — `Option` fields default
+    /// by construction.
     pub runner: Option<RunnerSpec>,
-    /// Environment applied to every launch in this prefix.
+    /// Environment applied to every launch in this prefix. Explicitly
+    /// defaulted so a hand-edited file may omit it (ADR 0001: human-edited
+    /// config; a missing table degrades to empty, never to an invalid
+    /// file).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Graphics backend setting (schema lands with the storage slice).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,8 +1,10 @@
 //! Application use-cases: the `AppEntry` registry — standalone install
 //! (registered without executing), app list with per-entry status, uninstall
-//! degrading to entry removal (#27) — plus the prefix lifecycle and the
-//! tree-health doctor check (#26). Thin orchestration over the `Storage`
-//! port — concrete adapters are injected only at the composition root.
+//! degrading to entry removal (#27) — the prefix lifecycle and the
+//! tree-health doctor check (#26), and the `LaunchApp` use-case (#28):
+//! resolve → check → plan with nothing spawning. Thin orchestration over
+//! the `Storage` port — concrete adapters are injected only at the
+//! composition root.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -11,8 +13,10 @@ use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Overrides};
 use cellar_core::errors::StorageError;
 use cellar_core::health::TreeHealth;
-use cellar_core::ports::Storage;
+use cellar_core::ports::{RunnerResolver, Storage};
 use cellar_core::slug;
+use cellar_core::types::{LaunchPlan, RunnerSpec};
+use cellar_launch::{LaunchError, build_plan, select_spec};
 
 /// The check-phase status of a registered entry (blueprint §7: the check
 /// phase applied entry-wide). This slice checks the registered exe's
@@ -36,11 +40,19 @@ impl EntryStatus {
     }
 }
 
-/// One row of `cellar list`: a registered entry plus its current status.
+/// One row of `cellar list`: a registered entry plus its current status and
+/// the runner default of the prefix it binds to — the rung that joins the
+/// runner column's chain (pinned ref → app override → prefix default →
+/// kind preset) with the launch slice (#28).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedEntry {
     pub entry: AppEntry,
     pub status: EntryStatus,
+    /// The bound prefix's default runner spec (the binding override picks
+    /// which prefix's defaults apply), when that prefix is readable. A
+    /// missing or broken prefix renders the floor instead — the doctor
+    /// flags such trees.
+    pub prefix_runner: Option<RunnerSpec>,
 }
 
 /// The result of a standalone registration.
@@ -154,8 +166,10 @@ impl<S: Storage> InstallService<S> {
     }
 
     /// Every registered entry with its status, the `cellar list` data
-    /// (blueprint §8: slug, kind, prefix, runner, status). Invalid
-    /// hand-edited entries are skipped — the doctor flags them (ADR 0001).
+    /// (blueprint §8: slug, kind, prefix, runner, status). The runner
+    /// column's chain includes the bound prefix's default (the rung #27
+    /// deferred to the launch slice); invalid hand-edited entries are
+    /// skipped — the doctor flags them (ADR 0001).
     pub fn list(&self) -> Result<Vec<ListedEntry>, StorageError> {
         let entries = self.storage.list_apps()?;
         let missing: BTreeSet<String> = self
@@ -164,17 +178,28 @@ impl<S: Storage> InstallService<S> {
             .missing_exes
             .into_iter()
             .collect();
-        Ok(entries
-            .into_iter()
-            .map(|entry| ListedEntry {
+        let mut listed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            // The prefix-binding override decides which prefix's defaults
+            // apply (glossary: Override); a broken prefix degrades the
+            // column to the floor — list must still render, the doctor
+            // flags the tree.
+            let bound = entry.overrides.prefix.as_deref().unwrap_or(&entry.prefix);
+            let prefix_runner = match self.storage.load_prefix(bound) {
+                Ok(prefix) => prefix.defaults.runner,
+                Err(_) => None,
+            };
+            listed.push(ListedEntry {
                 status: if missing.contains(&entry.slug) {
                     EntryStatus::ExeMissing
                 } else {
                     EntryStatus::Ok
                 },
                 entry,
-            })
-            .collect())
+                prefix_runner,
+            });
+        }
+        Ok(listed)
     }
 
     /// Remove exactly that entry's state — its app file, never more
@@ -186,6 +211,87 @@ impl<S: Storage> InstallService<S> {
             return Err(StorageError::Invalid(format!("invalid app slug {slug:?}")));
         }
         self.storage.delete_app(slug)
+    }
+}
+
+/// The `LaunchApp` use-case (blueprint §7): resolve → check → plan, with
+/// nothing spawning until the plan is frozen. This slice delivers the
+/// frozen plan as a pure, printable value — `--dry-run` and the GUI preview
+/// render it; spawning it lands with the execute slice (#29).
+///
+/// The check phase is doctor applied to one launch, in taxonomy order: the
+/// bound prefix must exist (disposition: recreate), runner resolution must
+/// succeed (dispositions: `SuggestInstall` / reinstall, in the
+/// `ResolveError` messages), and the registered exe must still be a file
+/// (disposition: re-register). First failure wins — the pipeline stops
+/// behaving non-deterministically.
+///
+/// The wrapper contributors this slice wires are none — the effective chain
+/// of every plan is empty until the umu/gamescope activation rules land
+/// (#34); the chain machinery is real and tested in `cellar-launch`.
+pub struct LaunchApp<S: Storage, R: RunnerResolver> {
+    storage: S,
+    resolver: R,
+}
+
+impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
+    /// The use-case over one storage adapter and one resolver — the
+    /// composition root injects the concrete registry composite (#28).
+    pub fn new(storage: S, resolver: R) -> Self {
+        Self { storage, resolver }
+    }
+
+    /// The frozen plan for one registered app, or the first pre-flight
+    /// failure (taxonomy order, blueprint §7). The launch never writes the
+    /// tree and never spawns — dry-run is a free, faithful preview.
+    pub fn plan(&self, slug: &str, args: &[String]) -> Result<LaunchPlan, LaunchError> {
+        // Resolve stage, first step: the app itself.
+        let entry = self.storage.load_app(slug).map_err(|err| match err {
+            StorageError::NotFound(_) => LaunchError::AppNotFound {
+                slug: slug.to_owned(),
+            },
+            other => LaunchError::Storage(other),
+        })?;
+        // Resolve stage, selection: the prefix-binding override decides
+        // which prefix's defaults apply (glossary: Override); its default
+        // is the prefix that registered the entry.
+        let prefix_slug = entry
+            .overrides
+            .prefix
+            .clone()
+            .unwrap_or_else(|| entry.prefix.clone());
+        let prefix = self
+            .storage
+            .load_prefix(&prefix_slug)
+            .map_err(|err| match err {
+                StorageError::NotFound(_) | StorageError::Invalid(_) => {
+                    LaunchError::PrefixMissing {
+                        slug: prefix_slug.clone(),
+                    }
+                }
+                other => LaunchError::Storage(other),
+            })?;
+        let settings = self.storage.load_settings().map_err(LaunchError::Storage)?;
+        // Resolve stage, resolution: app override → prefix default → floor
+        // picks the spec; the resolver runs the family's order (configured
+        // → managed → PATH, research #18).
+        let spec = select_spec(&entry, &prefix, &settings);
+        let resolved = self.resolver.resolve(&spec).map_err(LaunchError::Resolve)?;
+        // Check stage: exactly this launch's dependencies — the registered
+        // exe must still be a regular file.
+        self.storage
+            .canonicalize_exe(&entry.exe)
+            .map_err(|err| match err {
+                StorageError::NotFound(_) | StorageError::Invalid(_) => LaunchError::ExeMissing {
+                    slug: entry.slug.clone(),
+                    exe: entry.exe.clone(),
+                },
+                other => LaunchError::Storage(other),
+            })?;
+        // Plan stage: the pure, printable plan. The wrapper chain is empty
+        // this slice (no wrapper activation rules yet, #34).
+        let prefix_dir = self.storage.prefix_dir(&prefix_slug);
+        build_plan(&entry, &prefix, &resolved, &prefix_dir, &[], args)
     }
 }
 
@@ -264,17 +370,22 @@ impl<S: Storage> DoctorService<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorService, InstallService, PrefixService, Storage};
+    use super::{DoctorService, InstallService, LaunchApp, PrefixService, Storage};
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides, Settings};
-    use cellar_core::errors::StorageError;
+    use cellar_core::errors::{ResolveError, StorageError};
     use cellar_core::health::TreeHealth;
     use cellar_core::manifest::RunnerManifest;
+    use cellar_core::ports::{__sealed, RunnerResolver};
+    use cellar_core::types::{
+        ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
+    };
     use cellar_core::{Prefix, PrefixDefaults};
+    use cellar_launch::LaunchError;
 
     /// In-memory `Storage` double: real registry state (apps and prefixes
     /// live here, saves and deletes mutate it), canned tree health, and
@@ -291,6 +402,8 @@ mod tests {
         /// Prefix slugs whose file is broken (loads yield `Invalid`).
         broken_prefixes: Mutex<Vec<String>>,
         canonicalized: Mutex<Vec<PathBuf>>,
+        /// Exe paths that fail the launch check (canonicalize → `NotFound`).
+        missing_exes: Mutex<Vec<PathBuf>>,
         health: TreeHealth,
     }
 
@@ -304,6 +417,7 @@ mod tests {
                 taken_app_slugs: Mutex::new(Vec::new()),
                 broken_prefixes: Mutex::new(Vec::new()),
                 canonicalized: Mutex::new(Vec::new()),
+                missing_exes: Mutex::new(Vec::new()),
                 health,
             }
         }
@@ -357,6 +471,13 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(slug.to_owned());
         }
+
+        fn mark_exe_missing(&self, path: &Path) {
+            self.missing_exes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(path.to_path_buf());
+        }
     }
 
     impl cellar_core::ports::__sealed::Sealed for MockStorage {}
@@ -364,6 +485,10 @@ mod tests {
     impl Storage for MockStorage {
         fn data_root(&self) -> &Path {
             Path::new("/mock")
+        }
+
+        fn prefix_dir(&self, slug: &str) -> PathBuf {
+            PathBuf::from("/mock/prefixes").join(slug)
         }
 
         fn load_settings(&self) -> Result<Settings, StorageError> {
@@ -446,8 +571,14 @@ mod tests {
                 .clone())
         }
 
-        fn load_app(&self, _slug: &str) -> Result<AppEntry, StorageError> {
-            Err(StorageError::NotFound("/mock/apps".to_owned()))
+        fn load_app(&self, slug: &str) -> Result<AppEntry, StorageError> {
+            self.apps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|app| app.slug == slug)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(format!("app {slug}")))
         }
 
         fn save_app(&self, app: &AppEntry) -> Result<(), StorageError> {
@@ -486,6 +617,14 @@ mod tests {
         }
 
         fn canonicalize_exe(&self, path: &Path) -> Result<PathBuf, StorageError> {
+            let missing = self
+                .missing_exes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if missing.iter().any(|gone| gone == path) {
+                return Err(StorageError::NotFound(path.display().to_string()));
+            }
+            drop(missing);
             self.canonicalized
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -797,6 +936,281 @@ mod tests {
             service.uninstall("../escape"),
             Err(StorageError::Invalid(_))
         ));
+        Ok(())
+    }
+
+    /// A resolver double: a canned outcome plus the last spec it saw —
+    /// records what the selection walk produced for the orchestration.
+    /// The `seen` record is `Arc`-shared so tests can inspect it after the
+    /// resolver has been moved into the service.
+    #[derive(Debug)]
+    struct StubResolver {
+        result: Result<ResolvedRunner, ResolveError>,
+        seen: Arc<Mutex<Option<RunnerSpec>>>,
+    }
+
+    impl StubResolver {
+        fn new(result: Result<ResolvedRunner, ResolveError>) -> Self {
+            Self {
+                result,
+                seen: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn ok() -> Self {
+            Self::new(Ok(wine_resolved()))
+        }
+    }
+
+    impl __sealed::Sealed for StubResolver {}
+
+    impl RunnerResolver for StubResolver {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+
+        fn resolve(&self, spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
+            *self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(spec.clone());
+            self.result.clone()
+        }
+    }
+
+    /// The canonical shape a wine resolution returns: discover-only, found
+    /// on PATH.
+    fn wine_resolved() -> ResolvedRunner {
+        ResolvedRunner {
+            mode: ProviderMode::DiscoverOnly,
+            reference: RunnerRef {
+                provider_id: "wine".to_owned(),
+                family: RunnerFamily::Wine,
+                install: RunnerInstall::Discovered {
+                    path: PathBuf::from("/usr/bin/wine"),
+                    version: None,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn launch_plans_a_registered_tool_end_to_end() -> Result<(), LaunchError> {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Wine)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let service = LaunchApp::new(mock, StubResolver::ok());
+        let plan = service.plan("balatro", &["-x".to_owned()])?;
+        assert_eq!(
+            plan.argv,
+            [
+                "/usr/bin/wine".to_owned(),
+                "/games/balatro.exe".to_owned(),
+                "-x".to_owned(),
+            ]
+        );
+        assert_eq!(
+            plan.env.get("WINEPREFIX").map(String::as_str),
+            Some("/mock/prefixes/default"),
+            "the plan pins the bound prefix for wine"
+        );
+        assert!(plan.wrappers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn launch_picks_the_defaults_of_the_binding_override_prefix() {
+        let mock = MockStorage::new(healthy_tree());
+        let mut overridden = entry("balatro", "/games/balatro.exe");
+        overridden.overrides.prefix = Some("games".to_owned());
+        mock.add_app(overridden);
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.add_prefix(Prefix {
+            slug: "games".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Proton)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let seen = Arc::new(Mutex::new(None));
+        let service = LaunchApp::new(
+            mock,
+            StubResolver {
+                result: Ok(wine_resolved()),
+                seen: Arc::clone(&seen),
+            },
+        );
+        let plan = service
+            .plan("balatro", &[])
+            .unwrap_or_else(|e| panic!("plan: {e}"));
+        assert_eq!(
+            *seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(RunnerSpec::new(RunnerFamily::Proton)),
+            "the binding override selects whose defaults apply"
+        );
+        assert_eq!(
+            plan.env.get("WINEPREFIX").map(String::as_str),
+            Some("/mock/prefixes/games"),
+            "the plan pins the override-bound prefix"
+        );
+    }
+
+    #[test]
+    fn launch_resolution_failures_map_to_the_taxonomy() {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        let service = LaunchApp::new(
+            mock,
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Wine,
+            })),
+        );
+        let err = service.plan("balatro", &[]).expect_err("no wine available");
+        assert_eq!(
+            err,
+            LaunchError::Resolve(ResolveError::Unresolvable {
+                family: RunnerFamily::Wine
+            }),
+            "resolution exhausted maps to the resolve family"
+        );
+        assert!(
+            err.to_string().contains("install it"),
+            "the message carries the SuggestInstall disposition: {err}"
+        );
+    }
+
+    #[test]
+    fn launch_missing_exe_maps_to_registration_disposition() {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.mark_exe_missing(Path::new("/games/balatro.exe"));
+        let service = LaunchApp::new(mock, StubResolver::ok());
+        let err = service.plan("balatro", &[]).expect_err("exe deleted");
+        assert_eq!(
+            err,
+            LaunchError::ExeMissing {
+                slug: "balatro".to_owned(),
+                exe: PathBuf::from("/games/balatro.exe"),
+            }
+        );
+        assert!(
+            err.to_string().contains("re-register"),
+            "the message carries the re-register disposition: {err}"
+        );
+    }
+
+    #[test]
+    fn launch_missing_prefix_maps_to_recreate_disposition() {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        // No prefix registered — the binding's prefix is gone.
+        let service = LaunchApp::new(mock, StubResolver::ok());
+        let err = service.plan("balatro", &[]).expect_err("prefix gone");
+        assert_eq!(
+            err,
+            LaunchError::PrefixMissing {
+                slug: "default".to_owned()
+            }
+        );
+        assert!(
+            err.to_string().contains("recreate"),
+            "the message carries the recreate disposition: {err}"
+        );
+    }
+
+    #[test]
+    fn launch_unknown_app_maps_to_app_not_found() {
+        let mock = MockStorage::new(healthy_tree());
+        let service = LaunchApp::new(mock, StubResolver::ok());
+        let err = service.plan("nope", &[]).expect_err("nothing registered");
+        assert_eq!(
+            err,
+            LaunchError::AppNotFound {
+                slug: "nope".to_owned()
+            }
+        );
+        assert!(
+            err.to_string().contains("register it"),
+            "the message carries the registration hint"
+        );
+    }
+
+    #[test]
+    fn launch_checks_in_taxonomy_order_resolve_before_exe() {
+        // Both a dead exe and an unresolvable runner: the resolve phase
+        // reports first (blueprint §7 phase order, deterministic first
+        // failure wins).
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.mark_exe_missing(Path::new("/games/balatro.exe"));
+        let service = LaunchApp::new(
+            mock,
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Proton,
+            })),
+        );
+        let err = service.plan("balatro", &[]).expect_err("runner first");
+        assert!(
+            matches!(err, LaunchError::Resolve(_)),
+            "the resolve family reports before the check family: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_joins_the_bound_prefix_default_runner() -> Result<(), StorageError> {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Proton)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let service = InstallService::new(mock);
+        let listed = service.list()?;
+        assert_eq!(
+            listed[0].prefix_runner,
+            Some(RunnerSpec::new(RunnerFamily::Proton)),
+            "the runner column's prefix-default rung joins the chain"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_degrades_the_runner_column_when_the_prefix_is_broken() -> Result<(), StorageError> {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.mark_broken_prefix("default");
+        let service = InstallService::new(mock);
+        let listed = service.list()?;
+        assert_eq!(
+            listed[0].prefix_runner, None,
+            "a broken prefix degrades the column to the floor — the doctor flags it"
+        );
         Ok(())
     }
 }

@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 cellar-core = { path = "../cellar-core" }
+cellar-launch = { path = "../cellar-launch" }
 
 [dev-dependencies]
 anyhow.workspace = true

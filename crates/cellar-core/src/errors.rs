@@ -7,25 +7,47 @@
 
 use std::fmt;
 
-/// Failure resolving a runner spec (pre-flight; doctor: `SuggestInstall`).
+use crate::types::RunnerFamily;
+
+/// Failure resolving a runner spec (pre-flight; dispositions per blueprint
+/// §7: order exhausted → doctor: `SuggestInstall`; corrupt install →
+/// reinstall).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
-    /// No provider can service the spec (unknown family, order exhausted).
-    ///
-    /// Scaffold providers return this until #28 wires real resolution; the
-    /// doc comments on each stub say so explicitly, so a pre-#28 failure is
-    /// a stub, not a silent wiring bug.
-    Unresolvable,
+    /// No provider can serve the spec — the family's resolution order
+    /// (configured → managed → PATH, research #18) is exhausted, or no
+    /// provider services the family. The failure's family names what a
+    /// `SuggestInstall` must install.
+    Unresolvable { family: RunnerFamily },
     /// The provider exists but its install is missing or corrupt
     /// (doctor: reinstall the runner).
-    NotInstalled,
+    NotInstalled { family: RunnerFamily },
+}
+
+impl ResolveError {
+    /// The family the failure concerns — the family of the spec being
+    /// resolved. A composition of providers keeps the serviced family's
+    /// error over another family's "not me" answer (#28).
+    pub const fn family(&self) -> RunnerFamily {
+        match self {
+            Self::Unresolvable { family } | Self::NotInstalled { family } => *family,
+        }
+    }
 }
 
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unresolvable => write!(f, "no runner provider can resolve this spec"),
-            Self::NotInstalled => write!(f, "the runner is not installed or is corrupt"),
+            Self::Unresolvable { family } => write!(
+                f,
+                "no {} runner could be resolved — install it or configure a path",
+                family.as_str()
+            ),
+            Self::NotInstalled { family } => write!(
+                f,
+                "the {} runner is not installed or is corrupt — reinstall it",
+                family.as_str()
+            ),
         }
     }
 }

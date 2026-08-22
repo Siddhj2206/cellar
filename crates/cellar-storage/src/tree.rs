@@ -276,6 +276,13 @@ impl Storage for TreeStore {
         &self.root
     }
 
+    fn prefix_dir(&self, slug: &str) -> PathBuf {
+        // Explicit delegation to the inherent `TreeStore::prefix_dir` — the
+        // layout stays the adapter's; inherent methods would shadow this
+        // trait method, so the UFCS call is deliberate, not recursion.
+        TreeStore::prefix_dir(self, slug)
+    }
+
     fn load_settings(&self) -> Result<Settings, StorageError> {
         self.ensure_tree()?;
         Self::read_envelope(&self.settings_path())

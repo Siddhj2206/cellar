@@ -1,9 +1,18 @@
-//! The Cellar launch machinery (blueprint §7): launch-plan resolution —
-//! runner ref (configured → managed → PATH), wrapper-chain assembly sorted by
-//! `Layer`, the `resolve → check → plan → execute` pipeline. A generic chain
+//! The Cellar launch machinery (blueprint §7, ADR 0002): launch-plan
+//! resolution — the two-stage precedence (selection: app override → prefix
+//! default → defaults floor; then the provider-internal resolution order
+//! configured → managed → PATH) — wrapper-chain assembly sorted by `Layer`,
+//! and the frozen `LaunchPlan` as a pure, printable value. A generic chain
 //! builder: env contracts are wrapper-provider data, never launch machinery
 //! (#21, ADR 0003).
 //!
-//! Lands with slices 04/05 (#28: resolution and dry-run, #29: execute and
-//! process semantics). The scaffold ships the crate so every later slice
-//! starts from a wired, rule-enforced workspace.
+//! This slice (#28) delivers the resolve → check → plan phases with nothing
+//! spawning: the selection walk and plan assembly below, the pre-flight
+//! [`LaunchError`] dispositions, and an empty effective wrapper chain.
+//! Spawning the frozen plan lands with the execute slice (#29).
+
+pub mod error;
+pub mod plan;
+
+pub use error::LaunchError;
+pub use plan::{apply_wrappers, build_plan, select_spec};

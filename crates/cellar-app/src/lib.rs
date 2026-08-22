@@ -13,5 +13,6 @@
 pub mod services;
 
 pub use services::{
-    DoctorService, EntryStatus, InstallResult, InstallService, ListedEntry, PrefixService,
+    DoctorService, EntryStatus, InstallResult, InstallService, LaunchApp, ListedEntry,
+    PrefixService,
 };

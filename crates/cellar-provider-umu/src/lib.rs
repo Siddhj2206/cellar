@@ -6,16 +6,16 @@
 //! contributing the `GAMEID`/`WINEPREFIX`/`PROTONPATH`/`PROTON_VERB` env
 //! contract (research #18).
 //!
-//! Resolution and the env contract land with the launch slice (#28) and the
-//! managed pipeline (#34); until then resolve/contribute are
-//! shape-holding stubs.
+//! Resolution and the env contract land with the managed-runner pipeline
+//! (#34); until then resolve/contribute are shape-holding stubs — the umu
+//! chain must not half-work inside a plain-wine plan.
 
 use cellar_core::errors::ResolveError;
 use cellar_core::manifest::{
     ArchiveLayout, ChecksumScheme, InstallKind, ReleaseSource, RunnerManifest,
 };
 use cellar_core::ports::{__sealed, ManagedRunner, RunnerResolver, WrapperContributor};
-use cellar_core::types::{LaunchPlan, Layer, ResolvedRunner, RunnerSpec};
+use cellar_core::types::{LaunchPlan, Layer, ResolvedRunner, RunnerFamily, RunnerSpec};
 
 /// Managed umu provider.
 #[derive(Debug)]
@@ -62,7 +62,12 @@ impl RunnerResolver for UmuProvider {
     }
 
     fn resolve(&self, _spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
-        Err(ResolveError::Unresolvable)
+        // Resolution (configured path → managed `umu-run` → PATH) lands
+        // with the managed pipeline (#34); until then every Umu spec is
+        // exhausted by construction.
+        Err(ResolveError::Unresolvable {
+            family: RunnerFamily::Umu,
+        })
     }
 }
 
@@ -78,6 +83,7 @@ impl WrapperContributor for UmuProvider {
     }
 
     // The umu env contract (GAMEID, WINEPREFIX, PROTONPATH, PROTON_VERB) is
-    // contributed by this provider — lands with the launch slice (#28).
+    // contributed by this provider — activated with the managed pipeline
+    // (#34), where the plan carries a Proton install to point at.
     fn contribute(&self, _plan: &mut LaunchPlan) {}
 }

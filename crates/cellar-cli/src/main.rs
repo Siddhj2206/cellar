@@ -18,8 +18,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use cellar_app::{DoctorService, InstallService, ListedEntry, PrefixService};
-use cellar_core::{AppEntry, AppKind, Prefix, RunnerRef, TreeHealth};
+use cellar_app::{DoctorService, InstallService, LaunchApp, ListedEntry, PrefixService};
+use cellar_core::ports::{__sealed, RunnerResolver};
+use cellar_core::{
+    AppEntry, AppKind, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerRef, RunnerSpec,
+    TreeHealth,
+};
+use cellar_providers::all_resolvers;
 use cellar_storage::TreeStore;
 
 /// The Cellar Windows app/game runtime for Linux.
@@ -36,6 +41,9 @@ enum Command {
     Install(InstallArgs),
     /// List every registered app with its status.
     List(ListArgs),
+    /// Launch a registered app through its launch plan — dry-run preview
+    /// for now (spawning lands with the execute slice).
+    Launch(LaunchArgs),
     /// Uninstall an app (removes its entry; app files stay on disk).
     Uninstall(UninstallArgs),
     /// Manage Cellar prefixes (blueprint §8: lifecycle objects get noun
@@ -72,6 +80,22 @@ struct ListArgs {
 struct UninstallArgs {
     /// The app slug, as shown by `list`.
     slug: String,
+}
+
+#[derive(Debug, Args)]
+struct LaunchArgs {
+    /// The app slug, as shown by `list`.
+    app: String,
+    /// Arguments passed to the app (hyphen-prefixed values are accepted
+    /// directly; a `--` separator also works).
+    #[arg(allow_hyphen_values = true)]
+    args: Vec<String>,
+    /// Print the effective plan without executing anything.
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+    /// Machine-readable JSON output (with --dry-run): the serialized plan.
+    #[arg(long, requires = "dry_run")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -146,6 +170,19 @@ fn run() -> anyhow::Result<ExitCode> {
             let service = InstallService::new(store.clone());
             let entries = service.list()?;
             print!("{}", render_app_list(&entries, args.json)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Launch(args) => {
+            if !args.dry_run {
+                // Execute lands with #29 — never pretend a launch happened.
+                anyhow::bail!(
+                    "executing is not available yet — pass --dry-run to preview the \
+                     plan (spawning lands with the execute slice #29)"
+                );
+            }
+            let service = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
+            let plan = service.plan(&args.app, &args.args)?;
+            print!("{}", render_plan(&plan, args.json)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Uninstall(args) => {
@@ -265,15 +302,18 @@ fn runner_ref_label(runner: &RunnerRef) -> String {
     }
 }
 
-/// The runner column of an entry: pinned ref → app override → the
-/// defaults-floor preset (Game → Proton, Tool → wine). The prefix default
-/// joins the chain with the launch slice (#28), which resolves the effective
-/// runner.
-fn runner_for(entry: &AppEntry) -> String {
+/// The runner column of an entry: pinned ref → app override → bound
+/// prefix's default → the defaults-floor preset (Game → Proton, Tool →
+/// wine). The prefix default rung joins with the launch slice (#28); the
+/// effective runner of a real launch is what `launch --dry-run` prints.
+fn runner_for(entry: &AppEntry, prefix_runner: Option<&cellar_core::RunnerSpec>) -> String {
     if let Some(runner) = &entry.runner {
         return runner_ref_label(runner);
     }
     if let Some(spec) = &entry.overrides.runner {
+        return runner_label(Some(spec));
+    }
+    if let Some(spec) = prefix_runner {
         return runner_label(Some(spec));
     }
     entry.kind.default_family().as_str().to_owned()
@@ -299,7 +339,7 @@ fn render_app_list(entries: &[ListedEntry], json: bool) -> anyhow::Result<String
                 listed.entry.slug.clone(),
                 listed.entry.kind.as_str().to_owned(),
                 listed.entry.prefix.clone(),
-                runner_for(&listed.entry),
+                runner_for(&listed.entry, listed.prefix_runner.as_ref()),
                 listed.status.as_str().to_owned(),
             ]
         })
@@ -317,6 +357,86 @@ struct JsonApp<'a> {
     #[serde(flatten)]
     entry: &'a AppEntry,
     status: &'static str,
+}
+
+/// The dry-run render: argv, env, and the wrapper chain — the effective
+/// plan's three surfaces (blueprint §7) — or the machine JSON: the plan
+/// itself, serialized, a reproducible artifact for bug reports.
+fn render_plan(plan: &LaunchPlan, json: bool) -> anyhow::Result<String> {
+    use std::fmt::Write;
+
+    if json {
+        return Ok(serde_json::to_string_pretty(plan)?);
+    }
+    let mut out = String::new();
+    writeln!(out, "  argv: {}", plan.argv.join(" "))?;
+    if plan.env.is_empty() {
+        writeln!(out, "  env:  (none)")?;
+    } else {
+        writeln!(out, "  env:")?;
+        for (key, value) in &plan.env {
+            writeln!(out, "    {key}={value}")?;
+        }
+    }
+    if plan.wrappers.is_empty() {
+        writeln!(out, "  wrappers: none")?;
+    } else {
+        let chain = plan
+            .wrappers
+            .iter()
+            .map(|layer| layer.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(out, "  wrappers: {chain}")?;
+    }
+    if let Some(cwd) = &plan.cwd {
+        writeln!(out, "  cwd:  {}", cwd.display())?;
+    }
+    Ok(out)
+}
+
+/// Composition-root glue (blueprint §4): the registry's heterogeneous
+/// resolver collection wrapped as a single `RunnerResolver`, tried in
+/// registry order. The error of the provider that services the spec's
+/// family wins over another family's "not me" — the message then names
+/// what a `SuggestInstall` must find (blueprint §7). `Box<dyn _>` lives
+/// here, at the composition root, nowhere below presentation.
+#[derive(Debug)]
+struct ResolverSet {
+    resolvers: Vec<Box<dyn RunnerResolver>>,
+}
+
+impl ResolverSet {
+    fn new(resolvers: Vec<Box<dyn RunnerResolver>>) -> Self {
+        Self { resolvers }
+    }
+}
+
+impl __sealed::Sealed for ResolverSet {}
+
+impl RunnerResolver for ResolverSet {
+    fn id(&self) -> &'static str {
+        "registry"
+    }
+
+    fn resolve(&self, spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
+        let mut last_error = ResolveError::Unresolvable {
+            family: spec.family,
+        };
+        let mut serviced = None;
+        for resolver in &self.resolvers {
+            match resolver.resolve(spec) {
+                Ok(resolved) => return Ok(resolved),
+                Err(err) => {
+                    last_error = err;
+                    if last_error.family() == spec.family {
+                        serviced = Some(last_error.clone());
+                    }
+                }
+            }
+        }
+        Err(serviced.unwrap_or(last_error))
+    }
 }
 
 /// The doctor's tree section: one pass/fail line per check, every failure
@@ -394,10 +514,12 @@ fn render_tree_health(health: &TreeHealth, json: bool) -> anyhow::Result<String>
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cellar_app::{EntryStatus, InstallService, ListedEntry, PrefixService};
+    use cellar_core::ports::Storage as _;
     use cellar_core::{
         AppEntry, AppKind, Overrides, PrefixDefaults, RunnerFamily, RunnerInstall, RunnerRef,
     };
@@ -541,6 +663,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_launch_with_dry_run_and_app_args() {
+        let cli = Cli::try_parse_from(["cellar", "launch", "balatro", "-n"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Launch(LaunchArgs {
+            app,
+            args,
+            dry_run,
+            json,
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(app, "balatro");
+        assert!(dry_run, "-n is the dry-run shorthand");
+        assert!(args.is_empty());
+        assert!(!json);
+        let cli = Cli::try_parse_from([
+            "cellar",
+            "launch",
+            "balatro",
+            "--dry-run",
+            "--json",
+            "--",
+            "--fullscreen",
+        ])
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Launch(LaunchArgs {
+            app,
+            args,
+            dry_run,
+            json,
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(app, "balatro");
+        assert!(dry_run);
+        assert!(json);
+        assert_eq!(args, ["--fullscreen"], "app args come after `--`");
+    }
+
+    #[test]
+    fn launch_json_requires_dry_run() {
+        assert!(
+            Cli::try_parse_from(["cellar", "launch", "balatro", "--json"]).is_err(),
+            "--json without --dry-run is a usage error"
+        );
+        assert!(
+            Cli::try_parse_from(["cellar", "launch", "balatro"]).is_ok(),
+            "launch without --dry-run parses — executing is refused at runtime"
+        );
+    }
+
+    #[test]
     fn parses_list_and_uninstall() {
         let cli = Cli::try_parse_from(["cellar", "list", "--json"])
             .unwrap_or_else(|e| panic!("parse: {e}"));
@@ -570,6 +746,7 @@ mod tests {
                 installed_at: None,
             },
             status,
+            prefix_runner: None,
         }
     }
 
@@ -604,24 +781,33 @@ mod tests {
     }
 
     #[test]
-    fn runner_column_honors_override_then_preset() {
+    fn runner_column_honors_override_then_prefix_default_then_preset() {
         let entry = listed_entry("balatro", AppKind::Game, EntryStatus::Ok).entry;
         assert_eq!(
-            runner_for(&entry),
+            runner_for(&entry, None),
             "proton",
             "the defaults-floor preset for games"
         );
         let mut tooled = entry.clone();
         tooled.kind = AppKind::Tool;
         assert_eq!(
-            runner_for(&tooled),
+            runner_for(&tooled, None),
             "wine",
             "the defaults-floor preset for tools"
+        );
+        let prefix_default = Some(cellar_core::RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            cellar_core::ConfiguredRunner::Path(PathBuf::from("/opt/wine/bin/wine")),
+        ));
+        assert_eq!(
+            runner_for(&tooled, prefix_default.as_ref()),
+            "wine /opt/wine/bin/wine",
+            "the bound prefix's default beats the kind preset"
         );
         let mut overridden = entry.clone();
         overridden.overrides.runner = Some(cellar_core::RunnerSpec::new(RunnerFamily::Wine));
         assert_eq!(
-            runner_for(&overridden),
+            runner_for(&overridden, None),
             "wine",
             "an app override beats the preset"
         );
@@ -634,7 +820,11 @@ mod tests {
                 path: PathBuf::from("/opt/proton"),
             },
         });
-        assert_eq!(runner_for(&pinned), "proton 9.0-4", "a pinned ref wins");
+        assert_eq!(
+            runner_for(&pinned, None),
+            "proton 9.0-4",
+            "a pinned ref wins"
+        );
     }
 
     #[test]
@@ -688,6 +878,222 @@ mod tests {
         assert_eq!(service.list()?.len(), 2);
         service.delete("my-games")?;
         assert_eq!(service.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn render_plan_shows_argv_env_and_wrappers() -> anyhow::Result<()> {
+        let plan = LaunchPlan {
+            argv: vec!["/usr/bin/wine".to_owned(), "/games/balatro.exe".to_owned()],
+            env: BTreeMap::from([("WINEPREFIX".to_owned(), "/root/prefixes/default".to_owned())]),
+            cwd: None,
+            wrappers: vec![],
+        };
+        let human = render_plan(&plan, false)?;
+        assert!(
+            human.contains("argv: /usr/bin/wine /games/balatro.exe"),
+            "argv line missing:\n{human}"
+        );
+        assert!(
+            human.contains("WINEPREFIX=/root/prefixes/default"),
+            "env missing:\n{human}"
+        );
+        assert!(human.contains("wrappers: none"), "chain missing:\n{human}");
+        let mut wrapped = plan.clone();
+        wrapped.wrappers = vec![cellar_core::Layer::Container];
+        let human = render_plan(&wrapped, false)?;
+        assert!(
+            human.contains("wrappers: container"),
+            "chain missing:\n{human}"
+        );
+        let json = render_plan(&plan, true)?;
+        assert!(
+            json.contains("\"argv\""),
+            "json missing the plan fields:\n{json}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolver_set_keeps_the_serviced_familys_error() {
+        // Providers answer "not me" with their own family; the set must
+        // prefer the error of the provider that services the spec's family
+        // — otherwise a wine spec would report proton's exhaustion.
+        let set = ResolverSet::new(vec![
+            Box::new(StubResolver {
+                family: RunnerFamily::Proton,
+                outcome: Err(ResolveError::Unresolvable {
+                    family: RunnerFamily::Proton,
+                }),
+            }),
+            Box::new(StubResolver {
+                family: RunnerFamily::Wine,
+                outcome: Err(ResolveError::Unresolvable {
+                    family: RunnerFamily::Wine,
+                }),
+            }),
+        ]);
+        let err = set
+            .resolve(&RunnerSpec::new(RunnerFamily::Wine))
+            .expect_err("all stubs fail");
+        assert_eq!(
+            err,
+            ResolveError::Unresolvable {
+                family: RunnerFamily::Wine
+            },
+            "the serviced family's error wins"
+        );
+        assert!(
+            err.to_string().contains("wine"),
+            "the message names what to install: {err}"
+        );
+    }
+
+    #[test]
+    fn resolver_set_first_success_wins() {
+        let set = ResolverSet::new(vec![
+            Box::new(StubResolver {
+                family: RunnerFamily::Proton,
+                outcome: Err(ResolveError::Unresolvable {
+                    family: RunnerFamily::Proton,
+                }),
+            }),
+            Box::new(StubResolver {
+                family: RunnerFamily::Wine,
+                outcome: Ok(ResolvedRunner {
+                    mode: cellar_core::ProviderMode::DiscoverOnly,
+                    reference: RunnerRef {
+                        provider_id: "wine".to_owned(),
+                        family: RunnerFamily::Wine,
+                        install: RunnerInstall::Discovered {
+                            path: PathBuf::from("/usr/bin/wine"),
+                            version: None,
+                        },
+                    },
+                }),
+            }),
+        ]);
+        let resolved = set
+            .resolve(&RunnerSpec::new(RunnerFamily::Wine))
+            .unwrap_or_else(|e| panic!("resolve: {e}"));
+        assert_eq!(resolved.mode, cellar_core::ProviderMode::DiscoverOnly);
+    }
+
+    /// A canned resolver double for composition-root tests: answers its
+    /// canned outcome regardless of the spec.
+    #[derive(Debug)]
+    struct StubResolver {
+        family: RunnerFamily,
+        outcome: Result<ResolvedRunner, ResolveError>,
+    }
+
+    impl cellar_core::ports::__sealed::Sealed for StubResolver {}
+
+    impl RunnerResolver for StubResolver {
+        fn id(&self) -> &'static str {
+            match self.family {
+                RunnerFamily::Proton => "proton",
+                RunnerFamily::Wine => "wine",
+                RunnerFamily::Umu => "umu",
+            }
+        }
+
+        fn resolve(&self, _spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
+            self.outcome.clone()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launch_dry_run_end_to_end_with_a_stub_wine() -> anyhow::Result<()> {
+        use cellar_core::ConfiguredRunner;
+        use std::os::unix::fs::PermissionsExt;
+
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-launch-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        // A stub wine binary: the configured path wins resolution — no PATH
+        // games, and the dry-run stays spawn-free.
+        let wine = root.join("stub-wine");
+        std::fs::write(&wine, "#!/bin/sh\nexit 0\n")?;
+        let mut perms = std::fs::metadata(&wine)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wine, perms)?;
+        // Register a tool app (kind floor: wine) whose prefix defaults to
+        // the configured stub — hand-edited, like a user would.
+        let exe = root.join("drive_c/tool.exe");
+        std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(&exe, "MZ")?;
+        let registered = InstallService::new(store.clone()).install(
+            &exe,
+            "default",
+            Some("My Tool"),
+            AppKind::Tool,
+        )?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(wine),
+        ));
+        store.save_prefix(&prefix)?;
+        // Plan it: resolve → check → plan, pure and printable.
+        let app = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let plan = app.plan(&registered.entry.slug, &["--fullscreen".to_owned()])?;
+        let canonical_exe = std::fs::canonicalize(&exe)?;
+        assert_eq!(
+            plan.argv,
+            [
+                root.join("stub-wine").to_string_lossy().into_owned(),
+                canonical_exe.to_string_lossy().into_owned(),
+                "--fullscreen".to_owned(),
+            ],
+            "argv = configured runner, canonical exe, args"
+        );
+        let expected_prefix = store.prefix_dir(&registered.entry.prefix);
+        assert_eq!(
+            plan.env.get("WINEPREFIX").map(String::as_str),
+            Some(expected_prefix.to_string_lossy().as_ref()),
+            "the plan pins the bound prefix"
+        );
+        assert!(plan.wrappers.is_empty());
+        // The human render is the printable dry-run surface.
+        let human = render_plan(&plan, false)?;
+        assert!(human.contains("argv:"), "render missing:\n{human}");
+        // The JSON render is the machine surface.
+        let json = render_plan(&plan, true)?;
+        assert!(json.contains("\"argv\""), "json missing:\n{json}");
+        // Pre-flight dispositions against the real tree: a deleted exe
+        // re-registers; an unresolvable runner suggests install.
+        std::fs::remove_file(&exe)?;
+        let err = app.plan(&registered.entry.slug, &[]).expect_err("exe gone");
+        assert!(
+            err.to_string().contains("re-register"),
+            "disposition missing: {err}"
+        );
+        // A game in a runnerless prefix hits the kind floor (Proton), which
+        // nothing resolves before the managed pipeline — SuggestInstall.
+        let second_store = store.clone();
+        let games = PrefixService::new(store.clone()).create("games")?;
+        let game_root = root.join("game-exe");
+        std::fs::create_dir_all(&game_root)?;
+        let game_exe = game_root.join("game.exe");
+        std::fs::write(&game_exe, "MZ")?;
+        let game = InstallService::new(store.clone()).install(
+            &game_exe,
+            &games.slug,
+            None,
+            AppKind::Game,
+        )?;
+        let app = LaunchApp::new(second_store, ResolverSet::new(all_resolvers()));
+        let err = app.plan(&game.entry.slug, &[]).expect_err("no proton yet");
+        assert!(
+            err.to_string().contains("proton"),
+            "the SuggestInstall message names the family: {err}"
+        );
         Ok(())
     }
 }

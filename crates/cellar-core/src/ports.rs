@@ -64,6 +64,12 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// The tree root: `$XDG_DATA_HOME/cellar`.
     fn data_root(&self) -> &Path;
 
+    /// The on-disk directory of one prefix: pure layout math, no I/O —
+    /// `$root/prefixes/<slug>` (ADR 0001). The launch plan needs the path
+    /// for the wine `WINEPREFIX` contract; the layout stays the adapter's
+    /// knowledge, never `launch`/`app`'s.
+    fn prefix_dir(&self, slug: &str) -> PathBuf;
+
     fn load_settings(&self) -> Result<Settings, StorageError>;
     fn save_settings(&self, settings: &Settings) -> Result<(), StorageError>;
 
