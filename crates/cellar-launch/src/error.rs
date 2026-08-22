@@ -1,9 +1,12 @@
-//! Pre-flight failures of the launch pipeline, mapped to the blueprint §7
-//! failure taxonomy and its dispositions.
+//! Failures of the launch pipeline, mapped to the blueprint §7 failure
+//! taxonomy and its dispositions — the pre-flight families (Resolve, Check,
+//! Plan) and the execute phase's post-plan Spawn family (the OS error,
+//! reported as-is). The Runtime family (the exit code) is propagated raw by
+//! the presentation, not this error type.
 //!
-//! This slice (#28) carries the resolve and check families plus the
-//! plan-family "not planable yet" boundary; the spawn and runtime families
-//! land with the execute slice (#29).
+//! This slice (#28) carried the resolve and check families plus the
+//! plan-family "not planable yet" boundary; the spawn family lands with the
+//! execute slice (#29).
 
 use cellar_core::errors::{ResolveError, StorageError};
 use cellar_core::types::RunnerFamily;
@@ -11,8 +14,9 @@ use cellar_core::types::RunnerFamily;
 use std::fmt;
 use std::path::PathBuf;
 
-/// A launch that cannot reach a frozen plan. Every variant's message ends in
-/// the blueprint §7 disposition — the fix, not just the failure.
+/// A launch that failed. Pre-plan variants end in the blueprint §7
+/// disposition — the fix, not just the failure; the post-plan Spawn family
+/// reports the OS error as-is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchError {
     /// No entry is registered under this slug.
@@ -32,6 +36,10 @@ pub enum LaunchError {
     /// this family (the umu container layer) lands with the managed-runner
     /// pipeline (#34).
     PlanUnavailable { family: RunnerFamily },
+    /// The execute phase failed to start or capture the plan's process
+    /// (blueprint §7 Spawn family, post-plan): the OS error is reported
+    /// as-is, named with the program the launch ran.
+    Spawn { program: String, error: String },
     /// Any other storage failure (I/O, invalid tree files) — surfaced in
     /// the tree's own vocabulary.
     Storage(StorageError),
@@ -63,6 +71,9 @@ impl fmt::Display for LaunchError {
                  lands with the managed-runner pipeline (#34)",
                 family.as_str()
             ),
+            Self::Spawn { program, error } => {
+                write!(f, "failed to launch {program}: {error}")
+            }
             Self::Storage(err) => write!(f, "{err}"),
         }
     }

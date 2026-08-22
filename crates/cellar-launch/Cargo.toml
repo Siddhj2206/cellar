@@ -1,6 +1,6 @@
 [package]
 name = "cellar-launch"
-description = "Launch-plan resolution and chain assembly: runner ref (configured → managed → PATH), Layer-sorted wrappers"
+description = "Launch pipeline: plan resolution (runner ref, Layer-sorted wrappers) and the execute phase (spawn, per-launch logs)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

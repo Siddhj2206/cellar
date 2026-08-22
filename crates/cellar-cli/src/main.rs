@@ -6,19 +6,24 @@
 //! future `cellar-gui` leaf; flipping primary is `default-members`, zero
 //! edits below presentation.
 //!
-//! Surface for this slice (#27): `cellar install <exe>` (the standalone
-//! branch — registered without executing), `cellar list` (apps table),
-//! `cellar uninstall <app>` — on top of #26's `cellar prefix …` and
-//! `cellar doctor`. Exit codes (ADR 0004): 0 success, 1 operation error or
-//! doctor problems, 2 usage (clap).
+//! Surface for this slice (#29): `cellar launch <app>` executes the frozen
+//! plan — foreground by default with the game's exit code propagated raw,
+//! `--detach` releasing the process from the terminal, `-n/--dry-run`
+//! printing the plan spawn-free — on top of #27's install/list/uninstall,
+//! #26's `cellar prefix …` and `cellar doctor`. Exit codes (ADR 0004):
+//! 0 success, 1 operation error or doctor problems, 2 usage; `launch`
+//! propagates the game's exit code raw (§7), the collision with 1
+//! documented, not mapped.
 
 use clap::{Args, Parser, Subcommand};
 
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{ExitCode, ExitStatus};
 use std::str::FromStr;
 
-use cellar_app::{DoctorService, InstallService, LaunchApp, ListedEntry, PrefixService};
+use cellar_app::{
+    DoctorService, InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService,
+};
 use cellar_core::ports::{__sealed, RunnerResolver};
 use cellar_core::{
     AppEntry, AppKind, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerRef, RunnerSpec,
@@ -41,8 +46,9 @@ enum Command {
     Install(InstallArgs),
     /// List every registered app with its status.
     List(ListArgs),
-    /// Launch a registered app through its launch plan — dry-run preview
-    /// for now (spawning lands with the execute slice).
+    /// Launch a registered app through its launch plan — foreground by
+    /// default with the exit code propagated raw, `--detach` to release
+    /// the process from the terminal, `--dry-run` to preview spawn-free.
     Launch(LaunchArgs),
     /// Uninstall an app (removes its entry; app files stay on disk).
     Uninstall(UninstallArgs),
@@ -93,6 +99,10 @@ struct LaunchArgs {
     /// Print the effective plan without executing anything.
     #[arg(short = 'n', long)]
     dry_run: bool,
+    /// Release the launch from the terminal: spawn, print pid and log path,
+    /// and return while the process keeps running.
+    #[arg(long, conflicts_with_all = ["dry_run", "json"])]
+    detach: bool,
     /// Machine-readable JSON output (with --dry-run): the serialized plan.
     #[arg(long, requires = "dry_run")]
     json: bool,
@@ -173,17 +183,34 @@ fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Launch(args) => {
-            if !args.dry_run {
-                // Execute lands with #29 — never pretend a launch happened.
-                anyhow::bail!(
-                    "executing is not available yet — pass --dry-run to preview the \
-                     plan (spawning lands with the execute slice #29)"
-                );
-            }
             let service = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
-            let plan = service.plan(&args.app, &args.args)?;
-            print!("{}", render_plan(&plan, args.json)?);
-            Ok(ExitCode::SUCCESS)
+            if args.dry_run {
+                // Pre-plan phases only: resolve → check → plan, pure and
+                // printable — nothing spawns (blueprint §7).
+                let plan = service.plan(&args.app, &args.args)?;
+                print!("{}", render_plan(&plan, args.json)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Execute phase (blueprint §7): spawn the frozen plan; the
+            // wait-vs-detach policy is presentation's (CLI foregrounds,
+            // --detach releases the process from the terminal).
+            let mode = if args.detach {
+                LaunchMode::Detached
+            } else {
+                LaunchMode::Foreground
+            };
+            let process = service.spawn(&args.app, &args.args, mode)?;
+            if args.detach {
+                println!(
+                    "Detached '{}' — pid {}, output: {}",
+                    args.app,
+                    process.pid(),
+                    process.log_path().display()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            let status = process.wait()?;
+            Ok(exit_code_for(status))
         }
         Command::Uninstall(args) => {
             let service = InstallService::new(store);
@@ -228,6 +255,32 @@ fn run() -> anyhow::Result<ExitCode> {
             }
         }
     }
+}
+
+/// The game's exit status → our exit code (blueprint §7 Runtime family, ADR
+/// 0004): a real exit code propagates raw — including 1, whose collision
+/// with Cellar's operation-error code is documented, not mapped. A
+/// signal-terminated process has no code to propagate: the signal is
+/// reported to stderr and Cellar exits 1.
+fn exit_code_for(status: ExitStatus) -> ExitCode {
+    if let Some(code) = status.code() {
+        return ExitCode::from(raw_exit_code(code));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            eprintln!("the game was terminated by a signal ({signal})");
+        }
+    }
+    ExitCode::FAILURE
+}
+
+/// The raw exit code as an `ExitCode`-compatible byte. Unix exit codes are
+/// 0–255 by POSIX; anything else (conceivable only off Unix) degrades to 1
+/// rather than silently truncating a code the terminal never reported.
+fn raw_exit_code(code: i32) -> u8 {
+    u8::try_from(code).unwrap_or(1)
 }
 
 /// A column table: header row, blank line, then padded, two-space-separated
@@ -670,6 +723,7 @@ mod tests {
             app,
             args,
             dry_run,
+            detach,
             json,
         }) = cli.command
         else {
@@ -678,6 +732,7 @@ mod tests {
         assert_eq!(app, "balatro");
         assert!(dry_run, "-n is the dry-run shorthand");
         assert!(args.is_empty());
+        assert!(!detach);
         assert!(!json);
         let cli = Cli::try_parse_from([
             "cellar",
@@ -693,6 +748,7 @@ mod tests {
             app,
             args,
             dry_run,
+            detach,
             json,
         }) = cli.command
         else {
@@ -700,8 +756,48 @@ mod tests {
         };
         assert_eq!(app, "balatro");
         assert!(dry_run);
+        assert!(!detach);
         assert!(json);
         assert_eq!(args, ["--fullscreen"], "app args come after `--`");
+    }
+
+    #[test]
+    fn parses_launch_detach() {
+        let cli = Cli::try_parse_from(["cellar", "launch", "balatro", "--detach"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Launch(LaunchArgs { detach, .. }) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(detach);
+        // Detaching is a spawn policy — it cannot combine with the
+        // spawn-free preview or its JSON render.
+        assert!(
+            Cli::try_parse_from(["cellar", "launch", "balatro", "--detach", "--dry-run"]).is_err(),
+            "--detach conflicts with --dry-run"
+        );
+        assert!(
+            Cli::try_parse_from(["cellar", "launch", "balatro", "--detach", "--json"]).is_err(),
+            "--json requires --dry-run, which --detach conflicts with"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launch_exit_codes_propagate_raw() {
+        use std::os::unix::process::ExitStatusExt;
+
+        // A real wait-status encodes the exit code in the high byte.
+        assert_eq!(
+            raw_exit_code(ExitStatus::from_raw(7 << 8).code().unwrap()),
+            7
+        );
+        assert_eq!(raw_exit_code(ExitStatus::from_raw(0).code().unwrap()), 0);
+        // Signal deaths have no code — the raw path degrades to 1 (the
+        // signal itself is reported to stderr by `exit_code_for`).
+        assert_eq!(
+            raw_exit_code(ExitStatus::from_raw(0x02).code().unwrap_or(1)),
+            1
+        );
     }
 
     #[test]
@@ -712,7 +808,7 @@ mod tests {
         );
         assert!(
             Cli::try_parse_from(["cellar", "launch", "balatro"]).is_ok(),
-            "launch without --dry-run parses — executing is refused at runtime"
+            "a plain launch parses and executes for real (#29)"
         );
     }
 
@@ -1003,11 +1099,135 @@ mod tests {
         }
     }
 
+    /// Write an executable stub script the way every spawn test does: create →
+    /// write → `sync_all` → drop, so the script leaves the write-open state
+    /// (the exec `ETXTBSY` window) before any spawn — one pattern, no
+    /// drifted copies (mirrored in `cellar-launch` and `cellar-app`).
+    #[cfg(unix)]
+    fn write_stub_script(path: &Path, body: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launch_executes_the_plan_end_to_end_with_a_stub_wine() -> anyhow::Result<()> {
+        use cellar_core::ConfiguredRunner;
+
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-execute-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        // The configured stub runner wins resolution — no real wine needed.
+        // It echoes the plan it received (argv, the WINEPREFIX contract,
+        // both streams) and exits 7: the raw-code and per-launch-log
+        // acceptance criteria, in one binary.
+        let wine = root.join("stub-wine");
+        write_stub_script(
+            &wine,
+            "echo \"argv=$*\"\necho \"wineprefix=$WINEPREFIX\"\necho \"out-line\"\necho \"err-line\" >&2\nexit 7\n",
+        )?;
+        let exe = root.join("drive_c/tool.exe");
+        std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(&exe, "MZ")?;
+        let registered = InstallService::new(store.clone()).install(
+            &exe,
+            "default",
+            Some("My Tool"),
+            AppKind::Tool,
+        )?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(wine.clone()),
+        ));
+        store.save_prefix(&prefix)?;
+        let service = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
+        // Foreground: spawn the frozen plan, await it, propagate the raw
+        // exit code — 7, not a Cellar error.
+        let process = service.spawn(
+            &registered.entry.slug,
+            &["--fullscreen".to_owned()],
+            LaunchMode::Foreground,
+        )?;
+        let log_path = process.log_path().to_path_buf();
+        let status = process.wait()?;
+        assert_eq!(status.code(), Some(7), "the exit code propagates raw");
+        assert!(
+            log_path.starts_with(store.launch_logs_dir()),
+            "output lands under the disposable cache: {}",
+            log_path.display()
+        );
+        let name = log_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(
+            name.starts_with("my-tool-"),
+            "per-launch log named <slug>-<timestamp>.log: {name}"
+        );
+        assert_eq!(
+            log_path.extension().and_then(|ext| ext.to_str()),
+            Some("log"),
+            "the log ends in .log: {name}"
+        );
+        let text = std::fs::read_to_string(log_path)?;
+        assert!(
+            text.contains("--fullscreen"),
+            "the plan's argv ran exactly:\n{text}"
+        );
+        assert!(
+            text.contains("wineprefix=") && text.contains("prefixes/default"),
+            "the plan's env contract (WINEPREFIX) applied:\n{text}"
+        );
+        assert!(text.contains("out-line"), "stdout missing:\n{text}");
+        assert!(text.contains("err-line"), "stderr missing:\n{text}");
+        // Detached: the handle returns with the process still running, and
+        // its output still lands in its own per-launch log.
+        let sleeper = root.join("stub-sleeper");
+        write_stub_script(&sleeper, "echo sleeping\nexit 0\n")?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(sleeper.clone()),
+        ));
+        store.save_prefix(&prefix)?;
+        let service = LaunchApp::new(store, ResolverSet::new(all_resolvers()));
+        let process = service.spawn(&registered.entry.slug, &[], LaunchMode::Detached)?;
+        let log_path = process.log_path().to_path_buf();
+        // The Linux liveness probe: the pid exists while the launch runs —
+        // no libc/unsafe needed.
+        #[cfg(target_os = "linux")]
+        assert!(
+            std::fs::metadata(format!("/proc/{}", process.pid())).is_ok(),
+            "--detach must return with the process still running (pid {})",
+            process.pid()
+        );
+        let status = process.wait()?;
+        assert_eq!(status.code(), Some(0), "the detached launch ran to the end");
+        let text = std::fs::read_to_string(&log_path)?;
+        assert!(
+            text.contains("sleeping"),
+            "detached output missing:\n{text}"
+        );
+        Ok(())
+    }
+
     #[test]
     #[cfg(unix)]
     fn launch_dry_run_end_to_end_with_a_stub_wine() -> anyhow::Result<()> {
         use cellar_core::ConfiguredRunner;
-        use std::os::unix::fs::PermissionsExt;
 
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -1019,10 +1239,7 @@ mod tests {
         // A stub wine binary: the configured path wins resolution — no PATH
         // games, and the dry-run stays spawn-free.
         let wine = root.join("stub-wine");
-        std::fs::write(&wine, "#!/bin/sh\nexit 0\n")?;
-        let mut perms = std::fs::metadata(&wine)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&wine, perms)?;
+        write_stub_script(&wine, "exit 0\n")?;
         // Register a tool app (kind floor: wine) whose prefix defaults to
         // the configured stub — hand-edited, like a user would.
         let exe = root.join("drive_c/tool.exe");

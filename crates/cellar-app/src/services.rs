@@ -6,9 +6,6 @@
 //! the `Storage` port — concrete adapters are injected only at the
 //! composition root.
 
-use std::collections::BTreeSet;
-use std::path::Path;
-
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Overrides};
 use cellar_core::errors::StorageError;
@@ -16,7 +13,10 @@ use cellar_core::health::TreeHealth;
 use cellar_core::ports::{RunnerResolver, Storage};
 use cellar_core::slug;
 use cellar_core::types::{LaunchPlan, RunnerSpec};
-use cellar_launch::{LaunchError, build_plan, select_spec};
+use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 /// The check-phase status of a registered entry (blueprint §7: the check
 /// phase applied entry-wide). This slice checks the registered exe's
@@ -214,10 +214,13 @@ impl<S: Storage> InstallService<S> {
     }
 }
 
-/// The `LaunchApp` use-case (blueprint §7): resolve → check → plan, with
-/// nothing spawning until the plan is frozen. This slice delivers the
-/// frozen plan as a pure, printable value — `--dry-run` and the GUI preview
-/// render it; spawning it lands with the execute slice (#29).
+/// The `LaunchApp` use-case (blueprint §7): resolve → check → plan →
+/// execute, with nothing spawning before the plan is frozen. This slice
+/// (#28) delivered the frozen plan as a pure, printable value — `--dry-run`
+/// and the GUI preview render it; the execute phase lands here as well:
+/// [`LaunchApp::spawn`] runs the plan and returns a [`SpawnedProcess`]
+/// handle whose per-launch log lives under the disposable cache, and the
+/// presentation decides the wait-vs-detach policy (§7).
 ///
 /// The check phase is doctor applied to one launch, in taxonomy order: the
 /// bound prefix must exist (disposition: recreate), runner resolution must
@@ -292,6 +295,38 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
         // this slice (no wrapper activation rules yet, #34).
         let prefix_dir = self.storage.prefix_dir(&prefix_slug);
         build_plan(&entry, &prefix, &resolved, &prefix_dir, &[], args)
+    }
+
+    /// The execute phase (blueprint §7): freeze the plan exactly as
+    /// [`LaunchApp::plan`] would, then spawn it into a
+    /// [`SpawnedProcess`]. Output always goes to a fresh
+    /// `<slug>-<timestamp>.log` inside the tree's disposable
+    /// `cache/launch-logs` (blueprint §7 naming; the directory is the
+    /// adapter's layout via [`Storage::launch_logs_dir`]). Nothing spawns
+    /// before the plan is frozen — `--dry-run` stays spawn-free.
+    pub fn spawn(
+        &self,
+        slug: &str,
+        args: &[String],
+        mode: LaunchMode,
+    ) -> Result<SpawnedProcess, LaunchError> {
+        let plan = self.plan(slug, args)?;
+        let log_path = self.launch_log_path(slug);
+        cellar_launch::spawn(&plan, &log_path, mode)
+    }
+
+    /// The per-launch log file: `<slug>-<timestamp>.log` under the
+    /// disposable cache (blueprint §7). The timestamp is epoch nanoseconds
+    /// from the system clock (with a defensive 0 fallback) — practically
+    /// unique per launch, so two launches of the same app never fight over
+    /// one log; the open is append-only, never truncate, as a second guard.
+    fn launch_log_path(&self, slug: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        self.storage
+            .launch_logs_dir()
+            .join(format!("{slug}-{nanos}.log"))
     }
 }
 
@@ -385,7 +420,7 @@ mod tests {
         ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
     };
     use cellar_core::{Prefix, PrefixDefaults};
-    use cellar_launch::LaunchError;
+    use cellar_launch::{LaunchError, LaunchMode};
 
     /// In-memory `Storage` double: real registry state (apps and prefixes
     /// live here, saves and deletes mutate it), canned tree health, and
@@ -404,6 +439,9 @@ mod tests {
         canonicalized: Mutex<Vec<PathBuf>>,
         /// Exe paths that fail the launch check (canonicalize → `NotFound`).
         missing_exes: Mutex<Vec<PathBuf>>,
+        /// Where per-launch logs go (the real store: the tree's
+        /// `cache/launch-logs`); spawn tests point it at a temp dir.
+        log_dir: PathBuf,
         health: TreeHealth,
     }
 
@@ -418,8 +456,14 @@ mod tests {
                 broken_prefixes: Mutex::new(Vec::new()),
                 canonicalized: Mutex::new(Vec::new()),
                 missing_exes: Mutex::new(Vec::new()),
+                log_dir: PathBuf::from("/mock/cache/launch-logs"),
                 health,
             }
+        }
+
+        fn with_log_dir(mut self, log_dir: PathBuf) -> Self {
+            self.log_dir = log_dir;
+            self
         }
 
         fn created(&self) -> Vec<String> {
@@ -489,6 +533,10 @@ mod tests {
 
         fn prefix_dir(&self, slug: &str) -> PathBuf {
             PathBuf::from("/mock/prefixes").join(slug)
+        }
+
+        fn launch_logs_dir(&self) -> PathBuf {
+            self.log_dir.clone()
         }
 
         fn load_settings(&self) -> Result<Settings, StorageError> {
@@ -1152,6 +1200,99 @@ mod tests {
             err.to_string().contains("register it"),
             "the message carries the registration hint"
         );
+    }
+
+    /// A resolved wine runner at an explicit path — spawn tests point it at
+    /// a real stub executable.
+    fn wine_resolved_at(path: &Path) -> ResolvedRunner {
+        ResolvedRunner {
+            mode: ProviderMode::DiscoverOnly,
+            reference: RunnerRef {
+                provider_id: "wine".to_owned(),
+                family: RunnerFamily::Wine,
+                install: RunnerInstall::Discovered {
+                    path: path.to_path_buf(),
+                    version: None,
+                },
+            },
+        }
+    }
+
+    /// Write an executable stub script the way every spawn test does:
+    /// create → write → `sync_all` → drop, so the script leaves the
+    /// write-open state (the exec `ETXTBSY` window) before any spawn — one
+    /// pattern, no drifted copies (mirrored in `cellar-launch` and the CLI).
+    #[cfg(unix)]
+    fn write_stub_script(path: &Path, body: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launch_spawns_the_frozen_plan_into_the_per_launch_log() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-launch-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs)?;
+        // The configured stub runner: echo both streams, exit 7 — the
+        // configured path wins resolution, so no real wine is needed.
+        let wine = dir.join("stub-wine");
+        write_stub_script(&wine, "echo \"app-out\"\necho \"app-err\" >&2\nexit 7\n")?;
+        let mock = MockStorage::new(healthy_tree()).with_log_dir(logs.clone());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Wine)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let service = LaunchApp::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let process = service.spawn("balatro", &[], LaunchMode::Foreground)?;
+        assert!(process.pid() > 0);
+        // `wait` consumes the handle; the log path is wanted for the rest
+        // of the assertions.
+        let log_path = process.log_path().to_path_buf();
+        let status = process.wait()?;
+        assert_eq!(status.code(), Some(7), "the exit code propagates raw");
+        assert!(
+            log_path.starts_with(&logs),
+            "the log lives under the disposable cache: {}",
+            log_path.display()
+        );
+        let name = log_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(
+            name.starts_with("balatro-"),
+            "the log is <slug>-<timestamp>.log, got {name}"
+        );
+        assert_eq!(
+            log_path.extension().and_then(|ext| ext.to_str()),
+            Some("log"),
+            "the log ends in .log: {name}"
+        );
+        let text = std::fs::read_to_string(log_path)?;
+        assert!(text.contains("app-out"), "stdout missing:\n{text}");
+        assert!(text.contains("app-err"), "stderr missing:\n{text}");
+        Ok(())
     }
 
     #[test]

@@ -87,6 +87,13 @@ impl TreeStore {
         self.root.join("prefixes").join(slug)
     }
 
+    /// The per-launch log directory (blueprint §7): a subdir of the
+    /// disposable `cache/`, not a fifth top-level node — the doctor's
+    /// directory sweep stays the four locked dirs (ADR 0001).
+    pub fn launch_logs_dir(&self) -> PathBuf {
+        self.root.join("cache/launch-logs")
+    }
+
     fn settings_path(&self) -> PathBuf {
         self.root.join("settings.toml")
     }
@@ -108,6 +115,11 @@ impl TreeStore {
             let path = self.root.join(dir);
             fs::create_dir_all(&path).map_err(|e| io_err(&path, &e))?;
         }
+        // The per-launch log directory (blueprint §7) — a subdir of `cache`,
+        // so `TREE_DIRS` and the health sweep keep the four locked top-level
+        // nodes.
+        fs::create_dir_all(self.launch_logs_dir())
+            .map_err(|e| io_err(&self.launch_logs_dir(), &e))?;
         if !self.settings_path().exists() {
             Self::write_envelope(&self.settings_path(), &Settings::default())?;
         }
@@ -281,6 +293,12 @@ impl Storage for TreeStore {
         // layout stays the adapter's; inherent methods would shadow this
         // trait method, so the UFCS call is deliberate, not recursion.
         TreeStore::prefix_dir(self, slug)
+    }
+
+    fn launch_logs_dir(&self) -> PathBuf {
+        // Same deliberate UFCS delegation as `prefix_dir`: the adapter owns
+        // the layout, the port exposes it (#29).
+        TreeStore::launch_logs_dir(self)
     }
 
     fn load_settings(&self) -> Result<Settings, StorageError> {
@@ -579,6 +597,21 @@ mod tests {
         }
         let settings = file_text(&root, "settings.toml");
         assert!(settings.starts_with("schema_version = 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn first_run_creates_the_per_launch_log_directory() -> Result<(), StorageError> {
+        // Blueprint §7: game output always goes to `cache/launch-logs/` — a
+        // subdir of the disposable cache, created with the tree (#29).
+        let (store, root) = store("launch-logs");
+        store.create_prefix("default")?;
+        assert!(root.join("cache/launch-logs").is_dir());
+        assert_eq!(
+            store.launch_logs_dir(),
+            root.join("cache/launch-logs"),
+            "the layout stays the adapter's knowledge"
+        );
         Ok(())
     }
 

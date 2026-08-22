@@ -70,6 +70,12 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// knowledge, never `launch`/`app`'s.
     fn prefix_dir(&self, slug: &str) -> PathBuf;
 
+    /// The per-launch log directory: `$root/cache/launch-logs` (blueprint
+    /// §7: game output is disposable, ADR 0001). Pure layout math, no I/O —
+    /// same role as [`Storage::prefix_dir`]; the launch pipeline composes
+    /// `<slug>-<timestamp>.log` inside it.
+    fn launch_logs_dir(&self) -> PathBuf;
+
     fn load_settings(&self) -> Result<Settings, StorageError>;
     fn save_settings(&self, settings: &Settings) -> Result<(), StorageError>;
 
