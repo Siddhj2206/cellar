@@ -2,6 +2,8 @@
 
 A Windows app/game runtime for Linux: Cellar provisions Wine prefixes, manages Proton and umu, discovers and registers executables, and launches them under a uniform launch plan. App-launcher-first: many apps per prefix, one launcher entry per executable.
 
+Terms are decided through the wayfinder map [Cellar rewrite blueprint (rethink)](https://github.com/Siddhj2206/cellar/issues/14); new terms land as its domain tickets resolve.
+
 ## Language
 
 **Cellar**:
