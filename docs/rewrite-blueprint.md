@@ -144,7 +144,39 @@ resolve → check → plan → execute
 
 ## 8. CLI surface & first-run UX
 
-<!-- Pending #23. -->
+Locked via [#23 — CLI surface and first-run guided install UX](https://github.com/Siddhj2206/cellar/issues/23); contract governed by clig.dev; rationale: [ADR 0004](adr/0004-cli-surface-and-first-run-ux.md).
+
+**Command model** — verb-first, two noun groups. The rule for implementers: *actions on artifacts are top-level verbs; objects with lifecycle get noun groups*:
+
+```
+cellar install <path>   flagship: guided first-run flow (installer-aware)
+cellar launch <app>     daily driver: foreground by default; --detach; -n/--dry-run prints the plan (§7)
+cellar uninstall <app>  pairs with install
+cellar list             table: slug, kind, prefix, runner, status (+ --json)
+cellar doctor           sectioned capability checks (+ --json)
+cellar prefix create|list|delete <slug>
+cellar runner install|list <name>    managed runtimes; discover-only shown read-only
+```
+
+`cellar install <path>` is always an artifact; managed runtimes are `cellar runner install` — no ambiguity.
+
+**Flag & output contract** (clig.dev):
+- Standard flags everywhere: `--json`, `--no-input`, `-n/--dry-run`, `-q/--quiet`, `--version`, `-h/--help`; `NO_COLOR` and non-TTY → no color.
+- Human-readable on a TTY; `--json` for machines (`list`, `doctor`, `launch --dry-run`); piped stdout degrades data commands to plain tables.
+- Exit codes: **0** success · **1** Cellar operation error · **2** usage. `launch` propagates the game's exit code (§7: raw, no magic mapping); the collision with 1 is documented, not mapped.
+- Typo suggestions (`Did you mean list?`); no-args on a required-arg command → concise help with examples first.
+
+**The flagship flow** — `cellar install <path>`, five steps:
+1. **Pick or create prefix** — list existing; name a new one (slug, default `default`).
+2. **Handle the artifact** — installer: run inside the prefix, exit awaited (§7); archive: extract into it; standalone: register without executing.
+3. **Discovery** — `.lnk` candidates, multi-select keep/hide + manual add; never guesses a "main" exe, never registers silently.
+4. **Summary** — what was registered, plus the next command (`cellar launch <slug>`).
+
+Rules: interactive iff stdin is a TTY **and** no `--no-input`; every prompt has a flag (`--prefix`, `--name`, `--kind`, …); installer-vs-standalone is asked once with a filename-hint default, never guessed silently; re-installing a registered exe re-runs the session and updates the same entry (identity = exe path, #19).
+
+**The popup is presentation mode, not a program**: "Open with Cellar" (MIME wiring, #21) calls the **same InstallSession service** through the presentation binary's install entrypoint — the TTY flow today, a GUI dialog later. No separate popup binary, no shell wrapper in the exec line.
+
+**doctor & list surfaces**: verified above — doctor = sectioned checks (tree health, runner integrity, wrapper runtimes, plan buildable — §7 dispositions), each pass/fail **with a fix hint**; its exit code is overall health (0 healthy / 1 problems) so scripts can health-check.
 
 ## 9. Errors & doctor
 
@@ -156,4 +188,7 @@ resolve → check → plan → execute
 
 ## 11. ADR index
 
-<!-- Links to docs/adr/ entries for hard-to-reverse choices. -->
+- [0001 — Single-root storage tree at `$XDG_DATA_HOME/cellar`](adr/0001-single-root-storage-tree.md) (#19)
+- [0002 — Crate graph: domain / launch / desktop split with symmetric presentations](adr/0002-crate-graph-and-layer-rules.md) (#20)
+- [0003 — Extension ports: five sealed traits; mode by membership; platform as non-seam](adr/0003-extension-ports-and-platform-stance.md) (#21)
+- [0004 — CLI surface: verb-first with object groups; popup as presentation mode](adr/0004-cli-surface-and-first-run-ux.md) (#23)
