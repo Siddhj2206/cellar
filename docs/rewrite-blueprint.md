@@ -108,7 +108,39 @@ cellar/
 
 ## 7. Launch pipeline
 
-<!-- Pending #22. -->
+Locked via [#22 — Launch pipeline model](https://github.com/Siddhj2206/cellar/issues/22); foundations: #15 (LaunchPlan/Override/RunnerRef terms), #18 (umu chain), #20 (`cellar-launch` crate), #21 (ports, `Layer` enum, env contracts as wrapper data).
+
+**Four phases — nothing spawns until the plan is complete:**
+
+```
+resolve → check → plan → execute
+```
+
+1. **Resolve** — two-stage precedence (below) yields the concrete `RunnerRef`, prefix path, and effective settings.
+2. **Check** — per-launch pre-flight on exactly this launch's dependencies: exe exists, prefix exists, runner install intact, wrapper runtimes present (umu's SLR). The same checks swept across everything = `doctor`; the check phase is doctor applied to one launch.
+3. **Plan** — build the LaunchPlan as a **pure, printable value** (`Debug` + `serde` + human render): final `argv`, env contract, cwd, wrapper chain (Layer-sorted, #21). Nothing spawns; `--dry-run` and GUI preview are free features, and the printed `argv` is a user-runnable reproduction for bug reports.
+4. **Execute** — spawn from the frozen plan → `SpawnedProcess` handle (pid, log path, `wait()`).
+
+**Two-stage precedence:**
+- **Selection** (which runner family): app override → prefix default → defaults floor (`settings.toml` + kind presets — Game → GE-Proton, Tool → wine). The prefix-binding override decides *which* prefix's defaults apply at all.
+- **Resolution** (spec → concrete ref): configured path → managed install → PATH (research #18).
+
+**Canonical stacks** (examples, not exhaustive):
+- **Managed Proton**: `gamescope? → umu-run (Container; runs the SLR container internally, per #18) → proton waitforexitandrun → exe`; umu contributes `GAMEID`/`WINEPREFIX`/`PROTONPATH`/`PROTON_VERB`.
+- **Plain wine**: `wine <exe>` — **co-equal chain selected by config** (Tools / explicit override), *never an automatic fallback* for a failed Proton selection; a failed Proton resolve is a doctor-flagged error with a suggested fix (#18).
+- **Env assembly precedence**: app env overrides → wrapper contributions → prefix env → base.
+
+**Execute semantics:** InstallSession always awaits the artifact's exit (the installer must finish before discovery); LaunchApp's wait-vs-detach is presentation policy (CLI foregrounds, GUI detaches — surface detail lands with #23). Game output always goes to `cache/launch-logs/<slug>-<timestamp>.log` (disposable, #19); CLI may forward it, GUI may tail it.
+
+**Failure taxonomy** — five families, cut before spawn:
+
+| Family | Caught | Disposition |
+|---|---|---|
+| Resolve | pre-flight | unknown spec / order exhausted → doctor: SuggestInstall |
+| Check | pre-flight | exe missing → re-register; prefix missing → recreate; runner corrupt → reinstall |
+| Plan | pre-flight | wrapper contribution failure (e.g. missing SLR runtime) → doctor: install runtime |
+| Spawn | post-plan | OS exec error, reported as-is |
+| Runtime | post-spawn | exit code propagated raw — no magic mapping |
 
 ## 8. CLI surface & first-run UX
 
