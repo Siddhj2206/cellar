@@ -45,6 +45,10 @@ pub enum StorageError {
     NotFound(String),
     /// The node already exists (slug clash without dedupe).
     Exists(String),
+    /// A port method whose slice has not landed yet (e.g. discovery #27, the
+    /// shared installer #34). Stubs return this with a loud message — never
+    /// a silent success or a misleading taxonomy hit.
+    Unimplemented(String),
 }
 
 impl fmt::Display for StorageError {
@@ -54,6 +58,7 @@ impl fmt::Display for StorageError {
             Self::Invalid(path) => write!(f, "invalid file at {path}"),
             Self::NotFound(path) => write!(f, "not found: {path}"),
             Self::Exists(path) => write!(f, "already exists: {path}"),
+            Self::Unimplemented(what) => write!(f, "not implemented yet: {what}"),
         }
     }
 }

@@ -1,8 +1,13 @@
 //! The Cellar application layer (blueprint §4, ADR 0003): use-cases —
 //! `FirstRunInstall`, `LaunchApp`, `DoctorCheck` — thin orchestration over
 //! the `core` ports, generic for static dispatch and mock testing
-//! (`App<R, M, S, D>`); `Box<dyn _>` appears only at the composition root.
+//! (`PrefixService<S: Storage>`); `Box<dyn _>` appears only at the
+//! composition root.
 //!
-//! Lands with slice 03 (#27: `AppEntry` registry and standalone install). The
-//! scaffold ships the crate so every later slice starts from a wired,
-//! rule-enforced workspace.
+//! This slice (#26) delivers the prefix lifecycle and the tree-health doctor
+//! service. `FirstRunInstall` and `LaunchApp` land with their own slices
+//! (#27+), as do the managed install and runner-integrity doctor sections.
+
+pub mod services;
+
+pub use services::{DoctorService, PrefixService};

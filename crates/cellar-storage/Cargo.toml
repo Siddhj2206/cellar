@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 cellar-core = { path = "../cellar-core" }
+serde.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::entities::{AppEntry, Candidate, Prefix, Settings};
 use crate::errors::{DesktopError, ResolveError, StorageError};
+use crate::health::TreeHealth;
 use crate::manifest::RunnerManifest;
 use crate::types::{LaunchPlan, Layer, ResolvedRunner, RunnerSpec};
 
@@ -76,6 +77,12 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     fn load_app(&self, slug: &str) -> Result<AppEntry, StorageError>;
     fn save_app(&self, app: &AppEntry) -> Result<(), StorageError>;
     fn delete_app(&self, slug: &str) -> Result<(), StorageError>;
+
+    /// Health of the tree (blueprint §7: the doctor applied tree-wide):
+    /// which nodes are missing, which files are invalid, which prefix dirs
+    /// are orphaned. Deliberately no side effects — it reports exactly what
+    /// is on disk, never initializes anything.
+    fn tree_health(&self) -> Result<TreeHealth, StorageError>;
 
     /// Discovery: read the prefix's Start Menu / Desktop `.lnk` files and
     /// list candidate executables for user review. Never auto-registers.

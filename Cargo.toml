@@ -17,11 +17,14 @@ repository = "https://github.com/Siddhj2206/cellar"
 
 # Single source of truth for dependency versions; members use `x.workspace = true`.
 # Error handling: the port traits keep their sealed typed errors (ADR 0003);
-# presentation/app code converts them with `anyhow` (AGENTS.md) — first
-# consumer lands with slice 02+.
+# presentation normalizes them with `anyhow` (AGENTS.md) — the CLI's `run()`
+# converts port errors at the presentation boundary.
 [workspace.dependencies]
 anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9"
 
 [workspace.lints.rust]
 # Layer rules, enforced not aspirational (blueprint §4).

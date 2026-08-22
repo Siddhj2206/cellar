@@ -19,7 +19,8 @@ pub struct Settings {
     /// (#26) and launch (#28) slices. Wine is never an automatic fallback for
     /// a failed Proton selection (blueprint §7).
     pub resolution_order: Vec<RunnerFamily>,
-    // umu/proton configuration lands with the storage slice (#26).
+    // umu/proton configuration fields land with the runner-managed slices
+    // (#34+), once the settings schema has real consumers.
 }
 
 /// A Cellar-managed Windows environment holding the defaults for every

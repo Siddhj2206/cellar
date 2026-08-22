@@ -19,6 +19,17 @@ pub enum RunnerFamily {
     Umu,
 }
 
+impl RunnerFamily {
+    /// Human-readable identifier, e.g. for CLI tables.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proton => "proton",
+            Self::Wine => "wine",
+            Self::Umu => "umu",
+        }
+    }
+}
+
 /// A request to resolve a runner: which family, plus any explicit
 /// configuration. Providers answer only the specs they service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

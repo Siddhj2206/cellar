@@ -11,18 +11,24 @@
 //! - [`manifest`] — declarative managed-runner descriptors.
 //! - [`entities`] — `Prefix`, `AppEntry`, `Settings`, `Candidate` (glossary
 //!   vocabulary, CONTEXT.md).
+//! - [`slug`] — tree file-name rules: slugify, validation, `-2` dedupe.
+//! - [`health`] — the `TreeHealth` report the doctor renders.
 //! - [`ports`] — the locked extension seam (ADR 0003): exactly five traits.
 //! - [`errors`] — pre-flight error families for the ports.
 
 pub mod entities;
 pub mod errors;
+pub mod health;
 pub mod manifest;
 pub mod ports;
+pub mod slug;
 pub mod types;
 
 pub use entities::{AppEntry, AppKind, Candidate, Overrides, Prefix, PrefixDefaults, Settings};
 pub use errors::{DesktopError, ResolveError, StorageError};
+pub use health::TreeHealth;
 pub use manifest::{ArchiveLayout, ChecksumScheme, InstallKind, ReleaseSource, RunnerManifest};
+pub use slug::{MAX_LEN, dedupe_slug, is_valid_slug, slugify};
 pub use types::{
     ConfiguredRunner, LaunchPlan, Layer, ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall,
     RunnerRef, RunnerSpec,
