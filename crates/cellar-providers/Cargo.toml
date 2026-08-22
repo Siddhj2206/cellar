@@ -1,0 +1,16 @@
+[package]
+name = "cellar-providers"
+description = "Provider registry: all_resolvers() / all_wrappers() — consumed by presentations only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cellar-core = { path = "../cellar-core" }
+cellar-provider-gamescope = { path = "../cellar-provider-gamescope" }
+cellar-provider-proton = { path = "../cellar-provider-proton" }
+cellar-provider-umu = { path = "../cellar-provider-umu" }
+cellar-provider-wine = { path = "../cellar-provider-wine" }
+
+[lints]
+workspace = true

@@ -1,0 +1,3 @@
+# `cargo xtask <task>` runs the xtask crate (Helix/cargo pattern, blueprint §4).
+[alias]
+xtask = "run --manifest-path xtask/Cargo.toml --"

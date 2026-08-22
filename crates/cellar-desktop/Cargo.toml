@@ -1,0 +1,12 @@
+[package]
+name = "cellar-desktop"
+description = "Desktop integration: .desktop entries, icon extraction + cache, MIME/file associations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cellar-core = { path = "../cellar-core" }
+
+[lints]
+workspace = true

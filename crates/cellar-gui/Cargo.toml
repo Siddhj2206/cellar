@@ -1,0 +1,14 @@
+[package]
+name = "cellar-gui"
+description = "Future GUI presentation leaf (becomes PRIMARY later)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cellar-app = { path = "../cellar-app" }
+cellar-core = { path = "../cellar-core" }
+cellar-providers = { path = "../cellar-providers" }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "cellar-core"
+description = "Cellar domain: pure types, ports, invariants — no I/O, no platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true

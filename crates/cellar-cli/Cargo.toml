@@ -1,0 +1,18 @@
+[package]
+name = "cellar-cli"
+description = "The cellar binary — presentation, composition root (PRIMARY now)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cellar"
+path = "src/main.rs"
+
+[dependencies]
+cellar-app = { path = "../cellar-app" }
+cellar-core = { path = "../cellar-core" }
+cellar-providers = { path = "../cellar-providers" }
+
+[lints]
+workspace = true

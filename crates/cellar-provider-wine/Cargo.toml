@@ -1,0 +1,12 @@
+[package]
+name = "cellar-provider-wine"
+description = "Discover-only system wine provider (PATH)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cellar-core = { path = "../cellar-core" }
+
+[lints]
+workspace = true

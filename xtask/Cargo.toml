@@ -1,0 +1,9 @@
+[package]
+name = "xtask"
+description = "Cross-crate checks and release chores (workspace-wide gate)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
