@@ -25,7 +25,28 @@
 
 ## 6. Storage: file-tree source of truth
 
-<!-- Pending #19. -->
+Locked via [#19 — Storage layout and file format](https://github.com/Siddhj2206/cellar/issues/19); rationale: [ADR 0001](adr/0001-single-root-storage-tree.md).
+
+Single root `$XDG_DATA_HOME/cellar/` — one movable unit, TOML everywhere:
+
+```
+cellar/
+├── settings.toml          # global settings (runner resolution order, umu/proton config)
+├── prefixes/
+│   └── <prefix-slug>/     # user-chosen name at InstallSession, default `default`
+│       └── prefix.toml    # prefix-level defaults (runner, env, graphics, Windows version)
+├── apps/
+│   └── <app-slug>.toml    # one per AppEntry: exe path, kind, overrides (incl. prefix
+│                          #   binding), runner ref, current-state metadata
+├── runtime/               # managed provider installs (GE-Proton, umu) + providers.toml
+│                          #   inventory — authoritative, re-installable
+└── cache/                 # disposable: downloads, icons, discovery results
+```
+
+- **Format**: TOML (spec v1.1.0, `toml` crate) — purpose-built human-edited config with comments; YAML/JSON rejected (ADR 0001).
+- **Naming**: human-readable slugs, `-2` dedupe; file name = entry's display name; identity stays the exe path (renaming renames the file).
+- **Robustness**: `schema_version` per file; migrations are file-tree transforms; atomic writes (temp + rename), app service the sole writer; invalid files degrade — entry skipped, flagged by `cellar doctor`, never silently overwritten.
+- **Ownership**: delete-prefix removes its dir, uninstall removes its app file — never more. `cache/` re-derivable at any time.
 
 ## 7. Launch pipeline
 
