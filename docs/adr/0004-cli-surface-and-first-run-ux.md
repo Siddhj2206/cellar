@@ -15,3 +15,4 @@ Cellar's CLI is verb-first at the top level for artifact actions — `cellar ins
 - The surface is contractual once muscle memory forms: top-level commands, flag names, and exit codes (0 / 1 / 2, launch passthrough) change only through deprecation, never renames (clig.dev).
 - New commands slot in under one stated rule, so implementers can't invent conflicting CLIs.
 - The future GUI reuses every §8 use-case entrypoint unchanged — only the chrome differs.
+- Extension (2026-08, implemented in #33): the desktop-integration subsystem gets a third noun group under the rule — `cellar desktop sync` re-derives launcher entries, icons, and the Open-with-Cellar association from the tree (the "cache re-derivable at any time" contract needs an invocation surface; subsystems with no artifact/lifecycle home follow the noun-group shape). A future desktop command lands under the same group.

@@ -153,6 +153,7 @@ dependencies = [
  "anyhow",
  "cellar-app",
  "cellar-core",
+ "cellar-desktop",
  "cellar-providers",
  "cellar-storage",
  "clap",

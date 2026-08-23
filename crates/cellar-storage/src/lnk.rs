@@ -121,11 +121,11 @@ fn decode_ansi(bytes: &[u8]) -> String {
         .collect()
 }
 
-#[cfg(test)]
 /// Build a valid `.lnk` byte blob for storage tests: header + optional ID
-/// list + LinkInfo carrying a `VolumeID`, `LocalBasePath` (complete or
+/// link + `LinkInfo` carrying a `VolumeID`, `LocalBasePath` (complete or
 /// leading), and `CommonPathSuffix` — joined by the parser into the full
 /// target. `unicode` toggles the `IsUnicode` flag and the string encoding.
+#[cfg(test)]
 pub(crate) fn build_lnk(unicode: bool, id_list: bool, base: &str, suffix: &str) -> Vec<u8> {
     if unicode {
         let mut base_raw = Vec::new();
@@ -189,10 +189,10 @@ pub(crate) fn build_lnk_raw(unicode: bool, id_list: bool, base: &[u8], suffix: &
     push_bytes(&mut info, base, unicode);
     let suffix_offset = info.len();
     push_bytes(&mut info, suffix, unicode);
-    let size = info.len() as u32;
+    let size = u32::try_from(info.len()).expect("fixture sizes fit u32");
     info[0..4].copy_from_slice(&size.to_le_bytes());
-    info[suffix_offset_pos..suffix_offset_pos + 4]
-        .copy_from_slice(&(suffix_offset as u32).to_le_bytes());
+    let suffix_offset = u32::try_from(suffix_offset).expect("fixture offsets fit u32");
+    info[suffix_offset_pos..suffix_offset_pos + 4].copy_from_slice(&suffix_offset.to_le_bytes());
     bytes.extend_from_slice(&info);
     bytes
 }

@@ -9,12 +9,21 @@
 //! `LaunchApp` use-case (#28/#29): resolve → check → plan → execute. Thin
 //! orchestration over the `core` ports — concrete adapters are injected
 //! only at the composition root.
+//!
+//! Desktop integration lands with #33: registration creates the app's
+//! launcher entry and icon (uninstall removes them), a re-registration
+//! with a different name renames the app — the identity stays the exe
+//! path, the entry file name follows the new slug — and
+//! [`DesktopSync`] re-derives everything from the tree. The lifecycle is
+//! one-way: the desktop adapter derives host artifacts from the entries
+//! it is handed and never writes tree state.
 
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
+use cellar_core::errors::DesktopError;
 use cellar_core::errors::StorageError;
 use cellar_core::health::TreeHealth;
-use cellar_core::ports::{RunnerResolver, Storage};
+use cellar_core::ports::{DesktopIntegrator, RunnerResolver, Storage};
 use cellar_core::slug;
 use cellar_core::types::{LaunchPlan, RunnerSpec};
 use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
@@ -138,9 +147,9 @@ impl FromStr for ArtifactKind {
 }
 
 /// Session failures of `cellar install` (blueprint §8 step 2): the storage
-/// and launch taxonomies passed through, the installer's own exit, and
-/// archive extraction — each in its own vocabulary, with the fix where the
-/// pipeline defines one.
+/// and launch taxonomies passed through, the installer's own exit, archive
+/// extraction, and the desktop side effects — each in its own vocabulary,
+/// with the fix where the pipeline defines one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
     Storage(StorageError),
@@ -156,6 +165,10 @@ pub enum InstallError {
         signal: Option<i32>,
     },
     Archive(ArchiveError),
+    /// The launcher entry or cached icon could not be written or removed
+    /// (the derived side of a registration; the tree state is already
+    /// saved — re-run the command, or `desktop sync` to re-derive).
+    Desktop(DesktopError),
 }
 
 impl From<StorageError> for InstallError {
@@ -176,6 +189,12 @@ impl From<ArchiveError> for InstallError {
     }
 }
 
+impl From<DesktopError> for InstallError {
+    fn from(error: DesktopError) -> Self {
+        Self::Desktop(error)
+    }
+}
+
 impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -193,6 +212,7 @@ impl fmt::Display for InstallError {
                 (None, None) => write!(f, "the installer failed — the session aborted"),
             },
             Self::Archive(error) => write!(f, "{error}"),
+            Self::Desktop(error) => write!(f, "desktop: {error}"),
         }
     }
 }
@@ -208,16 +228,29 @@ impl std::error::Error for InstallError {}
 /// archive (extract into it); the discovery review and multi-registration
 /// land here (#31): [`InstallService::register_reviewed`] confirms the
 /// session's candidates — zero or more entries, one prefix, nothing silent.
-pub struct InstallService<S: Storage, R: RunnerResolver> {
+///
+/// Desktop integration (#33): every registration also derives the app's
+/// launcher entry and cached icon through the injected
+/// [`DesktopIntegrator`] — created on registration, removed on uninstall,
+/// refreshed when a re-registration renames the app. The adapter writes
+/// derived host artifacts only; tree state stays this service's alone
+/// (the lifecycle is one-way).
+pub struct InstallService<S: Storage, R: RunnerResolver, D: DesktopIntegrator> {
     storage: S,
     resolver: R,
+    desktop: D,
 }
 
-impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
-    /// The service over one storage adapter and one resolver — the
-    /// composition root injects the concrete registry composite (#28).
-    pub fn new(storage: S, resolver: R) -> Self {
-        Self { storage, resolver }
+impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D> {
+    /// The service over one storage adapter, one resolver, and one
+    /// desktop integrator — the composition root injects the concrete
+    /// registry composite (#28) and adapter (#33).
+    pub fn new(storage: S, resolver: R, desktop: D) -> Self {
+        Self {
+            storage,
+            resolver,
+            desktop,
+        }
     }
 
     /// The flagship flow's artifact handling (blueprint §8 steps 1–3): bind
@@ -291,7 +324,16 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
                 let base = standalone_base
                     .as_deref()
                     .expect("the standalone base was computed above");
-                let result = self.register_standalone(&canonical, &prefix_slug, kind, base)?;
+                let result = self.register_standalone(
+                    &canonical,
+                    &prefix_slug,
+                    kind,
+                    base,
+                    // A re-registration renames only when the user named
+                    // it — the `--name` flag (US26); the stem-derived
+                    // default keeps the entry's name.
+                    name.is_some(),
+                )?;
                 Ok(InstallOutcome {
                     prefix_slug,
                     registrations: vec![result],
@@ -339,13 +381,17 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
     /// updates the same entry. Every exe is pre-flighted before the first
     /// write — a missing manual add or an unslugifiable label aborts the
     /// whole review, never a partial registration.
+    ///
+    /// Each registration also derives the entry's launcher artifacts
+    /// (desktop integration, #33): any failure surfaces after the tree
+    /// write — re-run the command or `desktop sync` to re-derive.
     pub fn register_reviewed(
         &self,
         session: &InstallOutcome,
         keep: &[Candidate],
         add: &[PathBuf],
         kind: AppKind,
-    ) -> Result<Vec<InstallResult>, StorageError> {
+    ) -> Result<Vec<InstallResult>, InstallError> {
         // Pre-flight: canonicalize every exe (the identity and existence
         // check), dedupe within the review, and judge every slug — all
         // before anything is written.
@@ -383,6 +429,9 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
                 kind,
                 &base,
                 session.artifact.clone(),
+                // The review's label is the user's confirmed name for the
+                // exe — an update brings the entry's name in line.
+                true,
             )?);
         }
         Ok(results)
@@ -390,27 +439,36 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
 
     /// The standalone branch (blueprint §8: register without executing) —
     /// the #27 logic, unchanged. Re-installing the same exe updates the
-    /// same entry — its slug and identity stay, its kind and prefix binding
-    /// take the new flags. The display name was already judged usable by
-    /// the session preflight (no side effects on a bad name).
+    /// same entry — its slug and identity stay, its kind and prefix
+    /// binding take the new flags. A rename only when the user names it:
+    /// the `--name` flag is the register-time rename channel (blueprint
+    /// §6: renaming renames the file, identity stays the exe) — the
+    /// stem-derived default name never renames an entry (US26). The
+    /// display name was already judged usable by the session preflight
+    /// (no side effects on a bad name).
     fn register_standalone(
         &self,
         canonical: &Path,
         prefix_slug: &str,
         kind: AppKind,
         base: &str,
-    ) -> Result<InstallResult, StorageError> {
-        self.register_one(canonical, prefix_slug, kind, base, None)
+        explicit_name: bool,
+    ) -> Result<InstallResult, InstallError> {
+        self.register_one(canonical, prefix_slug, kind, base, None, explicit_name)
     }
 
     /// The one-entry registration shared by the standalone branch (#27)
     /// and the session review (#31): identity is the canonical exe path —
     /// an existing entry with the same exe is updated in place (kind,
-    /// prefix binding, and this session's source artifact when there is
-    /// one), never duplicated; a fresh entry takes the deduped slug, the
-    /// binding prefix, and the source metadata. Callers pre-flight:
-    /// `base` is a pre-slugified display name and `canonical` a verified
-    /// exe path.
+    /// prefix binding, this session's source artifact when there is one,
+    /// and — only when the caller names the update — the display name,
+    /// which renames the entry, #33), never duplicated; a fresh entry
+    /// takes the deduped slug, the binding prefix, and the source
+    /// metadata. Every registration closes with the entry's derived
+    /// launcher artifacts: the cached icon and the `.desktop` entry
+    /// (created under the current slug, the renamed one removed — the
+    /// entry file name tracks the slug). Callers pre-flight: `base` is a
+    /// pre-slugified display name and `canonical` a verified exe path.
     fn register_one(
         &self,
         canonical: &Path,
@@ -418,29 +476,52 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
         kind: AppKind,
         base: &str,
         source_installer: Option<PathBuf>,
-    ) -> Result<InstallResult, StorageError> {
+        rename: bool,
+    ) -> Result<InstallResult, InstallError> {
         if base.is_empty() {
             return Err(StorageError::Invalid(
                 "cannot register an entry without a display name".to_owned(),
-            ));
+            )
+            .into());
         }
-        if let Some(mut existing) = self
+        let previous_slug = if let Some(mut existing) = self
             .storage
             .list_apps()?
             .into_iter()
             .find(|app| app.exe == canonical)
         {
+            let old_slug = existing.slug.clone();
             existing.kind = kind;
             prefix_slug.clone_into(&mut existing.prefix);
             if source_installer.is_some() {
                 existing.source_installer = source_installer;
             }
+            existing.slug = if rename {
+                self.renamed_slug(&existing, base)?
+            } else {
+                existing.slug.clone()
+            };
+            let renamed = existing.slug != old_slug;
             self.storage.save_app(&existing)?;
+            if renamed {
+                // The new name is saved first; the old file drops after
+                // — a crash in between leaves a duplicated entry
+                // (visible, removable) rather than a lost one.
+                self.storage.delete_app(&old_slug)?;
+            }
+            let icon = self.desktop.install_icon(&existing.exe)?;
+            self.desktop.create_entry(
+                &existing,
+                (existing.slug != old_slug).then_some(old_slug).as_deref(),
+                icon.as_deref(),
+            )?;
             return Ok(InstallResult {
                 entry: existing,
                 was_update: true,
             });
-        }
+        } else {
+            None
+        };
         // The dedupe domain is every app file stem — a broken hand-edited
         // entry is sidestepped, never overwritten (ADR 0001).
         let taken: BTreeSet<String> = self.storage.list_app_slugs()?.into_iter().collect();
@@ -455,10 +536,26 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
             installed_at: None,
         };
         self.storage.save_app(&app)?;
+        let icon = self.desktop.install_icon(&app.exe)?;
+        self.desktop
+            .create_entry(&app, previous_slug, icon.as_deref())?;
         Ok(InstallResult {
             entry: app,
             was_update: false,
         })
+    }
+
+    /// The entry's slug after a rename: the display name's slug, deduped
+    /// against every other app file stem — the entry's own file is being
+    /// replaced, so its own name is never a clash.
+    fn renamed_slug(&self, entry: &AppEntry, base: &str) -> Result<String, StorageError> {
+        let taken: BTreeSet<String> = self
+            .storage
+            .list_app_slugs()?
+            .into_iter()
+            .filter(|taken| taken != &entry.slug)
+            .collect();
+        Ok(slug::dedupe_slug(base, &taken))
     }
 
     /// The installer branch (blueprint §8 step 2: "installer: run inside
@@ -550,14 +647,83 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
     }
 
     /// Remove exactly that entry's state — its app file, never more
-    /// (ADR 0001 ownership). The Windows-uninstaller path (glossary:
-    /// Uninstall) degrades to entry removal for now (#30); Cellar never
-    /// deletes the app's own files.
-    pub fn uninstall(&self, slug: &str) -> Result<(), StorageError> {
+    /// (ADR 0001 ownership) — followed by the derived launcher cleanup
+    /// (the `.desktop` entry and cached icon, #33): the tree is the
+    /// source of truth, so a failed cleanup still leaves a consistent
+    /// tree — the stale entry is pruned by the next `desktop sync`. The
+    /// Windows-uninstaller path (glossary: Uninstall) degrades to entry
+    /// removal for now (#30); Cellar never deletes the app's own files.
+    pub fn uninstall(&self, slug: &str) -> Result<(), InstallError> {
         if !slug::is_valid_slug(slug) {
-            return Err(StorageError::Invalid(format!("invalid app slug {slug:?}")));
+            return Err(StorageError::Invalid(format!("invalid app slug {slug:?}")).into());
         }
-        self.storage.delete_app(slug)
+        // The app's entry is needed for the cleanup — the entry and icon
+        // are derived from it.
+        let app = self.storage.load_app(slug)?;
+        self.storage.delete_app(slug)?;
+        self.desktop.remove_entry(&app)?;
+        Ok(())
+    }
+}
+
+/// The re-derivation use-case (blueprint §6: the cache is re-derivable at
+/// any time): every registered app's launcher entry and icon are re-derived
+/// from the tree, stale entry files are pruned — a renamed or gone app
+/// never leaves an entry behind — and the "Open with Cellar" file
+/// association is ensured. The lifecycle stays one-way: the sweep reads
+/// the tree (through the storage port) and writes derived host artifacts
+/// only; no write path leads back into app state.
+pub struct DesktopSync<S: Storage, D: DesktopIntegrator> {
+    storage: S,
+    desktop: D,
+}
+
+/// What a re-derivation did: the entry and icon counts plus the stale
+/// entry files removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopSyncReport {
+    pub entries: usize,
+    pub icons: usize,
+    pub removed_entries: Vec<PathBuf>,
+}
+
+impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
+    /// The use-case over one storage adapter and one integrator.
+    pub fn new(storage: S, desktop: D) -> Self {
+        Self { storage, desktop }
+    }
+
+    /// Re-derive everything derived: each app's entry and icon, the stale
+    /// sweep, then the file association.
+    pub fn sync(&self) -> Result<DesktopSyncReport, InstallError> {
+        let apps = self.storage.list_apps()?;
+        let mut icons = 0usize;
+        let mut keep = Vec::with_capacity(apps.len());
+        for app in &apps {
+            keep.push(app.slug.as_str());
+            // The icon's source may be gone (a deleted exe): the entry
+            // still re-derives — it is the functional half; the icon
+            // comes back once the exe does (US24/25: invalid entries are
+            // skipped, not blockers).
+            let icon = match self.desktop.install_icon(&app.exe) {
+                Ok(Some(icon)) => {
+                    icons += 1;
+                    Some(icon)
+                }
+                Ok(None) => None,
+                Err(_) => None,
+            };
+            // A fresh create under the current slug; the stale sweep
+            // removes any entry left under an old slug.
+            self.desktop.create_entry(app, None, icon.as_deref())?;
+        }
+        let removed_entries = self.desktop.prune_entries(&keep)?;
+        self.desktop.set_file_association()?;
+        Ok(DesktopSyncReport {
+            entries: apps.len(),
+            icons,
+            removed_entries,
+        })
     }
 }
 
@@ -783,8 +949,8 @@ impl<S: Storage> DoctorService<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, DoctorService, InstallError, InstallOutcome, InstallResult, InstallService,
-        LaunchApp, PrefixService, Storage,
+        ArtifactKind, DesktopSync, DoctorService, InstallError, InstallOutcome, InstallResult,
+        InstallService, LaunchApp, PrefixService, Storage,
     };
 
     use std::collections::BTreeSet;
@@ -792,10 +958,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides, Settings};
-    use cellar_core::errors::{ResolveError, StorageError};
+    use cellar_core::errors::{DesktopError, ResolveError, StorageError};
     use cellar_core::health::TreeHealth;
     use cellar_core::manifest::RunnerManifest;
-    use cellar_core::ports::{__sealed, RunnerResolver};
+    use cellar_core::ports::{__sealed, DesktopIntegrator, RunnerResolver};
     use cellar_core::types::{
         ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
     };
@@ -1181,7 +1347,7 @@ mod tests {
     #[test]
     fn install_registers_a_new_entry_without_executing() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let result = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
@@ -1219,7 +1385,7 @@ mod tests {
     fn install_uses_the_flag_name_and_dedupes_the_slug() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
         mock.take_app_slugs(&["my-game", "my-game-2"]);
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let result = registered(service.install(
             Path::new("/games/game.exe"),
             "default",
@@ -1237,7 +1403,7 @@ mod tests {
     #[test]
     fn reinstalling_the_same_exe_updates_the_same_entry() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let first = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
@@ -1271,7 +1437,7 @@ mod tests {
     #[test]
     fn reinstalling_rebinds_the_prefix() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
@@ -1299,7 +1465,7 @@ mod tests {
             slug: "default".to_owned(),
             defaults: PrefixDefaults::default(),
         });
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
@@ -1318,7 +1484,7 @@ mod tests {
         // create` applies, so the requested slug is never silently reused.
         let mock = MockStorage::new(healthy_tree());
         mock.mark_broken_prefix("default");
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let result = registered(service.install(
             Path::new("/games/balatro.exe"),
             "default",
@@ -1334,7 +1500,7 @@ mod tests {
     #[test]
     fn install_rejects_bad_inputs_before_touching_the_tree() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         // A non-exe is not a standalone or installer artifact.
         assert!(matches!(
             service.install(
@@ -1377,13 +1543,12 @@ mod tests {
     }
 
     #[test]
-    fn review_registers_every_kept_candidate_bound_to_the_session_prefix()
-    -> Result<(), StorageError> {
+    fn review_registers_every_kept_candidate_bound_to_the_session_prefix() -> anyhow::Result<()> {
         // An installer dropping five exes yields up to five entries — one
         // per confirmed candidate, every one bound to the session's single
         // prefix. No guessing a "main" exe: the review decides all of it.
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let candidates = (0..5)
             .map(|i| Candidate {
                 exe: PathBuf::from(format!("/prefix/drive_c/users/me/Desktop/app{i}.exe")),
@@ -1425,12 +1590,12 @@ mod tests {
     }
 
     #[test]
-    fn review_registers_nothing_without_confirmation() -> Result<(), StorageError> {
+    fn review_registers_nothing_without_confirmation() -> anyhow::Result<()> {
         // The hard rule: candidates alone never register — only the
         // review's explicit decisions do. An empty review is a valid
         // session outcome.
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let outcome = InstallOutcome {
             prefix_slug: "default".to_owned(),
             registrations: Vec::new(),
@@ -1454,9 +1619,9 @@ mod tests {
     }
 
     #[test]
-    fn review_manual_adds_register_with_the_exe_stem_label() -> Result<(), StorageError> {
+    fn review_manual_adds_register_with_the_exe_stem_label() -> anyhow::Result<()> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let outcome = InstallOutcome {
             prefix_slug: "default".to_owned(),
             registrations: Vec::new(),
@@ -1479,11 +1644,11 @@ mod tests {
     }
 
     #[test]
-    fn review_dedupes_kept_and_manually_added_exes() -> Result<(), StorageError> {
+    fn review_dedupes_kept_and_manually_added_exes() -> anyhow::Result<()> {
         // The same exe via a shortcut and a manual add — or two shortcuts
         // — registers once.
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let candidate = Candidate {
             exe: PathBuf::from("/prefix/drive_c/game.exe"),
             label: "game".to_owned(),
@@ -1507,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn review_reinstalling_a_registered_exe_updates_the_same_entry() -> Result<(), StorageError> {
+    fn review_reinstalling_a_registered_exe_updates_the_same_entry() -> anyhow::Result<()> {
         let mock = MockStorage::new(healthy_tree());
         mock.add_app(AppEntry {
             slug: "balatro".to_owned(),
@@ -1519,7 +1684,7 @@ mod tests {
             source_installer: None,
             installed_at: None,
         });
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let candidate = Candidate {
             exe: PathBuf::from("/prefix/drive_c/balatro.exe"),
             label: "Balatro".to_owned(),
@@ -1553,12 +1718,12 @@ mod tests {
     }
 
     #[test]
-    fn review_preflights_every_exe_before_any_write() -> Result<(), StorageError> {
+    fn review_preflights_every_exe_before_any_write() -> anyhow::Result<()> {
         // Two good candidates and one missing manual add: the whole review
         // aborts with nothing written — never a partial registration.
         let mock = MockStorage::new(healthy_tree());
         mock.mark_exe_missing(Path::new("/prefix/drive_c/gone.exe"));
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let keep = vec![
             Candidate {
                 exe: PathBuf::from("/prefix/drive_c/a.exe"),
@@ -1585,7 +1750,7 @@ mod tests {
             )
             .expect_err("the missing add aborts the review");
         assert!(
-            matches!(&err, StorageError::NotFound(_)),
+            matches!(&err, InstallError::Storage(StorageError::NotFound(_))),
             "the missing exe is named: {err}"
         );
         assert!(
@@ -1596,9 +1761,9 @@ mod tests {
     }
 
     #[test]
-    fn review_rejects_unslugifiable_labels_without_writing() -> Result<(), StorageError> {
+    fn review_rejects_unslugifiable_labels_without_writing() -> anyhow::Result<()> {
         let mock = MockStorage::new(healthy_tree());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let outcome = InstallOutcome {
             prefix_slug: "default".to_owned(),
             registrations: Vec::new(),
@@ -1613,7 +1778,7 @@ mod tests {
                 &[PathBuf::from("/prefix/drive_c/!!!.exe")],
                 AppKind::Game,
             ),
-            Err(StorageError::Invalid(_))
+            Err(InstallError::Storage(StorageError::Invalid(_)))
         ));
         assert!(service.storage.list_apps()?.is_empty());
         Ok(())
@@ -1648,7 +1813,11 @@ mod tests {
                 ..PrefixDefaults::default()
             },
         });
-        let service = InstallService::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let service = InstallService::new(
+            mock,
+            StubResolver::new(Ok(wine_resolved_at(&wine))),
+            StubDesktop::new(),
+        );
         let outcome = service.install(
             Path::new("/tmp/setup.exe"),
             "default",
@@ -1698,7 +1867,11 @@ mod tests {
             label: "game".to_owned(),
         };
         mock.push_candidate(dropped.clone());
-        let service = InstallService::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let service = InstallService::new(
+            mock,
+            StubResolver::new(Ok(wine_resolved_at(&wine))),
+            StubDesktop::new(),
+        );
         let outcome = service.install(
             Path::new("/tmp/setup.exe"),
             "default",
@@ -1749,7 +1922,11 @@ mod tests {
                 ..PrefixDefaults::default()
             },
         });
-        let service = InstallService::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let service = InstallService::new(
+            mock,
+            StubResolver::new(Ok(wine_resolved_at(&wine))),
+            StubDesktop::new(),
+        );
         let err = service
             .install(
                 Path::new("/tmp/setup.exe"),
@@ -1795,7 +1972,7 @@ mod tests {
             let resolver = StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
             }));
-            let service = InstallService::new(mock, resolver);
+            let service = InstallService::new(mock, resolver, StubDesktop::new());
             let _ = service
                 .install(
                     Path::new("/tmp/setup.exe"),
@@ -1855,7 +2032,7 @@ mod tests {
             label: "Game".to_owned(),
         };
         mock.push_candidate(candidate.clone());
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let outcome = service.install(
             &bundle,
             "default",
@@ -1900,7 +2077,7 @@ mod tests {
             slug: "default".to_owned(),
             defaults: PrefixDefaults::default(),
         });
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let err = service
             .install(
                 &bundle,
@@ -1927,13 +2104,13 @@ mod tests {
     }
 
     #[test]
-    fn list_joins_tree_health_for_entry_status() -> Result<(), StorageError> {
+    fn list_joins_tree_health_for_entry_status() -> anyhow::Result<()> {
         let mut health = healthy_tree();
         health.missing_exes.push("balatro".to_owned());
         let mock = MockStorage::new(health);
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.add_app(entry("warpinator", "/prefix/drive_c/warpinator.exe"));
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let listed = service.list()?;
         let statuses: Vec<_> = listed
             .iter()
@@ -1948,11 +2125,11 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_removes_only_that_entry() -> Result<(), StorageError> {
+    fn uninstall_removes_only_that_entry() -> anyhow::Result<()> {
         let mock = MockStorage::new(healthy_tree());
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.add_app(entry("warpinator", "/prefix/drive_c/warpinator.exe"));
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         service.uninstall("balatro")?;
         let apps = service.storage.list_apps()?;
         let remaining: Vec<_> = apps.iter().map(|app| app.slug.as_str()).collect();
@@ -1963,12 +2140,173 @@ mod tests {
         );
         assert!(matches!(
             service.uninstall("balatro"),
-            Err(StorageError::NotFound(_))
+            Err(InstallError::Storage(StorageError::NotFound(_)))
         ));
         assert!(matches!(
             service.uninstall("../escape"),
-            Err(StorageError::Invalid(_))
+            Err(InstallError::Storage(StorageError::Invalid(_)))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn registration_derives_the_launcher_entry_and_icon() -> anyhow::Result<()> {
+        // AC: registering an app creates its launcher entry (and its
+        // cached icon); the identity the adapter sees is the exe path.
+        let desktop = StubDesktop::new();
+        let service = InstallService::new(
+            MockStorage::new(healthy_tree()),
+            StubResolver::ok(),
+            desktop.clone(),
+        );
+        service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Standalone,
+        )?;
+        assert_eq!(
+            desktop.created(),
+            [("balatro".to_owned(), None)],
+            "the registration creates the entry for the app's slug"
+        );
+        assert_eq!(
+            desktop.icons(),
+            [PathBuf::from("/games/balatro.exe")],
+            "the icon is extracted from the exe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_removes_the_launcher_entry() -> anyhow::Result<()> {
+        // AC: uninstalling removes the launcher entry too.
+        let desktop = StubDesktop::new();
+        let service = InstallService::new(
+            MockStorage::new(healthy_tree()),
+            StubResolver::ok(),
+            desktop.clone(),
+        );
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        service.uninstall("balatro")?;
+        assert_eq!(
+            desktop.removed(),
+            ["balatro".to_owned()],
+            "the uninstall removes the app's entry"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reinstalling_with_a_new_name_renames_the_entry() -> anyhow::Result<()> {
+        // AC: renaming an app updates the entry file name — the identity
+        // stays the exe path, so the refresh reports the previous slug.
+        let desktop = StubDesktop::new();
+        let service = InstallService::new(
+            MockStorage::new(healthy_tree()),
+            StubResolver::ok(),
+            desktop.clone(),
+        );
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            Some("Poker Night"),
+            AppKind::Game,
+            ArtifactKind::Standalone,
+        )?;
+        assert_eq!(
+            desktop.created(),
+            [("poker-night".to_owned(), Some("balatro".to_owned()))],
+            "the re-registration renames: the entry refresh names the previous slug"
+        );
+        let apps = service.storage.list_apps()?;
+        assert_eq!(apps.len(), 1, "identity stays — one entry");
+        assert_eq!(
+            apps[0].slug, "poker-night",
+            "the file name follows the rename"
+        );
+        assert_eq!(
+            apps[0].exe,
+            PathBuf::from("/games/balatro.exe"),
+            "the exe stays"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reinstalling_without_a_name_keeps_the_entry_name() -> anyhow::Result<()> {
+        // US26: renaming requires an explicit name — the stem-derived
+        // default of a re-install never renames an entry (its slug stays;
+        // only kind and binding refresh).
+        let desktop = StubDesktop::new();
+        let service = InstallService::new(
+            MockStorage::new(healthy_tree()),
+            StubResolver::ok(),
+            desktop.clone(),
+        );
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Standalone,
+        )?;
+        service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            None,
+            AppKind::Tool,
+            ArtifactKind::Standalone,
+        )?;
+        assert_eq!(
+            desktop.created(),
+            [("balatro".to_owned(), None), ("balatro".to_owned(), None)],
+            "no explicit name, no rename — the entry and its file stay"
+        );
+        let apps = service.storage.list_apps()?;
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].slug, "balatro");
+        assert_eq!(apps[0].kind, AppKind::Tool, "kind refreshes as usual");
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_sync_re_derives_entries_icons_and_prunes_stale() -> anyhow::Result<()> {
+        // AC: deleting the cache leaves entries functional after a
+        // re-derivation — the sweep re-derives every entry from the
+        // tree, prunes stale files, and is strictly one-way (it only
+        // reads app state).
+        let desktop = StubDesktop::new();
+        let service = DesktopSync::new(MockStorage::new(healthy_tree()), desktop.clone());
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        service
+            .storage
+            .add_app(entry("warpinator", "/games/warpinator.exe"));
+        let report = service.sync()?;
+        assert_eq!(report.entries, 2);
+        assert_eq!(report.icons, 0, "the stub finds no icons");
+        let created: Vec<_> = desktop
+            .created()
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .collect();
+        assert_eq!(created, ["balatro".to_owned(), "warpinator".to_owned()]);
+        assert_eq!(
+            desktop.prunes(),
+            [vec!["balatro".to_owned(), "warpinator".to_owned()]],
+            "the stale sweep keeps exactly the tree's apps"
+        );
         Ok(())
     }
 
@@ -2008,6 +2346,105 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(spec.clone());
             self.result.clone()
+        }
+    }
+
+    /// One recorded create-entry request: the app's slug plus the previous
+    /// slug it was renamed from, if any.
+    type EntryRequest = (String, Option<String>);
+
+    /// A desktop-integrator double: records the entry/icon/prune calls
+    /// instead of touching a filesystem — the storage mock's twin on the
+    /// desktop seam. `Arc`-shared so tests can inspect the records after
+    /// the stub has been moved into the service.
+    #[derive(Debug, Clone, Default)]
+    struct StubDesktop {
+        /// Every `(slug, previous_slug)` pair a registration asked for.
+        created: Arc<Mutex<Vec<EntryRequest>>>,
+        /// Every slug a removal was asked for.
+        removed: Arc<Mutex<Vec<String>>>,
+        /// Every icon extraction request (the exe path).
+        icons: Arc<Mutex<Vec<PathBuf>>>,
+        /// Every stale-sweep keep-list.
+        prunes: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl StubDesktop {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn created(&self) -> Vec<EntryRequest> {
+            self.created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn removed(&self) -> Vec<String> {
+            self.removed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn icons(&self) -> Vec<PathBuf> {
+            self.icons
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn prunes(&self) -> Vec<Vec<String>> {
+            self.prunes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl __sealed::Sealed for StubDesktop {}
+
+    impl DesktopIntegrator for StubDesktop {
+        fn create_entry(
+            &self,
+            app: &AppEntry,
+            previous_slug: Option<&str>,
+            _icon: Option<&Path>,
+        ) -> Result<PathBuf, DesktopError> {
+            self.created
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((app.slug.clone(), previous_slug.map(str::to_owned)));
+            Ok(PathBuf::from(format!("cellar-{}.desktop", app.slug)))
+        }
+
+        fn remove_entry(&self, app: &AppEntry) -> Result<(), DesktopError> {
+            self.removed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(app.slug.clone());
+            Ok(())
+        }
+
+        fn install_icon(&self, exe: &Path) -> Result<Option<PathBuf>, DesktopError> {
+            self.icons
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(exe.to_path_buf());
+            Ok(None)
+        }
+
+        fn prune_entries(&self, keep: &[&str]) -> Result<Vec<PathBuf>, DesktopError> {
+            self.prunes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(keep.iter().map(|slug| (*slug).to_owned()).collect());
+            Ok(Vec::new())
+        }
+
+        fn set_file_association(&self) -> Result<(), DesktopError> {
+            Ok(())
         }
     }
 
@@ -2316,7 +2753,7 @@ mod tests {
                 ..PrefixDefaults::default()
             },
         });
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let listed = service.list()?;
         assert_eq!(
             listed[0].prefix_runner,
@@ -2331,7 +2768,7 @@ mod tests {
         let mock = MockStorage::new(healthy_tree());
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.mark_broken_prefix("default");
-        let service = InstallService::new(mock, StubResolver::ok());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let listed = service.list()?;
         assert_eq!(
             listed[0].prefix_runner, None,

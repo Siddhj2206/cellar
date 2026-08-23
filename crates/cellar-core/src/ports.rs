@@ -122,15 +122,44 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
 }
 
 /// Desktop integration: `.desktop` entries, Rust-native icon extraction and
-/// cache, MIME/file associations (blueprint §8).
+/// cache, MIME/file associations (blueprint §5, §8). The lifecycle is
+/// strictly one-way — the adapter derives host artifacts from the
+/// `AppEntry` values it is handed and never reads or writes tree state:
+/// everything it produces is re-derivable from the tree (blueprint §6:
+/// the cache is disposable; this slice ships the re-derivation sweep).
 pub trait DesktopIntegrator: __sealed::Sealed + Send + Sync + Debug {
-    /// Create or refresh the `.desktop` launcher entry. Returns the entry
-    /// path.
-    fn create_entry(&self, app: &AppEntry) -> Result<PathBuf, DesktopError>;
+    /// Create or refresh the `.desktop` launcher entry for `app`. When the
+    /// app was renamed — `previous_slug` differs from `app.slug` — the old
+    /// entry file is removed, so the entry's file name always tracks the
+    /// app's slug (blueprint §6 naming; identity stays the exe path).
+    /// `icon` is the cached icon path the entry references, `None` for an
+    /// icon-less entry. Returns the entry path.
+    fn create_entry(
+        &self,
+        app: &AppEntry,
+        previous_slug: Option<&str>,
+        icon: Option<&Path>,
+    ) -> Result<PathBuf, DesktopError>;
+
+    /// Remove `app`'s launcher entry and its cached icon — the uninstall
+    /// cleanup; a missing entry is not an error (the re-derivation sweep
+    /// may already have removed it).
     fn remove_entry(&self, app: &AppEntry) -> Result<(), DesktopError>;
-    /// Extract an icon from the exe into the icon cache; returns the cache
-    /// path.
-    fn install_icon(&self, app: &AppEntry, exe: &Path) -> Result<PathBuf, DesktopError>;
-    /// Wire the "Open with Cellar" MIME association.
-    fn set_file_association(&self, mime_type: &str) -> Result<(), DesktopError>;
+
+    /// Extract the exe's icon Rust-natively into the disposable icon
+    /// cache, reusing an existing cache file; `None` when the exe carries
+    /// no usable icon (entries without icons are still created — the icon
+    /// key is simply omitted).
+    fn install_icon(&self, exe: &Path) -> Result<Option<PathBuf>, DesktopError>;
+
+    /// Remove this integrator's own entry files whose slugs are not in
+    /// `keep` — the stale sweep of a re-derivation (a renamed or gone app
+    /// never leaves an entry behind). Returns the removed paths.
+    fn prune_entries(&self, keep: &[&str]) -> Result<Vec<PathBuf>, DesktopError>;
+
+    /// Wire the "Open with Cellar" file association for Windows
+    /// executables: a no-display launcher whose exec line calls the
+    /// presentation binary's install entrypoint directly — no wrapper
+    /// binary, no shell wrapper (ADR 0004).
+    fn set_file_association(&self) -> Result<(), DesktopError>;
 }

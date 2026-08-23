@@ -19,12 +19,20 @@
 //! branches discovered are reviewed — interactive keep/hide/manual-add
 //! with a y/N confirmation, or the `--keep` / `--keep-all` / `--add` flag
 //! equivalents; confirmed entries register bound to the session's one
-//! prefix; the summary lists them with `cellar launch <slug>`.) On top of
-//! #29's `cellar launch <app>`, #27's install/list/uninstall, #26's
-//! `cellar prefix …` and `cellar doctor`. Exit codes (ADR 0004):
-//! 0 success, 1 operation error or doctor problems, 2 usage; `launch`
-//! propagates the game's exit code raw (§7), the collision with 1
-//! documented, not mapped.
+//! prefix; the summary lists them with `cellar launch <slug>`.)
+//!
+//! Desktop integration lands with #33: the composition root injects the
+//! concrete [`DesktopService`] (tree root + this binary) into the install
+//! service and the re-derivation use-case — registration derives the
+//! app's launcher entry and cached icon, uninstall removes them, a rename
+//! refreshes the entry file name, and `cellar desktop sync` re-derives
+//! everything from the tree (stale entries pruned, the Open-with-Cellar
+//! association wired) — an extension under the noun-group rule (ADR
+//! 0004). On top of #29's `cellar launch <app>`, #27's
+//! install/list/uninstall, #26's `cellar prefix …` and `cellar doctor`.
+//! Exit codes (ADR 0004): 0 success, 1 operation error or doctor
+//! problems, 2 usage; `launch` propagates the game's exit code raw (§7),
+//! the collision with 1 documented, not mapped.
 
 use clap::{Args, Parser, Subcommand};
 
@@ -34,14 +42,15 @@ use std::process::{ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use cellar_app::{
-    ArtifactKind, DoctorService, InstallOutcome, InstallResult, InstallService, LaunchApp,
-    LaunchMode, ListedEntry, PrefixService,
+    ArtifactKind, DesktopSync, DoctorService, InstallOutcome, InstallResult, InstallService,
+    LaunchApp, LaunchMode, ListedEntry, PrefixService,
 };
-use cellar_core::ports::{__sealed, RunnerResolver};
+use cellar_core::ports::{__sealed, RunnerResolver, Storage};
 use cellar_core::{
     AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerRef,
     RunnerSpec, TreeHealth,
 };
+use cellar_desktop::DesktopService;
 use cellar_providers::all_resolvers;
 use cellar_storage::TreeStore;
 
@@ -69,6 +78,11 @@ enum Command {
     /// Manage Cellar prefixes (blueprint §8: lifecycle objects get noun
     /// groups).
     Prefix(PrefixArgs),
+    /// The desktop integration noun group: the re-derivation sweep that
+    /// rebuilds launcher entries, icons, and the file association from
+    /// the tree (blueprint §6: everything derived is re-derivable) —
+    /// an extension under the noun-group rule recorded in ADR 0004.
+    Desktop(DesktopArgs),
     /// Sectioned capability checks with fix hints; exits 1 on any problem.
     Doctor(DoctorArgs),
 }
@@ -184,6 +198,22 @@ struct DoctorArgs {
     json: bool,
 }
 
+#[derive(Debug, Args)]
+struct DesktopArgs {
+    #[command(subcommand)]
+    command: DesktopCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopCommand {
+    /// Re-derive the launcher entries, icons, and the Open-with-Cellar
+    /// association from the tree (blueprint §6: the cache is disposable,
+    /// everything derived is rebuilt), and remove stale entries left by
+    /// renamed or removed apps. The sweep reads app state only — it
+    /// never writes back into the tree.
+    Sync,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -194,13 +224,44 @@ fn main() -> ExitCode {
     }
 }
 
+/// The `cellar desktop sync` handler: re-derive every launcher entry and
+/// icon from the tree (blueprint §6: the cache is disposable), prune the
+/// stale entry files a rename or uninstall left behind, and wire the
+/// Open-with-Cellar association — the re-derivation `cellar list` and
+/// `cellar doctor` rely on, one-way (tree state is only read).
+fn run_desktop_sync(store: &TreeStore, desktop: &DesktopService) -> anyhow::Result<ExitCode> {
+    let report = DesktopSync::new(store.clone(), desktop.clone()).sync()?;
+    println!(
+        "Synced {} launcher entries ({} with icons)",
+        report.entries, report.icons
+    );
+    if report.removed_entries.is_empty() {
+        println!("No stale entries to remove");
+    } else {
+        for path in &report.removed_entries {
+            println!("Removed stale entry {}", path.display());
+        }
+    }
+    println!("Wired the Open-with-Cellar file association");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let store = TreeStore::from_env()?;
+    // The composition root builds the desktop adapter once: over the
+    // tree root (the entries live beside it, the icons under its
+    // disposable cache) and this binary — the Exec target of every
+    // launcher entry and the popup's install entrypoint (#32/#33).
+    let desktop = DesktopService::new(
+        store.data_root().to_path_buf(),
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cellar")),
+    );
     match cli.command {
-        Command::Install(args) => run_install(&store, &args),
+        Command::Install(args) => run_install(&store, &desktop, &args),
         Command::List(args) => {
-            let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+            let service =
+                InstallService::new(store.clone(), ResolverSet::new(all_resolvers()), desktop);
             let entries = service.list()?;
             print!("{}", render_app_list(&entries, args.json)?);
             Ok(ExitCode::SUCCESS)
@@ -236,7 +297,7 @@ fn run() -> anyhow::Result<ExitCode> {
             Ok(exit_code_for(status))
         }
         Command::Uninstall(args) => {
-            let service = InstallService::new(store, ResolverSet::new(all_resolvers()));
+            let service = InstallService::new(store, ResolverSet::new(all_resolvers()), desktop);
             service.uninstall(&args.slug)?;
             // Glossary: Uninstall — entry removal for now; Cellar never
             // deletes the app's own files.
@@ -246,6 +307,9 @@ fn run() -> anyhow::Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Command::Desktop(args) => match args.command {
+            DesktopCommand::Sync => run_desktop_sync(&store, &desktop),
+        },
         Command::Prefix(args) => match args.command {
             PrefixCommand::Create { name } => {
                 let service = PrefixService::new(store.clone());
@@ -318,14 +382,25 @@ fn raw_exit_code(code: i32) -> u8 {
 /// unreviewed candidate list registers nothing. The same handler is the
 /// "Open with Cellar" popup entrypoint (#32): a file-manager exec line
 /// calls `cellar install <path>` directly — no TTY, no wrapper binary —
-/// and the no-prompt path is exactly the flag/hint path below.
-fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode> {
+/// and the no-prompt path is exactly the flag/hint path below. Every
+/// registration also derives the app's launcher entry and icon through
+/// the injected desktop adapter (#33) — created here, removed on
+/// uninstall, renamed along with the app.
+fn run_install(
+    store: &TreeStore,
+    desktop: &DesktopService,
+    args: &InstallArgs,
+) -> anyhow::Result<ExitCode> {
     // Interactive iff stdin is a TTY and `--no-input` is absent
     // (blueprint §8) — and only when the decision flags leave nothing to
     // ask (a given `--prefix`/`--artifact`/`--keep`/`--keep-all`/`--add`
     // skips its prompt).
     let interactive = std::io::stdin().is_terminal() && !args.no_input;
-    let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+    let service = InstallService::new(
+        store.clone(),
+        ResolverSet::new(all_resolvers()),
+        desktop.clone(),
+    );
     let prefix = resolve_prefix_slug(args.prefix.as_deref(), interactive, store)?;
     let artifact = match args.artifact {
         Some(kind) => kind,
@@ -402,7 +477,7 @@ fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode
 /// 4). Nothing registers without confirmation: with no flags, an
 /// unreviewed list registers zero entries.
 fn review_and_register(
-    service: &InstallService<TreeStore, ResolverSet>,
+    service: &InstallService<TreeStore, ResolverSet, DesktopService>,
     outcome: &InstallOutcome,
     args: &InstallArgs,
     interactive: bool,
@@ -1095,7 +1170,6 @@ mod tests {
     use cellar_app::{
         EntryStatus, InstallOutcome, InstallResult, InstallService, ListedEntry, PrefixService,
     };
-    use cellar_core::ports::Storage as _;
     use cellar_core::{
         AppEntry, AppKind, Overrides, Prefix, PrefixDefaults, RunnerFamily, RunnerInstall,
         RunnerRef,
@@ -1544,7 +1618,11 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("cellar-cli-e2e-apps-{}-{seq}", std::process::id()));
         let store = TreeStore::new(root.clone());
-        let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let service = InstallService::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers()),
+            test_desktop(&store),
+        );
         let exe = root.join("drive_c/My Game.exe");
         std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))
             .unwrap_or_else(|e| panic!("mkdir: {e}"));
@@ -1767,7 +1845,12 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(&exe, "MZ")?;
         let registered = only_registration(
-            InstallService::new(store.clone(), ResolverSet::new(all_resolvers())).install(
+            InstallService::new(
+                store.clone(),
+                ResolverSet::new(all_resolvers()),
+                test_desktop(&store),
+            )
+            .install(
                 &exe,
                 "default",
                 Some("My Tool"),
@@ -1874,7 +1957,12 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
         std::fs::write(&exe, "MZ")?;
         let registered = only_registration(
-            InstallService::new(store.clone(), ResolverSet::new(all_resolvers())).install(
+            InstallService::new(
+                store.clone(),
+                ResolverSet::new(all_resolvers()),
+                test_desktop(&store),
+            )
+            .install(
                 &exe,
                 "default",
                 Some("My Tool"),
@@ -1931,7 +2019,12 @@ mod tests {
         let game_exe = game_root.join("game.exe");
         std::fs::write(&game_exe, "MZ")?;
         let game = only_registration(
-            InstallService::new(store.clone(), ResolverSet::new(all_resolvers())).install(
+            InstallService::new(
+                store.clone(),
+                ResolverSet::new(all_resolvers()),
+                test_desktop(&store),
+            )
+            .install(
                 &game_exe,
                 &games.slug,
                 None,
@@ -1999,7 +2092,11 @@ mod tests {
             ConfiguredRunner::Path(wine),
         ));
         store.save_prefix(&prefix)?;
-        let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let service = InstallService::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers()),
+            test_desktop(&store),
+        );
         let outcome = service.install(
             &installer,
             "default",
@@ -2028,7 +2125,11 @@ mod tests {
             ConfiguredRunner::Path(failing),
         ));
         store.save_prefix(&prefix)?;
-        let service = InstallService::new(store, ResolverSet::new(all_resolvers()));
+        let service = InstallService::new(
+            store,
+            ResolverSet::new(all_resolvers()),
+            test_desktop(&TreeStore::new(root)),
+        );
         let err = service
             .install(
                 &installer,
@@ -2066,7 +2167,11 @@ mod tests {
             &bundle,
             &[("game/Game.exe", "MZ"), ("game/data/level.bin", "level")],
         );
-        let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let service = InstallService::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers()),
+            test_desktop(&store),
+        );
         let outcome = service.install(
             &bundle,
             "default",
@@ -2288,6 +2393,20 @@ mod tests {
         Ok(())
     }
 
+    /// The real desktop adapter over a test tree: real entry files land in
+    /// an `applications/` directory beside a per-test sub-root, icons in
+    /// its disposable cache — the composition-root wiring, with every
+    /// test's tree a `data-home/cellar`-shaped pair so the sweeps of
+    /// parallel tests never share a directory. The `desktop-test`
+    /// sub-root keeps the adapter's layout math under the test's own
+    /// root even for tests whose tree root is a bare tempdir.
+    fn test_desktop(store: &TreeStore) -> DesktopService {
+        DesktopService::new(
+            store.data_root().join("desktop-test"),
+            PathBuf::from("/bin/false"),
+        )
+    }
+
     #[test]
     fn run_install_defaults_the_prefix_flaglessly_without_a_tty() -> anyhow::Result<()> {
         // The no-TTY, no-flag session is the popup invocation (#32): the
@@ -2304,6 +2423,7 @@ mod tests {
         std::fs::write(&exe, "MZ")?;
         let code = run_install(
             &store,
+            &test_desktop(&store),
             &InstallArgs {
                 path: exe,
                 prefix: None,
@@ -2320,6 +2440,153 @@ mod tests {
         let apps = store.list_apps()?;
         assert_eq!(apps.len(), 1, "the session registered the exe");
         assert_eq!(apps[0].prefix, "default", "the flagless default prefix");
+        Ok(())
+    }
+
+    #[test]
+    fn install_writes_the_launcher_entry_and_uninstall_removes_it() -> anyhow::Result<()> {
+        // AC (#33): registering an app creates its launcher entry;
+        // uninstalling removes it — through the real adapter over the
+        // test tree, exactly as the composition root injects it. The
+        // home holds both the tree and, beside it, the applications
+        // directory the system reads.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-entry-lifecycle-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        let exe = home.join("cellar/balatro.exe");
+        std::fs::write(&exe, "MZ")?;
+        let desktop = test_desktop(&store);
+        run_install(
+            &store,
+            &desktop,
+            &InstallArgs {
+                path: exe.clone(),
+                prefix: None,
+                name: None,
+                kind: AppKind::Game,
+                artifact: Some(ArtifactKind::Standalone),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+        )?;
+        let entry = home.join("cellar/applications/cellar-balatro.desktop");
+        assert!(
+            entry.exists(),
+            "registering an app creates its launcher entry"
+        );
+        let rendered = std::fs::read_to_string(&entry)?;
+        assert!(
+            rendered.contains("launch balatro\n"),
+            "the entry launches the app"
+        );
+        let service =
+            InstallService::new(store.clone(), ResolverSet::new(all_resolvers()), desktop);
+        service.uninstall("balatro")?;
+        assert!(!entry.exists(), "uninstalling removes the launcher entry");
+        Ok(())
+    }
+
+    #[test]
+    fn reinstalling_with_a_new_name_renames_the_launcher_entry() -> anyhow::Result<()> {
+        // AC (#33): renaming an app updates the entry file name — the
+        // identity stays the exe path, so re-install with a new name
+        // moves the `.desktop` file.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-entry-rename-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        let exe = home.join("cellar/balatro.exe");
+        std::fs::write(&exe, "MZ")?;
+        let desktop = test_desktop(&store);
+        let args = |name: Option<&str>| InstallArgs {
+            path: exe.clone(),
+            prefix: None,
+            name: name.map(str::to_owned),
+            kind: AppKind::Game,
+            artifact: Some(ArtifactKind::Standalone),
+            no_input: true,
+            keep: Vec::new(),
+            keep_all: false,
+            add: Vec::new(),
+        };
+        run_install(&store, &desktop, &args(None))?;
+        let before = home.join("cellar/applications/cellar-balatro.desktop");
+        assert!(before.exists(), "the first entry exists");
+        run_install(&store, &desktop, &args(Some("Poker Night")))?;
+        assert!(!before.exists(), "the old entry file name is gone");
+        let after = home.join("cellar/applications/cellar-poker-night.desktop");
+        assert!(after.exists(), "the entry file name follows the rename");
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_sync_re_derives_entries_and_prunes_stale() -> anyhow::Result<()> {
+        // AC (#33): deleting the cache leaves entries functional — the
+        // re-derivation restores entries, icons, and the association
+        // from the tree, and prunes what a rename or removal left behind.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-desktop-sync-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        let exe = home.join("cellar/balatro.exe");
+        std::fs::write(&exe, "MZ")?;
+        let desktop = test_desktop(&store);
+        let args = |path: &Path| InstallArgs {
+            path: path.to_path_buf(),
+            prefix: None,
+            name: None,
+            kind: AppKind::Game,
+            artifact: Some(ArtifactKind::Standalone),
+            no_input: true,
+            keep: Vec::new(),
+            keep_all: false,
+            add: Vec::new(),
+        };
+        let tool = home.join("cellar/helper.exe");
+        std::fs::write(&tool, "MZ")?;
+        run_install(&store, &desktop, &args(&exe))?;
+        run_install(&store, &desktop, &args(&tool))?;
+        let applications = home.join("cellar/applications");
+        let balatro_entry = applications.join("cellar-balatro.desktop");
+        let tool_entry = applications.join("cellar-helper.desktop");
+        assert!(balatro_entry.exists() && tool_entry.exists());
+        // The user's wreck: an entry, the icon cache, and one app's exe
+        // are gone; another app was renamed by hand — the file AND its
+        // slug (the tree contract: file name = entry's display name).
+        std::fs::remove_file(&balatro_entry)?;
+        std::fs::remove_dir_all(home.join("cellar/desktop-test/cache")).ok();
+        std::fs::remove_file(&exe).ok();
+        let renamed = std::fs::read_to_string(home.join("cellar/apps/balatro.toml"))?
+            .replace("slug = \"balatro\"", "slug = \"poker-night\"");
+        std::fs::write(home.join("cellar/apps/poker-night.toml"), renamed)?;
+        std::fs::remove_file(home.join("cellar/apps/balatro.toml"))?;
+        // One re-derivation restores everything derived and removes the
+        // stale entry the rename left behind — the missing exe's entry
+        // still re-derives (only its icon cannot).
+        let code = run_desktop_sync(&store, &desktop)?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(applications.join("cellar-poker-night.desktop").exists());
+        assert!(tool_entry.exists(), "the untouched app keeps its entry");
+        assert!(
+            !balatro_entry.exists(),
+            "the stale entry under the old slug is pruned"
+        );
+        assert!(
+            applications.join("open-with-cellar.desktop").exists(),
+            "the Open-with-Cellar association is wired"
+        );
         Ok(())
     }
 
@@ -2463,6 +2730,7 @@ mod tests {
         )?;
         let code = run_install(
             &store,
+            &test_desktop(&store),
             &InstallArgs {
                 path: installer,
                 prefix: None,
@@ -2501,6 +2769,7 @@ mod tests {
         )?;
         run_install(
             &store,
+            &test_desktop(&store),
             &InstallArgs {
                 path: installer,
                 prefix: None,
@@ -2530,6 +2799,7 @@ mod tests {
         let (store, installer) = installer_rig("review-none", &["game", "tool"])?;
         let code = run_install(
             &store,
+            &test_desktop(&store),
             &InstallArgs {
                 path: installer,
                 prefix: None,

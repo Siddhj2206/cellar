@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 cellar-app = { path = "../cellar-app" }
 cellar-core = { path = "../cellar-core" }
+cellar-desktop = { path = "../cellar-desktop" }
 cellar-providers = { path = "../cellar-providers" }
 cellar-storage = { path = "../cellar-storage" }
 clap.workspace = true
