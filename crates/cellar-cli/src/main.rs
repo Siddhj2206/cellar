@@ -6,26 +6,30 @@
 //! future `cellar-gui` leaf; flipping primary is `default-members`, zero
 //! edits below presentation.
 //!
-//! Surface for this slice (#30): `cellar install <path>` handles all three
-//! artifact branches — `--artifact standalone` registers without executing
-//! (the #27 branch, unchanged), `installer` runs inside the prefix with its
-//! exit awaited, `archive` extracts into it — each followed by the flat
-//! discovery scan of the prefix's menu/desktop areas (the keep/hide review
-//! lands with #31) — on top of #29's `cellar launch <app>`, #27's
-//! install/list/uninstall, #26's `cellar prefix …` and `cellar doctor`.
-//! Exit codes (ADR 0004):
+//! Surface for this slice (#31): `cellar install <path>` completes the
+//! flagship flow — the artifact branch is decided by filename hint and
+//! asked once on a TTY (never guessed silently), the candidates the
+//! installer/archive branches discovered are reviewed (interactive
+//! keep/hide/manual-add with a y/N confirmation, or the `--keep` /
+//! `--keep-all` / `--add` flag equivalents under `--no-input`), the
+//! confirmed entries register bound to the session's one prefix, and the
+//! summary lists them with their next command (`cellar launch <slug>`).
+//! On top of #29's `cellar launch <app>`, #27's install/list/uninstall,
+//! #26's `cellar prefix …` and `cellar doctor`. Exit codes (ADR 0004):
 //! 0 success, 1 operation error or doctor problems, 2 usage; `launch`
 //! propagates the game's exit code raw (§7), the collision with 1
 //! documented, not mapped.
 
 use clap::{Args, Parser, Subcommand};
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use cellar_app::{
-    ArtifactKind, DoctorService, InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService,
+    ArtifactKind, DoctorService, InstallOutcome, InstallResult, InstallService, LaunchApp,
+    LaunchMode, ListedEntry, PrefixService,
 };
 use cellar_core::ports::{__sealed, RunnerResolver};
 use cellar_core::{
@@ -63,6 +67,8 @@ enum Command {
     Doctor(DoctorArgs),
 }
 
+/// The `cellar install` flags (blueprint §8): every interactive prompt has
+/// a flag equivalent, so `--no-input` can script any install.
 #[derive(Debug, Args)]
 struct InstallArgs {
     /// Path to the Windows artifact to install.
@@ -79,12 +85,25 @@ struct InstallArgs {
     kind: AppKind,
     /// How to handle the artifact: standalone registers without executing;
     /// installer runs inside the prefix with its exit awaited; archive
-    /// extracts into the prefix. Defaults to `standalone` — the #27
-    /// behavior, unchanged for existing invocations; the interactive
-    /// question with its filename-hint default lands with the discovery
-    /// slice (#31).
-    #[arg(long, value_parser = ArtifactKind::from_str, default_value = "standalone")]
-    artifact: ArtifactKind,
+    /// extracts into the prefix. Absent: hinted from the file name as the
+    /// prompt's default (e.g. setup.exe → installer, .zip → archive) — the
+    /// branch is asked once on a TTY, never silently fixed.
+    #[arg(long, value_parser = ArtifactKind::from_str)]
+    artifact: Option<ArtifactKind>,
+    /// Do not prompt — every decision must come from flags; unconfirmed
+    /// candidates register nothing.
+    #[arg(long)]
+    no_input: bool,
+    /// Keep the given candidates (the numbers printed after the
+    /// run/extract); the rest stay hidden. Repeatable.
+    #[arg(long)]
+    keep: Vec<usize>,
+    /// Keep every candidate discovery found.
+    #[arg(long, conflicts_with = "keep")]
+    keep_all: bool,
+    /// Manually add an executable discovery missed (repeatable).
+    #[arg(long)]
+    add: Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -276,19 +295,44 @@ fn raw_exit_code(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
-/// The `cellar install` handler (blueprint §8): the session over the
-/// artifact branch, then the per-branch summary and the discovery review
-/// preview. The standalone summary is the #27 surface, unchanged.
+/// The `cellar install` handler — the flagship flow (blueprint §8):
+/// bind/create the prefix, handle the artifact (branch hinted from the
+/// file name, asked once on a TTY), review the discovered candidates
+/// (interactive keep/hide/manual-add with a y/N confirmation when stdin is
+/// a TTY and no decision flags are given; `--keep`/`--keep-all`/`--add`
+/// otherwise), register the confirmed entries bound to the session's one
+/// prefix, and print the summary with the next command. Nothing registers
+/// without confirmation: an unreviewed candidate list registers nothing.
 fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode> {
+    // Interactive iff stdin is a TTY and `--no-input` is absent
+    // (blueprint §8) — and only when the decision flags leave nothing to
+    // ask (`--keep`/`--keep-all`/`--add` skip the review prompt).
+    let interactive = std::io::stdin().is_terminal() && !args.no_input;
     let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+    let artifact = match args.artifact {
+        Some(kind) => kind,
+        None if interactive => prompt_artifact_kind(&args.path)?,
+        // The filename hint is only the question's default (blueprint §8);
+        // used without the prompt, the guess is announced — never silent,
+        // always overridable.
+        None => {
+            let hint = artifact_hint(&args.path);
+            eprintln!(
+                "Treating '{}' as {} (hint from the file name — pass --artifact to override)",
+                file_name(&args.path),
+                hint.as_str()
+            );
+            hint
+        }
+    };
     let outcome = service.install(
         &args.path,
         &args.prefix,
         args.name.as_deref(),
         args.kind,
-        args.artifact,
+        artifact,
     )?;
-    match args.artifact {
+    match artifact {
         // The flagship summary (blueprint §8 step 4): what was registered,
         // plus the next command.
         ArtifactKind::Standalone => {
@@ -318,7 +362,7 @@ fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode
             if let Some(log) = &outcome.log_path {
                 println!("output: {}", log.display());
             }
-            print_candidates(&outcome.candidates);
+            review_and_register(&service, &outcome, args, interactive)?;
         }
         ArtifactKind::Archive => {
             println!(
@@ -326,10 +370,274 @@ fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode
                 file_name(&args.path),
                 outcome.prefix_slug
             );
-            print_candidates(&outcome.candidates);
+            review_and_register(&service, &outcome, args, interactive)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The review step of a running/extracting session (blueprint §8 step 3):
+/// present the discovered candidates, apply the keep/hide/manual-add
+/// decisions — from the prompts on a TTY, or from the `--keep` /
+/// `--keep-all` / `--add` flags — confirm when the decisions came from
+/// prompts, register the confirmed entries, and print the summary (step
+/// 4). Nothing registers without confirmation: with no flags, an
+/// unreviewed list registers zero entries.
+fn review_and_register(
+    service: &InstallService<TreeStore, ResolverSet>,
+    outcome: &InstallOutcome,
+    args: &InstallArgs,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    let decided = !args.keep.is_empty() || args.keep_all || !args.add.is_empty();
+    let (keep, add) = if interactive && !decided {
+        interactive_review(&outcome.candidates)?
+    } else {
+        print_candidates(&outcome.candidates);
+        (select_kept(&outcome.candidates, args)?, args.add.clone())
+    };
+    // The y/N gate exists only for prompted decisions — flags are the
+    // scripted confirmation (blueprint §8: every prompt has a flag).
+    let confirmed = keep.len() + add.len();
+    if confirmed > 0
+        && interactive
+        && !decided
+        && !confirm_registration(confirmed, &outcome.prefix_slug)?
+    {
+        println!("Registered nothing — the confirmation was declined");
+        return Ok(());
+    }
+    let registrations = service.register_reviewed(outcome, &keep, &add, args.kind)?;
+    print!(
+        "{}",
+        registration_summary(&registrations, &outcome.prefix_slug)
+    );
+    Ok(())
+}
+
+/// The artifact-kind question's filename-hint default (blueprint §8: the
+/// branch has a filename-hint default and is asked once — never silently
+/// fixed): `.zip` hints archive, an installer-ish name hints installer,
+/// everything else hints standalone.
+fn artifact_hint(path: &Path) -> ArtifactKind {
+    let name = file_name(path).to_ascii_lowercase();
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+    {
+        return ArtifactKind::Archive;
+    }
+    if name.contains("setup") || name.contains("install") {
+        return ArtifactKind::Installer;
+    }
+    ArtifactKind::Standalone
+}
+
+/// Parse a keep-selection line: whitespace/comma-separated 1-based
+/// candidate numbers, each within `count`. Empty input selects nothing.
+fn parse_keep_indices(input: &str, count: usize) -> Result<Vec<usize>, String> {
+    let mut indices = Vec::new();
+    for token in input.split([',', ' ', '\t']).filter(|t| !t.is_empty()) {
+        let index: usize = token
+            .parse()
+            .map_err(|_| format!("{token:?} is not a candidate number — enter numbers like 1,3"))?;
+        if index == 0 || index > count {
+            return Err(format!(
+                "candidate {index} is out of range (the review listed 1..={count})"
+            ));
+        }
+        indices.push(index - 1);
+    }
+    Ok(indices)
+}
+
+/// Parse the artifact-kind choice line; empty input picks the default.
+/// Accepts the numbered choice (1/2/3) and the vocabulary word.
+fn parse_artifact_choice(input: &str, default: ArtifactKind) -> Option<ArtifactKind> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "1" | "i" | "installer" => Some(ArtifactKind::Installer),
+        "2" | "a" | "archive" => Some(ArtifactKind::Archive),
+        "3" | "s" | "standalone" => Some(ArtifactKind::Standalone),
+        _ => None,
+    }
+}
+
+/// The candidates the review's flags keep: `--keep-all` keeps every one;
+/// `--keep N…` keeps the printed numbers (validated against the list,
+/// repeated numbers kept once); no flags keep nothing — the review never
+/// registers without confirmation.
+fn select_kept(candidates: &[Candidate], args: &InstallArgs) -> anyhow::Result<Vec<Candidate>> {
+    if args.keep_all {
+        return Ok(candidates.to_vec());
+    }
+    let mut kept: Vec<Candidate> = Vec::new();
+    for &index in &args.keep {
+        if index == 0 || index > candidates.len() {
+            anyhow::bail!(
+                "candidate {index} is out of range — the review printed 1..={}",
+                candidates.len()
+            );
+        }
+        let candidate = &candidates[index - 1];
+        if !kept.iter().any(|kept| kept.exe == candidate.exe) {
+            kept.push(candidate.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// The session summary (blueprint §8 step 4): what was registered —
+/// created vs updated — and the next command per entry. Zero
+/// registrations is a valid session outcome (an empty review); it says so
+/// plainly rather than pretending.
+fn registration_summary(registrations: &[InstallResult], prefix_slug: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    if registrations.is_empty() {
+        writeln!(
+            out,
+            "Registered nothing in prefix '{prefix_slug}' — no entries were confirmed; \
+             re-run `cellar install` to review the candidates, or pass --keep/--keep-all/--add"
+        )
+        .expect("writing to a String cannot fail");
+        return out;
+    }
+    let created = registrations
+        .iter()
+        .filter(|result| !result.was_update)
+        .count();
+    let updated = registrations.len() - created;
+    // One header line, told apart: everything fresh, everything an update,
+    // or the mixed session.
+    if updated == 0 {
+        let noun = if created == 1 { "entry" } else { "entries" };
+        writeln!(
+            out,
+            "Registered {created} {noun} in prefix '{prefix_slug}':"
+        )
+        .expect("write");
+    } else if created == 0 {
+        let noun = if updated == 1 { "entry" } else { "entries" };
+        writeln!(
+            out,
+            "Updated {updated} existing {noun} in prefix '{prefix_slug}':"
+        )
+        .expect("write");
+    } else {
+        let noun = if created == 1 { "entry" } else { "entries" };
+        writeln!(
+            out,
+            "Registered {created} {noun} in prefix '{prefix_slug}':"
+        )
+        .expect("write");
+        let noun = if updated == 1 { "entry" } else { "entries" };
+        writeln!(out, "Updated {updated} existing {noun}").expect("write");
+    }
+    for result in registrations {
+        writeln!(
+            out,
+            "  {} — {} ({})",
+            result.entry.slug,
+            result.entry.exe.display(),
+            result.entry.kind.as_str()
+        )
+        .expect("write");
+    }
+    writeln!(out, "Run it with:").expect("write");
+    for result in registrations {
+        writeln!(out, "  cellar launch {}", result.entry.slug).expect("write");
+    }
+    out
+}
+
+/// The interactive keep/hide/manual-add review (blueprint §8 step 3 — the
+/// TTY presentation): the candidates are printed numbered, the user keeps
+/// by number (the rest are hidden) and may add exes the scan missed; an
+/// empty line ends the review. The manual-add offer is always made — when
+/// discovery found nothing, that is exactly when a manual add is needed
+/// (glossary: manually adding a candidate discovery missed). Everything is
+/// re-askable on bad input; nothing is registered here — the y/N
+/// confirmation in [`review_and_register`] gates the writes.
+fn interactive_review(candidates: &[Candidate]) -> anyhow::Result<(Vec<Candidate>, Vec<PathBuf>)> {
+    print_candidates(candidates);
+    let keep = if candidates.is_empty() {
+        Vec::new()
+    } else {
+        loop {
+            print!(
+                "Keep which candidates? (numbers, e.g. 1,3 — the rest are hidden; empty = none): "
+            );
+            flush_stdout()?;
+            let line = read_line()?;
+            match parse_keep_indices(&line, candidates.len()) {
+                Ok(indices) => break indices.into_iter().map(|i| candidates[i].clone()).collect(),
+                Err(message) => eprintln!("cellar: {message}"),
+            }
+        }
+    };
+    let mut add = Vec::new();
+    loop {
+        print!("Manually add an exe the scan missed? (path, or empty when done): ");
+        flush_stdout()?;
+        let line = read_line()?;
+        if line.trim().is_empty() {
+            break;
+        }
+        add.push(PathBuf::from(line.trim()));
+    }
+    Ok((keep, add))
+}
+
+/// The artifact-kind question: the three branches with the filename-hint
+/// default (blueprint §8: asked once, never guessed) — looped until a
+/// recognizable answer.
+fn prompt_artifact_kind(path: &Path) -> anyhow::Result<ArtifactKind> {
+    let hint = artifact_hint(path);
+    eprintln!("How should Cellar handle '{}'?", file_name(path));
+    eprintln!("  1. installer — run it inside the prefix and discover what it drops");
+    eprintln!("  2. archive — extract it into the prefix");
+    eprintln!("  3. standalone — register without executing");
+    loop {
+        print!("Choice (1-3, default {}): ", hint.as_str());
+        flush_stdout()?;
+        match parse_artifact_choice(&read_line()?, hint) {
+            Some(kind) => return Ok(kind),
+            None => eprintln!("cellar: enter 1 (installer), 2 (archive), or 3 (standalone)"),
+        }
+    }
+}
+
+/// The y/N registration gate for prompted decisions ("nothing registers
+/// without confirmation", blueprint §8).
+fn confirm_registration(count: usize, prefix_slug: &str) -> anyhow::Result<bool> {
+    let noun = if count == 1 { "entry" } else { "entries" };
+    loop {
+        print!("Register {count} {noun} in prefix '{prefix_slug}'? [y/N]: ");
+        flush_stdout()?;
+        match read_line()?.trim().to_ascii_lowercase().as_str() {
+            "" | "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            _ => eprintln!("cellar: answer y or n"),
+        }
+    }
+}
+
+/// Flush the prompt to the terminal before blocking on input.
+fn flush_stdout() -> anyhow::Result<()> {
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+/// One line of prompt input, with the trailing newline removed.
+fn read_line() -> anyhow::Result<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
 /// The last path component for presentation, or the whole path when it has
@@ -341,9 +649,9 @@ fn file_name(path: &Path) -> String {
     )
 }
 
-/// The discovery review preview (blueprint §8 step 3). This slice presents
-/// the flat scan only — the interactive keep/hide review and registration
-/// land with the discovery slice (#31).
+/// The discovery review preview (blueprint §8 step 3): the numbered
+/// candidate list both presentation modes print — the interactive prompt
+/// reuses the numbers, and the `--keep` flags reference them.
 fn print_candidates(candidates: &[Candidate]) {
     if candidates.is_empty() {
         println!("No executable candidates in the prefix's menu/desktop areas");
@@ -777,10 +1085,9 @@ mod tests {
             "the name defaults to the exe file name"
         );
         assert_eq!(args.kind, AppKind::Game, "the default kind is `game`");
-        assert_eq!(
-            args.artifact,
-            ArtifactKind::Standalone,
-            "the unchanged default keeps `cellar install <exe>` behavior"
+        assert!(
+            args.artifact.is_none(),
+            "the branch is hinted from the file name, never silently fixed"
         );
         let cli = Cli::try_parse_from([
             "cellar",
@@ -814,11 +1121,64 @@ mod tests {
             let Command::Install(args) = cli.command else {
                 panic!("unexpected command");
             };
-            assert_eq!(args.artifact, expected);
+            assert_eq!(args.artifact, Some(expected));
         }
         assert!(
             Cli::try_parse_from(["cellar", "install", "x.exe", "--artifact", "bundle"]).is_err(),
             "an unknown artifact branch is a usage error"
+        );
+    }
+
+    #[test]
+    fn parses_the_review_flags() {
+        let cli = Cli::try_parse_from([
+            "cellar",
+            "install",
+            "x.exe",
+            "--artifact",
+            "installer",
+            "--no-input",
+            "--keep",
+            "1",
+            "--keep",
+            "3",
+            "--add",
+            "/prefix/drive_c/tools/helper.exe",
+        ])
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Install(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(args.no_input, "--no-input suppresses every prompt");
+        assert_eq!(
+            args.keep,
+            [1, 3],
+            "keep takes the printed candidate numbers"
+        );
+        assert_eq!(
+            args.add,
+            [PathBuf::from("/prefix/drive_c/tools/helper.exe")],
+            "add takes manual exe paths"
+        );
+        assert!(!args.keep_all);
+        let cli = Cli::try_parse_from([
+            "cellar",
+            "install",
+            "x.exe",
+            "--artifact",
+            "archive",
+            "--keep-all",
+        ])
+        .unwrap_or_else(|e| panic!("parse --keep-all: {e}"));
+        let Command::Install(args) = cli.command else {
+            panic!("unexpected command");
+        };
+        assert!(args.keep_all);
+        // --keep-all with an explicit --keep selection is contradictory.
+        assert!(
+            Cli::try_parse_from(["cellar", "install", "x.exe", "--keep-all", "--keep", "1"])
+                .is_err(),
+            "--keep-all conflicts with --keep"
         );
     }
 
@@ -1596,6 +1956,299 @@ mod tests {
             "the refusal is named: {err}"
         );
         assert!(!root.join("prefixes").join("evil.exe").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_hint_uses_the_filename_default() {
+        // Blueprint §8: the branch has a filename-hint default — never
+        // silently fixed. `.zip` hints archive, installer-ish names hint
+        // installer, everything else standalone.
+        assert_eq!(
+            artifact_hint(Path::new("/tmp/setup.exe")),
+            ArtifactKind::Installer
+        );
+        assert_eq!(
+            artifact_hint(Path::new("/downloads/GameInstaller-2.0.exe")),
+            ArtifactKind::Installer
+        );
+        assert_eq!(
+            artifact_hint(Path::new("/games/bundle.zip")),
+            ArtifactKind::Archive
+        );
+        assert_eq!(
+            artifact_hint(Path::new("/games/balatro.exe")),
+            ArtifactKind::Standalone
+        );
+        assert_eq!(
+            artifact_hint(Path::new("/games/BALATRO.EXE")),
+            ArtifactKind::Standalone,
+            "the hint matches case-insensitively"
+        );
+    }
+
+    #[test]
+    fn parse_keep_indices_validates_numbers() {
+        assert_eq!(parse_keep_indices("1,3", 5).unwrap(), [0, 2]);
+        assert_eq!(parse_keep_indices("1 3", 5).unwrap(), [0, 2]);
+        assert_eq!(parse_keep_indices("", 5).unwrap(), Vec::<usize>::new());
+        assert!(parse_keep_indices("0", 5).is_err(), "1-based numbering");
+        assert!(parse_keep_indices("6", 5).is_err(), "out of range");
+        assert!(parse_keep_indices("x", 5).is_err(), "not a number");
+    }
+
+    #[test]
+    fn parse_artifact_choice_accepts_numbers_and_words() {
+        let default = ArtifactKind::Standalone;
+        assert_eq!(parse_artifact_choice("", default), Some(default));
+        assert_eq!(
+            parse_artifact_choice("1", default),
+            Some(ArtifactKind::Installer)
+        );
+        assert_eq!(
+            parse_artifact_choice("i", default),
+            Some(ArtifactKind::Installer)
+        );
+        assert_eq!(
+            parse_artifact_choice("  Installer ", default),
+            Some(ArtifactKind::Installer)
+        );
+        assert_eq!(
+            parse_artifact_choice("2", default),
+            Some(ArtifactKind::Archive)
+        );
+        assert_eq!(
+            parse_artifact_choice("a", default),
+            Some(ArtifactKind::Archive)
+        );
+        assert_eq!(parse_artifact_choice("3", default), Some(default));
+        assert_eq!(parse_artifact_choice("q", default), None);
+    }
+
+    fn review_candidate(label: &str) -> Candidate {
+        Candidate {
+            exe: PathBuf::from(format!("/prefix/drive_c/{label}.exe")),
+            label: label.to_owned(),
+        }
+    }
+
+    #[test]
+    fn select_kept_applies_keep_all_and_validates_indices() -> anyhow::Result<()> {
+        let candidates = ["a", "b", "c"].map(review_candidate);
+        let args = || InstallArgs {
+            path: PathBuf::from("/tmp/setup.exe"),
+            prefix: "default".to_owned(),
+            name: None,
+            kind: AppKind::Game,
+            artifact: Some(ArtifactKind::Installer),
+            no_input: true,
+            keep: Vec::new(),
+            keep_all: false,
+            add: Vec::new(),
+        };
+        assert_eq!(
+            select_kept(&candidates, &args())?.len(),
+            0,
+            "no flags keep nothing — never silent registration"
+        );
+        let mut subset = args();
+        subset.keep = vec![2, 3];
+        let kept = select_kept(&candidates, &subset)?;
+        assert_eq!(
+            kept.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            ["b", "c"],
+            "--keep takes the printed numbers"
+        );
+        let mut all = args();
+        all.keep_all = true;
+        assert_eq!(
+            select_kept(&candidates, &all)?.len(),
+            3,
+            "--keep-all keeps every one"
+        );
+        let mut bad = args();
+        bad.keep = vec![4];
+        assert!(
+            select_kept(&candidates, &bad).is_err(),
+            "an out-of-range number is an operation error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registration_summary_lists_entries_and_next_commands() {
+        let result = |slug: &str, kind: AppKind, update: bool| InstallResult {
+            entry: AppEntry {
+                slug: slug.to_owned(),
+                exe: PathBuf::from(format!("/prefix/drive_c/{slug}.exe")),
+                kind,
+                prefix: "default".to_owned(),
+                overrides: Overrides::default(),
+                runner: None,
+                source_installer: Some(PathBuf::from("/tmp/setup.exe")),
+                installed_at: None,
+            },
+            was_update: update,
+        };
+        let summary = registration_summary(
+            &[
+                result("game-a", AppKind::Game, false),
+                result("game-b", AppKind::Game, true),
+            ],
+            "default",
+        );
+        assert!(
+            summary.contains("Registered 1 entry in prefix 'default'"),
+            "created vs updated are told apart:\n{summary}"
+        );
+        assert!(
+            summary.contains("Updated 1 existing entry"),
+            "update line:\n{summary}"
+        );
+        assert!(
+            summary.contains("cellar launch game-a") && summary.contains("cellar launch game-b"),
+            "the next command per entry:\n{summary}"
+        );
+        let empty = registration_summary(&[], "default");
+        assert!(
+            empty.contains("Registered nothing") && empty.contains("--keep"),
+            "an empty review is a plain outcome, not an error:\n{empty}"
+        );
+    }
+
+    /// The installer e2e rig: a stub wine that plants `names` on the
+    /// Desktop and reports success, plus the installer artifact and a
+    /// configured prefix — the full installer → awaited exit → discovery
+    /// loop in one test.
+    #[cfg(unix)]
+    fn installer_rig(tag: &str, names: &[&str]) -> anyhow::Result<(TreeStore, PathBuf)> {
+        use cellar_core::ConfiguredRunner;
+
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("cellar-cli-e2e-{tag}-{}-{seq}", std::process::id()));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let wine = root.join("stub-wine");
+        let plants = names
+            .iter()
+            .map(|name| format!("echo MZ > \"$WINEPREFIX/drive_c/users/me/Desktop/{name}.exe\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_stub_script(
+            &wine,
+            &format!("mkdir -p \"$WINEPREFIX/drive_c/users/me/Desktop\"\n{plants}\nexit 0\n"),
+        )?;
+        let installer = root.join("setup.exe");
+        std::fs::write(&installer, "MZ-setup")?;
+        PrefixService::new(store.clone()).create("default")?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(wine),
+        ));
+        store.save_prefix(&prefix)?;
+        Ok((store, installer))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_dropping_five_exes_registers_up_to_five_entries_with_keep_all()
+    -> anyhow::Result<()> {
+        // Acceptance: an installer dropping five exes yields up to five
+        // entries — no guessing a main one, no silent registration. Here
+        // `--keep-all` is the review's decision; the session stays one
+        // prefix.
+        let (store, installer) = installer_rig(
+            "review-all",
+            &["game", "launcher", "tool", "helper", "analyzer"],
+        )?;
+        let code = run_install(
+            &store,
+            &InstallArgs {
+                path: installer,
+                prefix: "default".to_owned(),
+                name: None,
+                kind: AppKind::Game,
+                artifact: Some(ArtifactKind::Installer),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: true,
+                add: Vec::new(),
+            },
+        )?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        let apps = store.list_apps()?;
+        let slugs: Vec<&str> = apps.iter().map(|app| app.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["analyzer", "game", "helper", "launcher", "tool"],
+            "five candidates, five entries"
+        );
+        assert!(
+            apps.iter().all(|app| app.prefix == "default"),
+            "one session, one prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_review_keep_subset_registers_only_the_confirmed() -> anyhow::Result<()> {
+        // `--keep 1 3 5` keeps exactly the printed numbers; the rest stay
+        // hidden.
+        let (store, installer) = installer_rig(
+            "review-subset",
+            &["game", "launcher", "tool", "helper", "analyzer"],
+        )?;
+        run_install(
+            &store,
+            &InstallArgs {
+                path: installer,
+                prefix: "default".to_owned(),
+                name: None,
+                kind: AppKind::Game,
+                artifact: Some(ArtifactKind::Installer),
+                no_input: true,
+                keep: vec![1, 3, 5],
+                keep_all: false,
+                add: Vec::new(),
+            },
+        )?;
+        let slugs: Vec<String> = store.list_apps()?.into_iter().map(|app| app.slug).collect();
+        assert_eq!(
+            slugs,
+            ["analyzer", "helper", "tool"],
+            "only the confirmed candidates register"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_review_without_confirmation_registers_nothing() -> anyhow::Result<()> {
+        // The hard rule enforced end-to-end: candidates alone never
+        // register — no flags, no prompts, zero entries, success exit.
+        let (store, installer) = installer_rig("review-none", &["game", "tool"])?;
+        let code = run_install(
+            &store,
+            &InstallArgs {
+                path: installer,
+                prefix: "default".to_owned(),
+                name: None,
+                kind: AppKind::Game,
+                artifact: Some(ArtifactKind::Installer),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+        )?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            store.list_apps()?.is_empty(),
+            "nothing registers without confirmation"
+        );
         Ok(())
     }
 }

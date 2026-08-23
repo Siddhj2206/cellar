@@ -33,6 +33,8 @@ use cellar_core::manifest::RunnerManifest;
 use cellar_core::ports::Storage;
 use cellar_core::slug;
 
+use crate::lnk;
+
 /// The schema version every written file carries (ADR 0001: migrations are
 /// file-tree transforms — a version bump is a transform, not a rewrite).
 pub const SCHEMA_VERSION: u32 = 1;
@@ -123,8 +125,14 @@ impl TreeStore {
     /// deterministic (sorted) order — the flat counterpart of the `.lnk`
     /// decode (#31). Symlinks are skipped, not followed: an installer may
     /// have planted anything in a prefix, and the scan must stay inside the
-    /// prefix's areas — no escapes, no link cycles.
-    fn collect_exes(dir: &Path, out: &mut Vec<Candidate>) -> Result<(), StorageError> {
+    /// prefix's areas — no escapes, no link cycles. Candidates whose exe
+    /// was already offered (via a `.lnk` target) are skipped — the
+    /// shortcut's label wins.
+    fn collect_exes(
+        dir: &Path,
+        out: &mut Vec<Candidate>,
+        seen: &mut BTreeSet<PathBuf>,
+    ) -> Result<(), StorageError> {
         let Ok(entries) = read_dir_sorted(dir) else {
             // Missing or unreadable area: nothing to collect there (the
             // area sweep already degrades gracefully — see `menu_areas`).
@@ -138,18 +146,59 @@ impl TreeStore {
                 continue;
             }
             if meta.is_dir() {
-                Self::collect_exes(&path, out)?;
-            } else if meta.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-            {
+                Self::collect_exes(&path, out, seen)?;
+            } else if meta.is_file() && has_extension(&path, "exe") && seen.insert(path.clone()) {
                 let label = path
                     .file_stem()
                     .map(|stem| stem.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 out.push(Candidate { exe: path, label });
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect the `.lnk` shortcuts under `dir` (recursive, sorted, same
+    /// symlink rules as the flat scan), decoding each target and resolving
+    /// it against the prefix's `drive_c`. A shortcut whose target is not a
+    /// real exe inside the prefix is skipped — discovery is best-effort
+    /// (blueprint §8: never guesses, never auto-registers; a `.lnk` that
+    /// cannot be read or decoded is noise, not a session failure).
+    fn collect_shortcut_candidates(
+        dir: &Path,
+        drive_c: &Path,
+        out: &mut Vec<Candidate>,
+        seen: &mut BTreeSet<PathBuf>,
+    ) -> Result<(), StorageError> {
+        let Ok(entries) = read_dir_sorted(dir) else {
+            return Ok(());
+        };
+        for path in entries {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                Self::collect_shortcut_candidates(&path, drive_c, out, seen)?;
+            } else if meta.is_file() && has_extension(&path, "lnk") {
+                let Ok(bytes) = fs::read(&path) else {
+                    continue;
+                };
+                let Some(target) = lnk::parse_lnk_target(&bytes) else {
+                    continue;
+                };
+                let Some(exe) = resolve_lnk_target(drive_c, &target) else {
+                    continue;
+                };
+                if seen.insert(exe.clone()) {
+                    let label = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    out.push(Candidate { exe, label });
+                }
             }
         }
         Ok(())
@@ -590,13 +639,20 @@ impl Storage for TreeStore {
     }
 
     fn discover_executables(&self, prefix: &Prefix) -> Result<Vec<Candidate>, StorageError> {
-        // The flat scan (this slice, #30): every `*.exe` regular file found
-        // recursively under the prefix's menu and desktop areas. `.lnk` target
-        // decoding lands with the discovery slice (#31) — shortcuts are not
-        // candidates until then. Never auto-registers (blueprint §8).
+        // Discovery (this slice, #31): every `*.exe` regular file found
+        // recursively under the prefix's menu and desktop areas (the flat
+        // scan, #30), joined with the `.lnk` targets that resolve to real
+        // exes inside the prefix — the shortcut's label wins over the flat
+        // scan's stem, and the same target from two shortcuts appears
+        // once. Deterministic: areas in fixed order (sorted users,
+        // per-user Desktop before Start Menu, then the all-users menu),
+        // entries sorted within each. Never auto-registers (blueprint §8).
+        let drive_c = self.prefix_dir(&prefix.slug).join("drive_c");
         let mut candidates = Vec::new();
+        let mut seen = BTreeSet::new();
         for area in self.menu_areas(&prefix.slug) {
-            Self::collect_exes(&area, &mut candidates)?;
+            Self::collect_shortcut_candidates(&area, &drive_c, &mut candidates, &mut seen)?;
+            Self::collect_exes(&area, &mut candidates, &mut seen)?;
         }
         Ok(candidates)
     }
@@ -629,6 +685,64 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>, StorageError> {
         .collect();
     entries.sort();
     Ok(entries)
+}
+
+/// Whether `path`'s extension matches `extension`, case-insensitively —
+/// Windows file naming, applied to both the flat-scan exe check and the
+/// `.lnk` shortcut check.
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+}
+
+/// Resolve a `.lnk` target — a Windows path like
+/// `C:\Program Files\My Game\game.exe` — against the prefix's `drive_c`
+/// (wine maps `C:\` there). The walk is case-insensitive per component
+/// (Windows filesystems are; wine's are not), never follows symlinks (the
+/// flat scan's containment rule, mirrored here), and only yields a real
+/// `*.exe` file. Anything else — non-`C:` drives, UNC or relative paths,
+/// missing nodes, folder or non-exe targets — is `None`: not a candidate.
+fn resolve_lnk_target(drive_c: &Path, target: &str) -> Option<PathBuf> {
+    let bytes = target.trim().as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].eq_ignore_ascii_case(&b'c') {
+        return None;
+    }
+    let mut current = drive_c.to_path_buf();
+    for component in target
+        .get(2..)?
+        .split(['\\', '/'])
+        .filter(|c| !c.is_empty())
+    {
+        current = find_child_ci(&current, component)?;
+    }
+    let Ok(meta) = fs::metadata(&current) else {
+        return None;
+    };
+    if !meta.is_file() || !has_extension(&current, "exe") {
+        return None;
+    }
+    Some(current)
+}
+
+/// The child of `dir` whose name matches `name` case-insensitively — or
+/// `None`. A symlink matching the name is refused, not followed: the walk
+/// stays inside the prefix (installers can plant anything).
+fn find_child_ci(dir: &Path, name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if file_name.eq_ignore_ascii_case(name) {
+            let meta = fs::symlink_metadata(&path).ok()?;
+            if meta.file_type().is_symlink() {
+                return None;
+            }
+            return Some(path);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -671,8 +785,9 @@ mod tests {
     fn discovery_flat_scan_finds_exes_across_menu_and_desktop_areas() -> Result<(), StorageError> {
         // An installer dropped a game next to its shortcut — nested Start
         // Menu dirs, several user profiles, an all-users shortcut, and
-        // non-exe noise the scan must ignore (the `.lnk` itself waits for
-        // the decode slice, #31).
+        // non-exe noise the scan must ignore. The opaque `.lnk` is skipped:
+        // it carries no valid shell-link header, so it yields no target
+        // (the decode itself is covered below).
         let (store, root) = store("discovery");
         let prefix = store.create_prefix("default")?;
         let prefix_dir = root.join("prefixes/default");
@@ -703,6 +818,236 @@ mod tests {
                 .iter()
                 .all(|c| c.exe.starts_with(&prefix_dir) && c.exe.extension().is_some()),
             "candidates are real files under the prefix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_resolves_lnk_targets_into_candidates() -> Result<(), StorageError> {
+        // A shortcut on the Desktop pointing at an app exe deep in
+        // program files: the decoded target becomes a candidate labelled
+        // with the shortcut's display name, exactly once (the flat scan
+        // would also find the exe — the shortcut's label wins).
+        let (store, root) = store("discovery-lnk");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default").join("drive_c");
+        let game_dir = prefix_dir.join("Program Files/My Game");
+        fs::create_dir_all(&game_dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let game_exe = game_dir.join("game.exe");
+        fs::write(&game_exe, "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let desktop = prefix_dir.join("users/me/Desktop");
+        fs::create_dir_all(&desktop).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(
+            desktop.join("Play My Game.lnk"),
+            crate::lnk::build_lnk(true, true, r"C:\Program Files\My Game\game.exe", ""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(desktop.join("notes.txt"), "hi").unwrap_or_else(|e| panic!("write: {e}"));
+        let candidates = store.discover_executables(&prefix)?;
+        assert_eq!(
+            candidates,
+            [Candidate {
+                exe: game_exe,
+                label: "Play My Game".to_owned(),
+            }],
+            "the shortcut name labels the resolved exe, exactly once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_resolves_targets_case_insensitively() -> Result<(), StorageError> {
+        // Installers write shortcuts with the exact case they remember;
+        // wine's drive_c may differ. Windows naming is case-insensitive —
+        // the resolution walks every component that way.
+        let (store, root) = store("discovery-lnk-case");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default").join("drive_c");
+        fs::create_dir_all(prefix_dir.join("program files/game"))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(prefix_dir.join("program files/game/Game.exe"), "MZ")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        let menu = prefix_dir
+            .join("users/me/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/My Game");
+        fs::create_dir_all(&menu).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(
+            menu.join("Game.lnk"),
+            crate::lnk::build_lnk(false, false, r"C:\PROGRAM FILES\GAME\GAME.EXE", ""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        let candidates = store.discover_executables(&prefix)?;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Game"],
+            "the ANSI shortcut's target resolves through differing case"
+        );
+        assert!(
+            candidates[0].exe.ends_with("program files/game/Game.exe"),
+            "the resolved path is the on-disk one: {}",
+            candidates[0].exe.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_resolves_a_non_ascii_ansi_target() -> Result<(), StorageError> {
+        // A Western installer writes `Café\game.exe` with the `é` as a
+        // single CP1252 byte; the on-disk name is UTF-8. The decode maps
+        // the byte back to `é`, so the walk matches the component exactly.
+        let (store, root) = store("discovery-lnk-ansi");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default").join("drive_c");
+        let cafe = prefix_dir.join("Program Files/Café");
+        fs::create_dir_all(&cafe).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(cafe.join("game.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let desktop = prefix_dir.join("users/me/Desktop");
+        fs::create_dir_all(&desktop).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(
+            desktop.join("Caf.lnk"),
+            crate::lnk::build_lnk_raw(false, false, b"C:\\Program Files\\Caf\xE9\\game.exe", b""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        let candidates = store.discover_executables(&prefix)?;
+        assert_eq!(
+            candidates,
+            [Candidate {
+                exe: cafe.join("game.exe"),
+                label: "Caf".to_owned(),
+            }],
+            "the CP1252 target byte resolves to the UTF-8 on-disk name"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_skips_shortcuts_without_a_resolvable_exe_target() -> Result<(), StorageError> {
+        // Dangling targets (uninstalled apps), folder targets, other-drive
+        // and UNC targets, and unparseable blobs are all skipped — a
+        // shortcut is never a candidate unless it names a real exe inside
+        // the prefix.
+        let (store, root) = store("discovery-lnk-skip");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default").join("drive_c");
+        let desktop = prefix_dir.join("users/me/Desktop");
+        fs::create_dir_all(&desktop).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let write_link = |name: &str, blob: &[u8]| {
+            fs::write(desktop.join(name), blob).unwrap_or_else(|e| panic!("write {name}: {e}"));
+        };
+        // Target missing on disk.
+        write_link(
+            "Gone.lnk",
+            &crate::lnk::build_lnk(true, false, r"C:\Games\Gone\gone.exe", ""),
+        );
+        // Target is a folder, not a file.
+        fs::create_dir_all(prefix_dir.join("Games/Folder"))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        write_link(
+            "Folder.lnk",
+            &crate::lnk::build_lnk(true, false, r"C:\Games\Folder", ""),
+        );
+        // Target on another drive.
+        write_link(
+            "Other Drive.lnk",
+            &crate::lnk::build_lnk(true, false, r"D:\Games\game.exe", ""),
+        );
+        // Non-exe target.
+        fs::write(prefix_dir.join("Games/readme.txt"), "hi")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+        write_link(
+            "Not An Exe.lnk",
+            &crate::lnk::build_lnk(false, false, r"C:\Games\readme.txt", ""),
+        );
+        // Not a shell link at all.
+        write_link("Garbage.lnk", b"definitely not a shortcut");
+        assert_eq!(
+            store.discover_executables(&prefix)?,
+            Vec::new(),
+            "no candidate from any of these shortcuts"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_merges_flat_and_shortcut_candidates_and_dedupes() -> Result<(), StorageError> {
+        // The exe a shortcut names and the flat scan finds is offered once
+        // (shortcut label wins); a shortcut-only exe and a flat-only exe
+        // both appear; two shortcuts to the same exe offer it once.
+        let (store, root) = store("discovery-lnk-merge");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default").join("drive_c");
+        let game_dir = prefix_dir.join("Program Files/My Game");
+        fs::create_dir_all(&game_dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(game_dir.join("game.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(game_dir.join("launcher.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let desktop = prefix_dir.join("users/me/Desktop");
+        fs::create_dir_all(&desktop).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        // Two shortcuts for the same game exe, plus one for the launcher.
+        let target = r"C:\Program Files\My Game\game.exe";
+        fs::write(
+            desktop.join("Play My Game.lnk"),
+            crate::lnk::build_lnk(true, true, target, ""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(
+            desktop.join("My Game.lnk"),
+            crate::lnk::build_lnk(false, false, target, ""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        fs::write(
+            desktop.join("Launcher.lnk"),
+            crate::lnk::build_lnk(true, false, r"C:\Program Files\My Game\launcher.exe", ""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        let candidates = store.discover_executables(&prefix)?;
+        let found: Vec<(&str, &str)> = candidates
+            .iter()
+            .map(|c| {
+                (
+                    c.label.as_str(),
+                    c.exe
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [("Launcher", "launcher.exe"), ("My Game", "game.exe"),],
+            "flat-only exes still appear; the first shortcut in sorted order names the exe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discovery_shortcut_resolution_refuses_symlinked_components() -> Result<(), StorageError> {
+        use std::os::unix::fs::symlink;
+
+        // A shortcut can be planted by anyone; its target path must not
+        // walk out of the prefix through a symlinked directory — the
+        // containment rule of the flat scan, mirrored in resolution.
+        let (store, root) = store("discovery-lnk-links");
+        let prefix = store.create_prefix("default")?;
+        let prefix_dir = root.join("prefixes/default").join("drive_c");
+        let outside = root.join("outside");
+        fs::create_dir_all(&outside).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(outside.join("sneaky.exe"), "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let desktop = prefix_dir.join("users/me/Desktop");
+        fs::create_dir_all(&desktop).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        symlink(&outside, prefix_dir.join("Escape")).unwrap_or_else(|e| panic!("symlink: {e}"));
+        fs::write(
+            desktop.join("Sneaky.lnk"),
+            crate::lnk::build_lnk(true, false, r"C:\Escape\sneaky.exe", ""),
+        )
+        .unwrap_or_else(|e| panic!("write: {e}"));
+        assert_eq!(
+            store.discover_executables(&prefix)?,
+            Vec::new(),
+            "the resolution never follows a symlinked component"
         );
         Ok(())
     }

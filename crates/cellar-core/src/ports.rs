@@ -109,10 +109,10 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     fn tree_health(&self) -> Result<TreeHealth, StorageError>;
 
     /// Discovery: the prefix's Start Menu / Desktop areas, scanned for
-    /// executable candidates the user reviews. Never auto-registers. This
-    /// slice (#30) implements the flat scan — the `*.exe` files found in
-    /// the areas, recursively, in deterministic order; `.lnk` target
-    /// decoding lands with the discovery slice (#31).
+    /// executable candidates the user reviews. Never auto-registers. The
+    /// flat `*.exe` scan of the areas landed with #30; `.lnk` target
+    /// decoding — shortcuts resolved against the prefix's `drive_c` —
+    /// with #31. Deterministic order, deduplicated by exe path.
     fn discover_executables(&self, prefix: &Prefix) -> Result<Vec<Candidate>, StorageError>;
 
     /// The shared installer pipeline — fetch, verify, extract, flock,

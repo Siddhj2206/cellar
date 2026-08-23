@@ -1,12 +1,14 @@
 //! Application use-cases: the `AppEntry` registry — install with the
 //! three-armed artifact handling (standalone registers without executing,
 //! installer runs inside the prefix with its exit awaited, archive extracts
-//! into it — each followed by the flat discovery scan, #30) — app list with
-//! per-entry status, uninstall degrading to entry removal (#27), the prefix
-//! lifecycle and the tree-health doctor check (#26), and the `LaunchApp`
-//! use-case (#28/#29): resolve → check → plan → execute. Thin orchestration
-//! over the `core` ports — concrete adapters are injected only at the
-//! composition root.
+//! into it — each followed by discovery) and the review registration step
+//! (#31): the confirmed keep-list and manual adds of a session become
+//! entries, zero or more, all bound to the session's one prefix — app list
+//! with per-entry status, uninstall degrading to entry removal (#27), the
+//! prefix lifecycle and the tree-health doctor check (#26), and the
+//! `LaunchApp` use-case (#28/#29): resolve → check → plan → execute. Thin
+//! orchestration over the `core` ports — concrete adapters are injected
+//! only at the composition root.
 
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
@@ -72,27 +74,31 @@ pub struct InstallResult {
 }
 
 /// The result of one session (glossary: InstallSession): the prefix it
-/// touched, the entries registered — this slice: standalone only; candidate
-/// review and multi-registration land with #31 — and, for the running and
-/// extracting branches, the flat discovery scan of the prefix's menu and
-/// desktop areas.
+/// touched, the artifact it handled, and the entries registered — the
+/// running/extracting branches collect the prefix's menu/desktop
+/// candidates for review; registration of the reviewed list is the
+/// session's closing step ([`InstallService::register_reviewed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallOutcome {
     /// The prefix the session touched — the bound one, created when missing.
     pub prefix_slug: String,
     pub registrations: Vec<InstallResult>,
     /// Executable candidates found after the artifact ran or extracted
-    /// (flat scan, `.lnk` decoding lands with #31). Empty for standalone.
+    /// (flat scan joined with `.lnk` targets, #31). Empty for standalone.
     pub candidates: Vec<Candidate>,
     /// The artifact-run log under the disposable cache (installer branch —
     /// the run's output always lands in a per-launch log, blueprint §7).
     pub log_path: Option<PathBuf>,
+    /// The canonical artifact path this session handled — recorded as the
+    /// `source_installer` metadata of entries registered from its review
+    /// (installer/archive branches). None for standalone.
+    pub artifact: Option<PathBuf>,
 }
 
 /// The artifact branch of `cellar install` (blueprint §8 step 2): how the
-/// artifact is handled inside the session. The flag replaces the interactive
-/// question with its filename-hint default, which lands with the discovery
-/// slice (#31) — the branch is never guessed silently.
+/// artifact is handled inside the session. The interactive question with
+/// its filename-hint default lives at the presentation layer (#31) — the
+/// branch is never guessed silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactKind {
     /// Register the exe without executing anything (the #27 branch).
@@ -101,6 +107,19 @@ pub enum ArtifactKind {
     Installer,
     /// Extract the archive into the bound prefix.
     Archive,
+}
+
+impl ArtifactKind {
+    /// The flag/choice vocabulary (`standalone`, `installer`, `archive`)
+    /// — the same strings [`FromStr`] accepts, so prompting and parsing
+    /// can never drift.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Installer => "installer",
+            Self::Archive => "archive",
+        }
+    }
 }
 
 impl FromStr for ArtifactKind {
@@ -183,11 +202,12 @@ impl std::error::Error for InstallError {}
 /// The `AppEntry` registry and install session (blueprint §8: `cellar
 /// install <path>` is the flagship flow). Identity is the canonical exe
 /// path — re-installing the same exe updates the same entry (blueprint §6,
-/// §8); the slug is the display/file name with `-2` dedupe. This slice
-/// (#30) delivers the closed three-armed artifact handling (blueprint §5):
+/// §8); the slug is the display/file name with `-2` dedupe. The closed
+/// three-armed artifact handling (blueprint §5) landed with #30 —
 /// standalone, installer (run inside the bound prefix, exit awaited),
-/// archive (extract into it) — the running/extracting branches then
-/// collect the prefix's menu/desktop candidates for review.
+/// archive (extract into it); the discovery review and multi-registration
+/// land here (#31): [`InstallService::register_reviewed`] confirms the
+/// session's candidates — zero or more entries, one prefix, nothing silent.
 pub struct InstallService<S: Storage, R: RunnerResolver> {
     storage: S,
     resolver: R,
@@ -200,16 +220,16 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
         Self { storage, resolver }
     }
 
-    /// The flagship flow's artifact handling (blueprint §8 steps 1–3 for
-    /// now; the interactive review and summary complete the flow with #31):
-    /// bind or create the prefix, then handle the artifact per its
+    /// The flagship flow's artifact handling (blueprint §8 steps 1–3): bind
+    /// or create the prefix, then handle the artifact per its
     /// [`ArtifactKind`]. Standalone registers without executing (the #27
-    /// branch, unchanged); installer runs inside the prefix with its exit
-    /// awaited — a failed installer aborts the session with
+    /// branch); installer runs inside the prefix with its exit awaited — a
+    /// failed installer aborts the session with
     /// [`InstallError::InstallerFailed`]; archive extracts into the
     /// prefix's wine root, path-traversal-safe. The running/extracting
     /// branches then collect the prefix's menu/desktop executable
-    /// candidates for review (flat scan; `.lnk` decoding lands with #31).
+    /// candidates for review; the review's confirmation registers them
+    /// ([`InstallService::register_reviewed`]) — nothing auto-registers.
     pub fn install(
         &self,
         path: &Path,
@@ -277,6 +297,7 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
                     registrations: vec![result],
                     candidates: Vec::new(),
                     log_path: None,
+                    artifact: None,
                 })
             }
             ArtifactKind::Installer => {
@@ -286,6 +307,7 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
                     registrations: Vec::new(),
                     candidates,
                     log_path: Some(log_path),
+                    artifact: Some(canonical),
                 })
             }
             ArtifactKind::Archive => {
@@ -300,9 +322,70 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
                     registrations: Vec::new(),
                     candidates,
                     log_path: None,
+                    artifact: Some(canonical),
                 })
             }
         }
+    }
+
+    /// The registration step of an [`InstallSession`](crate) (blueprint §8
+    /// step 3 → 4): the review's confirmed keep-list and manual adds become
+    /// `AppEntry`s, every one bound to the session's single prefix
+    /// (`session.prefix_slug`) — the glossary's one-session-one-prefix
+    /// rule, enforced here by construction. Zero or more entries register:
+    /// an empty review registers nothing — Cellar never guesses a "main"
+    /// exe and never registers silently. Identity is the canonical exe
+    /// path (blueprint §6): re-installing an already-registered exe
+    /// updates the same entry. Every exe is pre-flighted before the first
+    /// write — a missing manual add or an unslugifiable label aborts the
+    /// whole review, never a partial registration.
+    pub fn register_reviewed(
+        &self,
+        session: &InstallOutcome,
+        keep: &[Candidate],
+        add: &[PathBuf],
+        kind: AppKind,
+    ) -> Result<Vec<InstallResult>, StorageError> {
+        // Pre-flight: canonicalize every exe (the identity and existence
+        // check), dedupe within the review, and judge every slug — all
+        // before anything is written.
+        let mut planned: Vec<(PathBuf, String)> = Vec::new();
+        let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut plan = |exe: &Path, label: &str| -> Result<(), StorageError> {
+            let canonical = self.storage.canonicalize_exe(exe)?;
+            if !seen.insert(canonical.clone()) {
+                return Ok(());
+            }
+            let base = slug::slugify(label);
+            if base.is_empty() {
+                return Err(StorageError::Invalid(format!(
+                    "cannot form an app slug from {label:?}"
+                )));
+            }
+            planned.push((canonical, base));
+            Ok(())
+        };
+        for candidate in keep {
+            plan(&candidate.exe, &candidate.label)?;
+        }
+        for path in add {
+            let label = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            plan(path, &label)?;
+        }
+        let mut results = Vec::with_capacity(planned.len());
+        for (canonical, base) in planned {
+            results.push(self.register_one(
+                &canonical,
+                &session.prefix_slug,
+                kind,
+                &base,
+                session.artifact.clone(),
+            )?);
+        }
+        Ok(results)
     }
 
     /// The standalone branch (blueprint §8: register without executing) —
@@ -317,8 +400,30 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
         kind: AppKind,
         base: &str,
     ) -> Result<InstallResult, StorageError> {
-        // Identity is the canonical exe path: re-install finds the existing
-        // entry and updates it in place.
+        self.register_one(canonical, prefix_slug, kind, base, None)
+    }
+
+    /// The one-entry registration shared by the standalone branch (#27)
+    /// and the session review (#31): identity is the canonical exe path —
+    /// an existing entry with the same exe is updated in place (kind,
+    /// prefix binding, and this session's source artifact when there is
+    /// one), never duplicated; a fresh entry takes the deduped slug, the
+    /// binding prefix, and the source metadata. Callers pre-flight:
+    /// `base` is a pre-slugified display name and `canonical` a verified
+    /// exe path.
+    fn register_one(
+        &self,
+        canonical: &Path,
+        prefix_slug: &str,
+        kind: AppKind,
+        base: &str,
+        source_installer: Option<PathBuf>,
+    ) -> Result<InstallResult, StorageError> {
+        if base.is_empty() {
+            return Err(StorageError::Invalid(
+                "cannot register an entry without a display name".to_owned(),
+            ));
+        }
         if let Some(mut existing) = self
             .storage
             .list_apps()?
@@ -327,6 +432,9 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
         {
             existing.kind = kind;
             prefix_slug.clone_into(&mut existing.prefix);
+            if source_installer.is_some() {
+                existing.source_installer = source_installer;
+            }
             self.storage.save_app(&existing)?;
             return Ok(InstallResult {
                 entry: existing,
@@ -343,7 +451,7 @@ impl<S: Storage, R: RunnerResolver> InstallService<S, R> {
             prefix: prefix_slug.to_owned(),
             overrides: Overrides::default(),
             runner: None,
-            source_installer: None,
+            source_installer,
             installed_at: None,
         };
         self.storage.save_app(&app)?;
@@ -1265,6 +1373,294 @@ mod tests {
             "nothing registered"
         );
         assert!(service.storage.created().is_empty(), "no prefix created");
+        Ok(())
+    }
+
+    #[test]
+    fn review_registers_every_kept_candidate_bound_to_the_session_prefix()
+    -> Result<(), StorageError> {
+        // An installer dropping five exes yields up to five entries — one
+        // per confirmed candidate, every one bound to the session's single
+        // prefix. No guessing a "main" exe: the review decides all of it.
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock, StubResolver::ok());
+        let candidates = (0..5)
+            .map(|i| Candidate {
+                exe: PathBuf::from(format!("/prefix/drive_c/users/me/Desktop/app{i}.exe")),
+                label: format!("App {i}"),
+            })
+            .collect::<Vec<_>>();
+        let outcome = InstallOutcome {
+            prefix_slug: "games".to_owned(),
+            registrations: Vec::new(),
+            candidates: candidates.clone(),
+            log_path: None,
+            artifact: Some(PathBuf::from("/tmp/setup.exe")),
+        };
+        let results = service.register_reviewed(&outcome, &candidates, &[], AppKind::Game)?;
+        assert_eq!(results.len(), 5, "five confirmed candidates, five entries");
+        assert!(
+            results.iter().all(|result| !result.was_update),
+            "nothing was pre-registered"
+        );
+        let apps = service.storage.list_apps()?;
+        assert_eq!(apps.len(), 5);
+        for (app, candidate) in apps.iter().zip(&candidates) {
+            assert_eq!(app.prefix, "games", "every entry binds the session prefix");
+            assert_eq!(app.exe, candidate.exe, "identity is the candidate exe");
+            assert_eq!(app.kind, AppKind::Game, "the session kind applies");
+            assert_eq!(
+                app.source_installer.as_deref(),
+                Some(Path::new("/tmp/setup.exe")),
+                "the session's artifact is recorded as the source"
+            );
+        }
+        let slugs: Vec<&str> = apps.iter().map(|app| app.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["app-0", "app-1", "app-2", "app-3", "app-4"],
+            "each label forms its slug in review order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_registers_nothing_without_confirmation() -> Result<(), StorageError> {
+        // The hard rule: candidates alone never register — only the
+        // review's explicit decisions do. An empty review is a valid
+        // session outcome.
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock, StubResolver::ok());
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: vec![Candidate {
+                exe: PathBuf::from("/prefix/drive_c/game.exe"),
+                label: "game".to_owned(),
+            }],
+            log_path: None,
+            artifact: Some(PathBuf::from("/tmp/setup.exe")),
+        };
+        assert_eq!(
+            service.register_reviewed(&outcome, &[], &[], AppKind::Game)?,
+            Vec::new(),
+            "zero confirmed candidates, zero entries"
+        );
+        assert!(
+            service.storage.list_apps()?.is_empty(),
+            "nothing was registered silently"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_manual_adds_register_with_the_exe_stem_label() -> Result<(), StorageError> {
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock, StubResolver::ok());
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: Vec::new(),
+            log_path: None,
+            artifact: None,
+        };
+        let results = service.register_reviewed(
+            &outcome,
+            &[],
+            &[PathBuf::from("/prefix/drive_c/tools/helper.exe")],
+            AppKind::Tool,
+        )?;
+        assert_eq!(results.len(), 1);
+        let app = &results[0].entry;
+        assert_eq!(app.slug, "helper", "the manual add is named by its stem");
+        assert_eq!(app.kind, AppKind::Tool);
+        assert_eq!(app.prefix, "default");
+        Ok(())
+    }
+
+    #[test]
+    fn review_dedupes_kept_and_manually_added_exes() -> Result<(), StorageError> {
+        // The same exe via a shortcut and a manual add — or two shortcuts
+        // — registers once.
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock, StubResolver::ok());
+        let candidate = Candidate {
+            exe: PathBuf::from("/prefix/drive_c/game.exe"),
+            label: "game".to_owned(),
+        };
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: vec![candidate.clone()],
+            log_path: None,
+            artifact: None,
+        };
+        let results = service.register_reviewed(
+            &outcome,
+            &[candidate.clone(), candidate],
+            &[PathBuf::from("/prefix/drive_c/game.exe")],
+            AppKind::Game,
+        )?;
+        assert_eq!(results.len(), 1, "the exe registers exactly once");
+        assert_eq!(service.storage.list_apps()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn review_reinstalling_a_registered_exe_updates_the_same_entry() -> Result<(), StorageError> {
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(AppEntry {
+            slug: "balatro".to_owned(),
+            exe: PathBuf::from("/prefix/drive_c/balatro.exe"),
+            kind: AppKind::Tool,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        });
+        let service = InstallService::new(mock, StubResolver::ok());
+        let candidate = Candidate {
+            exe: PathBuf::from("/prefix/drive_c/balatro.exe"),
+            label: "Balatro".to_owned(),
+        };
+        let outcome = InstallOutcome {
+            prefix_slug: "games".to_owned(),
+            registrations: Vec::new(),
+            candidates: vec![candidate.clone()],
+            log_path: None,
+            artifact: Some(PathBuf::from("/tmp/setup.exe")),
+        };
+        let results = service.register_reviewed(&outcome, &[candidate], &[], AppKind::Game)?;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].was_update, "identity stays with the exe path");
+        assert_eq!(
+            results[0].entry.slug, "balatro",
+            "the slug stays the entry's"
+        );
+        assert_eq!(results[0].entry.kind, AppKind::Game);
+        assert_eq!(
+            results[0].entry.prefix, "games",
+            "the session prefix rebinds"
+        );
+        assert_eq!(
+            results[0].entry.source_installer.as_deref(),
+            Some(Path::new("/tmp/setup.exe")),
+            "the re-session's artifact refreshes the metadata"
+        );
+        assert_eq!(service.storage.list_apps()?.len(), 1, "no duplicate entry");
+        Ok(())
+    }
+
+    #[test]
+    fn review_preflights_every_exe_before_any_write() -> Result<(), StorageError> {
+        // Two good candidates and one missing manual add: the whole review
+        // aborts with nothing written — never a partial registration.
+        let mock = MockStorage::new(healthy_tree());
+        mock.mark_exe_missing(Path::new("/prefix/drive_c/gone.exe"));
+        let service = InstallService::new(mock, StubResolver::ok());
+        let keep = vec![
+            Candidate {
+                exe: PathBuf::from("/prefix/drive_c/a.exe"),
+                label: "A".to_owned(),
+            },
+            Candidate {
+                exe: PathBuf::from("/prefix/drive_c/b.exe"),
+                label: "B".to_owned(),
+            },
+        ];
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: keep.clone(),
+            log_path: None,
+            artifact: None,
+        };
+        let err = service
+            .register_reviewed(
+                &outcome,
+                &keep,
+                &[PathBuf::from("/prefix/drive_c/gone.exe")],
+                AppKind::Game,
+            )
+            .expect_err("the missing add aborts the review");
+        assert!(
+            matches!(&err, StorageError::NotFound(_)),
+            "the missing exe is named: {err}"
+        );
+        assert!(
+            service.storage.list_apps()?.is_empty(),
+            "nothing was written by the aborted review"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review_rejects_unslugifiable_labels_without_writing() -> Result<(), StorageError> {
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock, StubResolver::ok());
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: Vec::new(),
+            log_path: None,
+            artifact: None,
+        };
+        assert!(matches!(
+            service.register_reviewed(
+                &outcome,
+                &[],
+                &[PathBuf::from("/prefix/drive_c/!!!.exe")],
+                AppKind::Game,
+            ),
+            Err(StorageError::Invalid(_))
+        ));
+        assert!(service.storage.list_apps()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn installer_branch_records_the_session_artifact() -> anyhow::Result<()> {
+        // The session's artifact becomes the source_installer metadata of
+        // entries registered from its review. The configured stub runner
+        // plays wine; no real wine needed.
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-artifact-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs)?;
+        let wine = dir.join("stub-wine");
+        write_stub_script(&wine, "exit 0\n")?;
+        let mock = MockStorage::new(healthy_tree())
+            .with_log_dir(logs)
+            .with_prefix_base(dir.join("prefixes"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Wine)),
+                ..PrefixDefaults::default()
+            },
+        });
+        let service = InstallService::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let outcome = service.install(
+            Path::new("/tmp/setup.exe"),
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Installer,
+        )?;
+        assert_eq!(
+            outcome.artifact.as_deref(),
+            Some(Path::new("/tmp/setup.exe")),
+            "the canonical artifact is part of the session record"
+        );
         Ok(())
     }
 

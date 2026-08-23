@@ -31,7 +31,7 @@ The uniform first-run flow for any artifact — standalone exe, installer, or ar
 _Avoid_: first-run wizard, setup, install
 
 **Discovery**:
-The executable-finding step of an InstallSession: the prefix's Start Menu and Desktop shortcuts (`.lnk` files) are read and every target exe listed as a candidate; the user reviews the list — keeping, hiding, or manually adding — and kept candidates become AppEntries. Discovery never guesses a "main" exe and never auto-registers silently. (Lands in two slices: the flat scan of the menu/desktop areas in #30, `.lnk` target reading with #31.)
+The executable-finding step of an InstallSession: the prefix's Start Menu and Desktop shortcuts (`.lnk` files) are read and every target exe listed as a candidate; the user reviews the list — keeping, hiding, or manually adding — and kept candidates become AppEntries. Discovery never guesses a "main" exe and never auto-registers silently. (Landed in two slices: the flat scan of the menu/desktop areas in #30, `.lnk` target reading in #31.)
 _Avoid_: scan, rescan, finder
 
 **Uninstall**:
