@@ -38,6 +38,10 @@ _Avoid_: scan, rescan, finder
 Removing an AppEntry: Cellar runs the app's Windows uninstaller when one is registered in the prefix, then deletes the entry and its overrides; without a registered uninstaller it degrades to entry removal only. Cellar deletes no files itself — the uninstaller cleans the app's files, or they stay. Uninstalling the last AppEntry in a prefix offers to delete the prefix too, which removes everything inside it.
 _Avoid_: unregister, remove, delete
 
+**Managed runner**:
+A runner Cellar provisions itself — GE-Proton / umu-Proton and umu — from a declarative manifest (source URL pattern, checksum scheme, archive layout, install kind): download (resumable), verify (SHA-512 where upstream publishes a checksum), extract, probe, and record in the authoritative `runtime/providers.toml` inventory, so the runtime directory is rebuildable at any time. Discover-only runners (system wine via PATH, Steam Proton in Steam's compatibility layout) are the read-only mirror: Cellar resolves them through the same registry but never provisions them. Resolution runs the locked order configured path → managed install → PATH / Steam (research #18). (Landed with #34.)
+_Avoid_: bundled runner, downloaded runner
+
 **Uninstaller**:
 The Windows-side removal program for an app, recorded in the prefix's registry (Add/Remove Programs). Cellar invokes it through the runner's `uninstaller --list/--remove`; a missing Uninstaller entry is what degrades Uninstall to entry removal.
 _Avoid_: uninstall program, remover

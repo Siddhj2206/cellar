@@ -27,7 +27,10 @@ pub mod types;
 pub use entities::{AppEntry, AppKind, Candidate, Overrides, Prefix, PrefixDefaults, Settings};
 pub use errors::{DesktopError, ResolveError, StorageError};
 pub use health::TreeHealth;
-pub use manifest::{ArchiveLayout, ChecksumScheme, InstallKind, ReleaseSource, RunnerManifest};
+pub use manifest::{
+    ArchiveLayout, ChecksumScheme, InstallKind, ManagedInventory, ManagedRecord, ReleaseSource,
+    RunnerManifest,
+};
 pub use slug::{MAX_LEN, dedupe_slug, is_valid_slug, slugify};
 pub use types::{
     ConfiguredRunner, LaunchPlan, Layer, ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall,

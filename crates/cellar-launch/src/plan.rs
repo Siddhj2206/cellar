@@ -10,7 +10,9 @@
 
 use cellar_core::entities::{AppEntry, Prefix, Settings};
 use cellar_core::ports::WrapperContributor;
-use cellar_core::types::{LaunchPlan, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerSpec};
+use cellar_core::types::{
+    LaunchPlan, Layer, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerSpec,
+};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -62,7 +64,8 @@ pub fn build_plan(
     wrappers: &[&dyn WrapperContributor],
     args: &[String],
 ) -> Result<LaunchPlan, LaunchError> {
-    let (command, base_env) = match &resolved.reference.family {
+    let family = resolved.reference.family;
+    let (command, base_env) = match family {
         RunnerFamily::Wine => {
             let RunnerInstall::Discovered { path, .. } = &resolved.reference.install else {
                 // Structural impossibility today (wine is discover-only by
@@ -81,10 +84,50 @@ pub fn build_plan(
             );
             (command, base_env)
         }
-        family => {
-            return Err(LaunchError::PlanUnavailable { family: *family });
+        RunnerFamily::Proton => {
+            // The umu delegation (research #18): Cellar spawns `umu-run`
+            // with the exe and its args; umu-run runs the SLR container
+            // internally and appends its own `_v2-entry-point → proton
+            // waitforexitandrun` chain — so the base argv is the exe
+            // invocation, and the Container wrapper prepends umu-run (the
+            // plan never fabricates umu's internal expansion). The base
+            // env rung is empty: the umu contract (WINEPREFIX, PROTONPATH,
+            // GAMEID, PROTON_VERB) is wrapper data, contributed below by
+            // the umu provider (ADR 0003).
+            let mut command = vec![entry.exe.to_string_lossy().into_owned()];
+            command.extend(args.iter().cloned());
+            (command, BTreeMap::new())
+        }
+        RunnerFamily::Umu => {
+            // The umu family is a wrapper layer, never an app's own
+            // runner selection.
+            return Err(LaunchError::PlanUnavailable {
+                family: RunnerFamily::Umu,
+            });
         }
     };
+    // A Proton plan without the Container layer would exec the exe
+    // bare — the umbrella rule "GE-Proton outside the SLR is
+    // unsupported" (research #18) enforced at plan construction.
+    if family == RunnerFamily::Proton
+        && !wrappers
+            .iter()
+            .any(|wrapper| wrapper.layer() == Layer::Container)
+    {
+        return Err(LaunchError::PlanUnavailable {
+            family: RunnerFamily::Proton,
+        });
+    }
+    // The mirror: a Container layer outside a Proton plan would point
+    // `PROTONPATH` (the umu contract) at a non-Proton runner — the
+    // wrapper's own premise, refused here rather than half-wired.
+    if family != RunnerFamily::Proton
+        && wrappers
+            .iter()
+            .any(|wrapper| wrapper.layer() == Layer::Container)
+    {
+        return Err(LaunchError::PlanUnavailable { family });
+    }
     // The plan starts at the base + prefix rungs; wrappers and overrides
     // land on it below, in precedence order.
     let mut plan = LaunchPlan {
@@ -102,17 +145,21 @@ pub fn build_plan(
     Ok(plan)
 }
 
-/// Apply wrapper contributions in `Layer` order (outermost first: Display →
-/// Container → `RuntimeEnv`; blueprint §5), recording which layers the plan
-/// goes through. A generic chain builder: no wrapper is hard-coded here —
-/// env contracts are wrapper-provider data. The effective chain this slice
-/// is empty (wine plans); the activation rules (which wrappers a plan gets)
-/// land with the managed pipeline (#34).
+/// Apply wrapper contributions by `Layer` (outermost first: Display →
+/// Container → `RuntimeEnv`; blueprint §5) and record which layers the
+/// plan goes through. A generic chain builder: no wrapper is hard-coded
+/// here — env contracts are wrapper-provider data (ADR 0003).
+///
+/// Contribution runs **innermost first** so that prepend-style wrappers
+/// nest correctly — each contributes on top of the inner chain, leaving
+/// the outermost wrapper at `argv[0]`. The recorded `plan.wrappers` list
+/// stays the layer-sorted (outermost-first) declaration, matching the
+/// field's locked semantics.
 pub fn apply_wrappers(plan: &mut LaunchPlan, wrappers: &[&dyn WrapperContributor]) {
     let mut sorted: Vec<&dyn WrapperContributor> = wrappers.to_vec();
     sorted.sort_by_key(|wrapper| wrapper.layer());
     plan.wrappers = sorted.iter().map(|wrapper| wrapper.layer()).collect();
-    for wrapper in sorted {
+    for wrapper in sorted.into_iter().rev() {
         wrapper.contribute(plan);
     }
 }
@@ -328,8 +375,8 @@ mod tests {
         let order = log.lock().unwrap_or_else(PoisonError::into_inner);
         assert_eq!(
             &*order,
-            &[Layer::Display, Layer::RuntimeEnv],
-            "outermost layer contributes first"
+            &[Layer::RuntimeEnv, Layer::Display],
+            "contribution runs innermost-first so prepends nest (Display ends up outermost)"
         );
         assert_eq!(plan.wrappers, [Layer::Display, Layer::RuntimeEnv]);
         assert_eq!(
@@ -392,6 +439,136 @@ mod tests {
             plan.env.get("GAMEID").map(String::as_str),
             Some("umu-default")
         );
+    }
+
+    #[test]
+    fn build_plan_managed_proton_delegates_to_the_container_layer() {
+        // AC (#34): the dry-run plan for a managed Proton app shows the
+        // canonical stack — `umu-run → (SLR, internal) → proton
+        // waitforexitandrun → exe` — as the delegation (research #18:
+        // Cellar spawns umu-run; the entry-point expansion is umu's own)
+        // with the container layer prepending and contributing the
+        // contract. The real contract is the umu provider's test; here
+        // the machinery is pinned with a container-shaped double.
+        let app = entry(AppKind::Game);
+        let resolved = ResolvedRunner {
+            mode: ProviderMode::Managed,
+            reference: RunnerRef {
+                provider_id: "proton".to_owned(),
+                family: RunnerFamily::Proton,
+                install: RunnerInstall::Managed {
+                    version: "GE-Proton11-5".to_owned(),
+                    path: PathBuf::from("/runtime/proton/GE-Proton11-5"),
+                },
+            },
+        };
+        let mut env = BTreeMap::new();
+        env.insert(
+            "PROTONPATH".to_owned(),
+            "/runtime/proton/GE-Proton11-5".to_owned(),
+        );
+        env.insert("WINEPREFIX".to_owned(), "/root/prefixes/default".to_owned());
+        let container = PrependWrapper {
+            layer: Layer::Container,
+            argv0: "/runtime/umu/1.4.4/umu-run".to_owned(),
+            env,
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let wrappers: [&dyn WrapperContributor; 1] = [&container];
+        let plan = build_plan(
+            &app,
+            &prefix(None),
+            &resolved,
+            Path::new("/root/prefixes/default"),
+            &wrappers,
+            &["-x".to_owned()],
+        )
+        .unwrap_or_else(|e| panic!("plan: {e}"));
+        assert_eq!(
+            plan.argv,
+            [
+                "/runtime/umu/1.4.4/umu-run".to_owned(),
+                "/games/balatro.exe".to_owned(),
+                "-x".to_owned(),
+            ],
+            "umu-run is the outermost of the spawn — the delegation"
+        );
+        assert_eq!(
+            plan.env.get("PROTONPATH").map(String::as_str),
+            Some("/runtime/proton/GE-Proton11-5"),
+            "the container layer carries the umu contract"
+        );
+        assert_eq!(plan.wrappers, [Layer::Container]);
+    }
+
+    #[test]
+    fn build_plan_proton_without_a_container_layer_is_plan_unavailable() {
+        // The umbrella rule: a Proton plan outside the umu container is
+        // unsupported (research #18) — enforced at plan construction, not
+        // discovered at spawn. (The pre-chain test above covers the empty
+        // chain; this pins that a *non-Container* wrapper set is also
+        // refused for Proton.)
+        let app = entry(AppKind::Game);
+        let resolved = ResolvedRunner {
+            mode: ProviderMode::Managed,
+            reference: RunnerRef {
+                provider_id: "proton".to_owned(),
+                family: RunnerFamily::Proton,
+                install: RunnerInstall::Managed {
+                    version: "GE-Proton11-5".to_owned(),
+                    path: PathBuf::from("/runtime/proton/GE-Proton11-5"),
+                },
+            },
+        };
+        let display = PrependWrapper {
+            layer: Layer::Display,
+            argv0: "gamescope".to_owned(),
+            env: BTreeMap::new(),
+            log: Arc::new(Mutex::new(Vec::new())),
+        };
+        let wrappers: [&dyn WrapperContributor; 1] = [&display];
+        assert_eq!(
+            build_plan(
+                &app,
+                &prefix(None),
+                &resolved,
+                Path::new("/root/prefixes/default"),
+                &wrappers,
+                &[],
+            ),
+            Err(LaunchError::PlanUnavailable {
+                family: RunnerFamily::Proton
+            })
+        );
+    }
+
+    /// A wrapper double that prepends `argv0` and merges canned env — the
+    /// prepend shape the real container/display wrappers use.
+    #[derive(Debug)]
+    struct PrependWrapper {
+        layer: Layer,
+        argv0: String,
+        env: BTreeMap<String, String>,
+        log: Arc<Mutex<Vec<Layer>>>,
+    }
+
+    impl __sealed::Sealed for PrependWrapper {}
+
+    impl cellar_core::ports::WrapperContributor for PrependWrapper {
+        fn layer(&self) -> Layer {
+            self.layer
+        }
+
+        fn contribute(&self, plan: &mut LaunchPlan) {
+            self.log
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.layer);
+            plan.argv.insert(0, self.argv0.clone());
+            for (key, value) in &self.env {
+                plan.env.insert(key.clone(), value.clone());
+            }
+        }
     }
 
     #[test]

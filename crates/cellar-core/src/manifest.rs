@@ -53,3 +53,29 @@ pub enum InstallKind {
     /// A launcher binary placed on the executable path (`umu-run`).
     LauncherBinary,
 }
+
+/// One authoritative inventory record: a managed install the pipeline
+/// recorded in `runtime/providers.toml` (blueprint §6 — authoritative,
+/// re-installable). Enough to rebuild the install: the provider manifest
+/// (looked up by `provider_id`) plus the version pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedRecord {
+    /// Stable provider identifier, matching [`RunnerManifest::provider_id`].
+    pub provider_id: String,
+    /// The installed version (the release tag, e.g. `GE-Proton11-5`).
+    pub version: String,
+    /// The install directory, relative to the runtime root
+    /// (`<provider_id>/<version>`) — the tree is one movable unit (ADR
+    /// 0001), so records never carry absolute paths.
+    pub install: String,
+}
+
+/// The inventory file's entity (blueprint §6): one `[[runner]]` table per
+/// record — the wrapper keeps the file a single TOML table (the envelope
+/// already carries `schema_version`; a bare top-level array is not a TOML
+/// shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ManagedInventory {
+    #[serde(default)]
+    pub runner: Vec<ManagedRecord>,
+}

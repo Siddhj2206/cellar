@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cellar_core::entities::{AppEntry, Candidate, Prefix, PrefixDefaults, Settings};
 use cellar_core::errors::StorageError;
 use cellar_core::health::TreeHealth;
-use cellar_core::manifest::RunnerManifest;
+use cellar_core::manifest::{ManagedRecord, RunnerManifest};
 use cellar_core::ports::Storage;
 use cellar_core::slug;
 
@@ -240,7 +240,7 @@ impl TreeStore {
     /// fields must not break older binaries), then schema check. A malformed
     /// or version-mismatched file is `Invalid` — hand-edit damage degrades to
     /// a skipped, doctor-flagged entry, never a rewrite (ADR 0001).
-    fn read_envelope<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
+    pub(crate) fn read_envelope<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
         let text = fs::read_to_string(path).map_err(|e| io_err(path, &e))?;
         let meta: FileMeta =
             toml::from_str(&text).map_err(|_| StorageError::Invalid(path.display().to_string()))?;
@@ -257,7 +257,10 @@ impl TreeStore {
     /// Write an entity atomically: `schema_version` header + TOML body via a
     /// unique temp file in the same directory, then `rename` over the target.
     /// A reader or concurrent writer never observes a partial file.
-    fn write_envelope<T: Serialize>(path: &Path, data: &T) -> Result<(), StorageError> {
+    pub(crate) fn write_envelope<T: Serialize + ?Sized>(
+        path: &Path,
+        data: &T,
+    ) -> Result<(), StorageError> {
         let dir = path.parent().ok_or_else(|| {
             StorageError::Io(format!("{} has no parent directory", path.display()))
         })?;
@@ -657,10 +660,16 @@ impl Storage for TreeStore {
         Ok(candidates)
     }
 
-    fn install_managed(&self, _manifest: &RunnerManifest) -> Result<PathBuf, StorageError> {
-        Err(StorageError::Unimplemented(
-            "the shared installer pipeline lands with the managed-runtime slice (#34)".to_owned(),
-        ))
+    fn install_managed(
+        &self,
+        manifest: &RunnerManifest,
+        version: &str,
+    ) -> Result<PathBuf, StorageError> {
+        crate::installer::install(&self.root, manifest, version)
+    }
+
+    fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError> {
+        crate::installer::inventory(&self.root)
     }
 }
 
@@ -1531,11 +1540,12 @@ mod tests {
     }
 
     #[test]
-    fn installer_pipeline_stub_is_loud() {
-        // The managed-runner pipeline is the last storage stub — it stays
-        // loud until the managed-runtime slice (#34). Discovery is real
-        // since #30.
-        let (store, _) = store("stubs");
+    fn installer_pipeline_installs_via_the_shared_module() {
+        // The managed-runner pipeline landed with #34: `install_managed`
+        // now delegates to the shared installer (its own tests exercise
+        // fetch/verify/extract/flock/inventory; here the delegation and
+        // the inventory port round-trip).
+        let (store, _) = store("pipeline");
         let manifest = RunnerManifest {
             provider_id: "proton".to_owned(),
             source: cellar_core::manifest::ReleaseSource {
@@ -1546,9 +1556,11 @@ mod tests {
             archive: cellar_core::manifest::ArchiveLayout::ExtractsToSingleRootDir,
             install_kind: cellar_core::manifest::InstallKind::CompatTool,
         };
-        assert!(matches!(
-            store.install_managed(&manifest),
-            Err(StorageError::Unimplemented(_))
-        ));
+        // A missing artifact is a pipeline failure, not a stub.
+        let err = store
+            .install_managed(&manifest, "9.0-4")
+            .expect_err("a missing artifact fails the pipeline");
+        assert!(matches!(err, StorageError::Artifact(_)) || matches!(err, StorageError::Io(_)));
+        assert!(store.managed_inventory().unwrap().is_empty());
     }
 }

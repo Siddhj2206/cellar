@@ -11,8 +11,10 @@
 /// presentation alone instantiates concrete providers (composition root).
 pub fn entrypoint() {
     // Composition root, like the CLI: presentation alone instantiates
-    // concrete providers.
-    let _resolvers = cellar_providers::all_resolvers();
+    // concrete providers. The registry's wrapper chain is per-launch
+    // state since #34 (`wrappers_for`); the scaffold pins the resolver
+    // and manifest edges.
+    let runtime = std::path::PathBuf::from("/var/lib/cellar/runtime");
+    let _resolvers = cellar_providers::all_resolvers(&runtime);
     let _managed = cellar_providers::all_managed();
-    let _wrappers = cellar_providers::all_wrappers();
 }

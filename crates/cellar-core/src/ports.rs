@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::entities::{AppEntry, Candidate, Prefix, Settings};
 use crate::errors::{DesktopError, ResolveError, StorageError};
 use crate::health::TreeHealth;
-use crate::manifest::RunnerManifest;
+use crate::manifest::{ManagedRecord, RunnerManifest};
 use crate::types::{LaunchPlan, Layer, ResolvedRunner, RunnerSpec};
 
 /// Marker that seals the port traits against implementations outside the
@@ -115,10 +115,22 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// with #31. Deterministic order, deduplicated by exe path.
     fn discover_executables(&self, prefix: &Prefix) -> Result<Vec<Candidate>, StorageError>;
 
-    /// The shared installer pipeline — fetch, verify, extract, flock,
-    /// resumable cache, inventory write — driven by a managed runner's
-    /// manifest. Returns the install directory.
-    fn install_managed(&self, manifest: &RunnerManifest) -> Result<PathBuf, StorageError>;
+    /// The shared installer pipeline — fetch (resumable), verify (SHA-512
+    /// for GE-Proton), extract, flock per directory, inventory write —
+    /// driven by a managed runner's manifest and a concrete version pin.
+    /// The install directory (`runtime/<provider_id>/<version>`) is the
+    /// return; an already-installed version is a no-op. Corrupt artifacts
+    /// fail closed — nothing is extracted, nothing is recorded.
+    fn install_managed(
+        &self,
+        manifest: &RunnerManifest,
+        version: &str,
+    ) -> Result<PathBuf, StorageError>;
+
+    /// The authoritative managed-runner inventory (`runtime/providers.toml`
+    /// — blueprint §6: the runtime directory is rebuildable from it): every
+    /// record the pipeline recorded, deterministic order.
+    fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError>;
 }
 
 /// Desktop integration: `.desktop` entries, Rust-native icon extraction and

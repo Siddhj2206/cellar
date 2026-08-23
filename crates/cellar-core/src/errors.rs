@@ -67,6 +67,10 @@ pub enum StorageError {
     NotFound(String),
     /// The node already exists (slug clash without dedupe).
     Exists(String),
+    /// A shared-pipeline artifact failure — the managed-installer pipeline
+    /// (fetch, checksum, extraction, layout, probe): the artifact could not
+    /// be acquired as declared. The message names the failing step.
+    Artifact(String),
     /// A port method whose slice has not landed yet (e.g. discovery #27, the
     /// shared installer #34). Stubs return this with a loud message — never
     /// a silent success or a misleading taxonomy hit.
@@ -80,6 +84,7 @@ impl fmt::Display for StorageError {
             Self::Invalid(path) => write!(f, "invalid file at {path}"),
             Self::NotFound(path) => write!(f, "not found: {path}"),
             Self::Exists(path) => write!(f, "already exists: {path}"),
+            Self::Artifact(what) => write!(f, "artifact failure: {what}"),
             Self::Unimplemented(what) => write!(f, "not implemented yet: {what}"),
         }
     }

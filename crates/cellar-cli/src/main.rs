@@ -43,15 +43,15 @@ use std::str::FromStr;
 
 use cellar_app::{
     ArtifactKind, DesktopSync, DoctorService, InstallOutcome, InstallResult, InstallService,
-    LaunchApp, LaunchMode, ListedEntry, PrefixService,
+    LaunchApp, LaunchMode, ListedEntry, PrefixService, RunnerService,
 };
 use cellar_core::ports::{__sealed, RunnerResolver, Storage};
 use cellar_core::{
-    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerRef,
-    RunnerSpec, TreeHealth,
+    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ProviderMode, ResolveError, ResolvedRunner,
+    RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec, TreeHealth,
 };
 use cellar_desktop::DesktopService;
-use cellar_providers::all_resolvers;
+use cellar_providers::{all_managed, all_resolvers, steam_protons, wrappers_for};
 use cellar_storage::TreeStore;
 
 /// The Cellar Windows app/game runtime for Linux.
@@ -83,6 +83,10 @@ enum Command {
     /// the tree (blueprint §6: everything derived is re-derivable) —
     /// an extension under the noun-group rule recorded in ADR 0004.
     Desktop(DesktopArgs),
+    /// Manage Cellar's runners (blueprint §8: lifecycle objects get noun
+    /// groups): managed installs (fetch → verify → extract → record) and
+    /// the merged managed + discover-only list.
+    Runner(RunnerArgs),
     /// Sectioned capability checks with fix hints; exits 1 on any problem.
     Doctor(DoctorArgs),
 }
@@ -214,6 +218,39 @@ enum DesktopCommand {
     Sync,
 }
 
+#[derive(Debug, Args)]
+struct RunnerArgs {
+    #[command(subcommand)]
+    command: RunnerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunnerCommand {
+    /// Install one managed runner version: download (resumable from the
+    /// disposable cache), verify against the provider's published
+    /// SHA-512 when there is one (a corrupt download fails closed),
+    /// extract, probe, and record in the authoritative inventory
+    /// (`runtime/providers.toml`) — the runtime dir is rebuildable from
+    /// it. Idempotent: an installed version is a no-op.
+    Install {
+        /// The provider's identifier (`proton`, `umu`).
+        provider: String,
+        /// The version to install — the release tag, e.g.
+        /// `GE-Proton11-5` (no guessed "latest": the artifact is named
+        /// deterministically by its tag).
+        version: String,
+    },
+    /// List every runner: managed installs (the inventory) and
+    /// discover-only host state (wine and umu-run on PATH, Steam Proton
+    /// in Steam's compatibility layout). Discover-only entries are
+    /// read-only — Cellar never modifies them.
+    List {
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -246,6 +283,122 @@ fn run_desktop_sync(store: &TreeStore, desktop: &DesktopService) -> anyhow::Resu
     Ok(ExitCode::SUCCESS)
 }
 
+/// The registry's resolver composite over one store — the composition
+/// root wiring: providers scan the store's own `runtime/` dir (managed
+/// installs), never a guessed data root.
+fn resolvers_for(store: &TreeStore) -> ResolverSet {
+    ResolverSet::new(all_resolvers(&store.data_root().join("runtime")))
+}
+
+/// The `cellar runner install` handler (blueprint §5, §8): the provider's
+/// manifest — one descriptor, zero pipeline code at the surface — drives
+/// the storage-owned pipeline: fetch (resumable), verify (SHA-512 when
+/// the manifest names a checksum source), extract, probe, record — and
+/// the runtime dir is rebuildable from the recorded inventory (AC).
+fn run_runner_install(
+    store: &TreeStore,
+    provider: &str,
+    version: &str,
+) -> anyhow::Result<ExitCode> {
+    let known: Vec<String> = all_managed()
+        .iter()
+        .map(|runner| runner.manifest().provider_id.clone())
+        .collect();
+    let manifest = all_managed()
+        .into_iter()
+        .find(|runner| runner.manifest().provider_id == provider)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown runner provider {provider:?} — managed providers: {}",
+                known.join(", ")
+            )
+        })?;
+    let service = RunnerService::new(store.clone());
+    let dir = service.install(manifest.manifest(), version)?;
+    println!("Installed {provider} {version} at {}", dir.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// One `runner list` row (blueprint §8): managed or discover-only, with
+/// the resolved version and path. The presentation's row shape — the
+/// `--json` contract is audited in the surface sweep (#36).
+#[derive(serde::Serialize)]
+struct RunnerRow {
+    mode: &'static str,
+    provider: String,
+    version: Option<String>,
+    path: PathBuf,
+}
+
+/// The `cellar runner list` handler: managed rows from the authoritative
+/// inventory plus discover-only host state — wine and umu-run on PATH,
+/// Steam Proton in Steam's compatibility layout — each resolved through
+/// the same registry the launch pipeline uses. Discover-only entries are
+/// read-only: Cellar never modifies them.
+fn run_runner_list(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
+    let service = RunnerService::new(store.clone());
+    let inventory = service.installed()?;
+    let resolvers = resolvers_for(store);
+    let mut managed = Vec::new();
+    for record in inventory {
+        managed.push(RunnerRow {
+            mode: "managed",
+            provider: record.provider_id,
+            version: Some(record.version),
+            path: store.data_root().join("runtime").join(&record.install),
+        });
+    }
+    let mut discovered = Vec::new();
+    for family in [RunnerFamily::Wine, RunnerFamily::Umu] {
+        if let Ok(resolved) = resolvers.resolve(&RunnerSpec::new(family)) {
+            // A managed-capable family may resolve to its managed
+            // install; the list shows only its read-only state (the
+            // managed row already carries the install).
+            if let RunnerInstall::Discovered { path, version } = &resolved.reference.install {
+                discovered.push(RunnerRow {
+                    mode: "discover-only",
+                    provider: resolved.reference.provider_id,
+                    version: version.clone(),
+                    path: path.clone(),
+                });
+            }
+        }
+    }
+    for proton in steam_protons() {
+        discovered.push(RunnerRow {
+            mode: "discover-only",
+            provider: "proton".to_owned(),
+            version: Some(proton.version),
+            path: proton.dir,
+        });
+    }
+    if json {
+        let mut all = managed;
+        all.extend(discovered);
+        print!("{}", serde_json::to_string_pretty(&all)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("Managed:");
+    for row in &managed {
+        println!(
+            "  {:<8} {:<20} {}",
+            row.provider,
+            row.version.as_deref().unwrap_or("-"),
+            row.path.display()
+        );
+    }
+    println!("Discover-only (read-only — Cellar never modifies these):");
+    for row in &discovered {
+        println!(
+            "  {:<8} {:<20} {}",
+            row.provider,
+            row.version.as_deref().unwrap_or("-"),
+            row.path.display()
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let store = TreeStore::from_env()?;
@@ -260,14 +413,13 @@ fn run() -> anyhow::Result<ExitCode> {
     match cli.command {
         Command::Install(args) => run_install(&store, &desktop, &args),
         Command::List(args) => {
-            let service =
-                InstallService::new(store.clone(), ResolverSet::new(all_resolvers()), desktop);
+            let service = InstallService::new(store.clone(), resolvers_for(&store), desktop);
             let entries = service.list()?;
             print!("{}", render_app_list(&entries, args.json)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Launch(args) => {
-            let service = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
+            let service = LaunchApp::with_chain(store.clone(), resolvers_for(&store), wrappers_for);
             if args.dry_run {
                 // Pre-plan phases only: resolve → check → plan, pure and
                 // printable — nothing spawns (blueprint §7).
@@ -297,7 +449,7 @@ fn run() -> anyhow::Result<ExitCode> {
             Ok(exit_code_for(status))
         }
         Command::Uninstall(args) => {
-            let service = InstallService::new(store, ResolverSet::new(all_resolvers()), desktop);
+            let service = InstallService::new(store.clone(), resolvers_for(&store), desktop);
             service.uninstall(&args.slug)?;
             // Glossary: Uninstall — entry removal for now; Cellar never
             // deletes the app's own files.
@@ -309,6 +461,12 @@ fn run() -> anyhow::Result<ExitCode> {
         }
         Command::Desktop(args) => match args.command {
             DesktopCommand::Sync => run_desktop_sync(&store, &desktop),
+        },
+        Command::Runner(args) => match args.command {
+            RunnerCommand::Install { provider, version } => {
+                run_runner_install(&store, &provider, &version)
+            }
+            RunnerCommand::List { json } => run_runner_list(&store, json),
         },
         Command::Prefix(args) => match args.command {
             PrefixCommand::Create { name } => {
@@ -396,10 +554,11 @@ fn run_install(
     // ask (a given `--prefix`/`--artifact`/`--keep`/`--keep-all`/`--add`
     // skips its prompt).
     let interactive = std::io::stdin().is_terminal() && !args.no_input;
-    let service = InstallService::new(
+    let service = InstallService::with_chain(
         store.clone(),
-        ResolverSet::new(all_resolvers()),
+        resolvers_for(store),
         desktop.clone(),
+        wrappers_for,
     );
     let prefix = resolve_prefix_slug(args.prefix.as_deref(), interactive, store)?;
     let artifact = match args.artifact {
@@ -1620,7 +1779,7 @@ mod tests {
         let store = TreeStore::new(root.clone());
         let service = InstallService::new(
             store.clone(),
-            ResolverSet::new(all_resolvers()),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
             test_desktop(&store),
         );
         let exe = root.join("drive_c/My Game.exe");
@@ -1847,7 +2006,7 @@ mod tests {
         let registered = only_registration(
             InstallService::new(
                 store.clone(),
-                ResolverSet::new(all_resolvers()),
+                ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
                 test_desktop(&store),
             )
             .install(
@@ -1864,7 +2023,10 @@ mod tests {
             ConfiguredRunner::Path(wine.clone()),
         ));
         store.save_prefix(&prefix)?;
-        let service = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let service = LaunchApp::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+        );
         // Foreground: spawn the frozen plan, await it, propagate the raw
         // exit code — 7, not a Cellar error.
         let process = service.spawn(
@@ -1904,17 +2066,52 @@ mod tests {
         );
         assert!(text.contains("out-line"), "stdout missing:\n{text}");
         assert!(text.contains("err-line"), "stderr missing:\n{text}");
-        // Detached: the handle returns with the process still running, and
-        // its output still lands in its own per-launch log.
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn launch_detached_releases_the_process_and_keeps_its_log() -> anyhow::Result<()> {
+        use cellar_core::ConfiguredRunner;
+
+        // Detached: the handle returns with the process still running,
+        // and its output still lands in its own per-launch log.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-detach-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
         let sleeper = root.join("stub-sleeper");
         write_stub_script(&sleeper, "echo sleeping\nexit 0\n")?;
+        let exe = root.join("drive_c/tool.exe");
+        std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(&exe, "MZ")?;
+        let registered = only_registration(
+            InstallService::new(
+                store.clone(),
+                ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+                test_desktop(&store),
+            )
+            .install(
+                &exe,
+                "default",
+                Some("My Tool"),
+                AppKind::Tool,
+                ArtifactKind::Standalone,
+            )?,
+        );
         let mut prefix = store.load_prefix("default")?;
         prefix.defaults.runner = Some(RunnerSpec::with_configured(
             RunnerFamily::Wine,
             ConfiguredRunner::Path(sleeper.clone()),
         ));
         store.save_prefix(&prefix)?;
-        let service = LaunchApp::new(store, ResolverSet::new(all_resolvers()));
+        let service = LaunchApp::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+        );
         let process = service.spawn(&registered.entry.slug, &[], LaunchMode::Detached)?;
         let log_path = process.log_path().to_path_buf();
         // The Linux liveness probe: the pid exists while the launch runs —
@@ -1959,7 +2156,7 @@ mod tests {
         let registered = only_registration(
             InstallService::new(
                 store.clone(),
-                ResolverSet::new(all_resolvers()),
+                ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
                 test_desktop(&store),
             )
             .install(
@@ -1977,7 +2174,10 @@ mod tests {
         ));
         store.save_prefix(&prefix)?;
         // Plan it: resolve → check → plan, pure and printable.
-        let app = LaunchApp::new(store.clone(), ResolverSet::new(all_resolvers()));
+        let app = LaunchApp::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+        );
         let plan = app.plan(&registered.entry.slug, &["--fullscreen".to_owned()])?;
         let canonical_exe = std::fs::canonicalize(&exe)?;
         assert_eq!(
@@ -2021,7 +2221,7 @@ mod tests {
         let game = only_registration(
             InstallService::new(
                 store.clone(),
-                ResolverSet::new(all_resolvers()),
+                ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
                 test_desktop(&store),
             )
             .install(
@@ -2032,7 +2232,10 @@ mod tests {
                 ArtifactKind::Standalone,
             )?,
         );
-        let app = LaunchApp::new(second_store, ResolverSet::new(all_resolvers()));
+        let app = LaunchApp::new(
+            second_store.clone(),
+            ResolverSet::new(all_resolvers(&second_store.data_root().join("runtime"))),
+        );
         let err = app.plan(&game.entry.slug, &[]).expect_err("no proton yet");
         assert!(
             err.to_string().contains("proton"),
@@ -2094,7 +2297,7 @@ mod tests {
         store.save_prefix(&prefix)?;
         let service = InstallService::new(
             store.clone(),
-            ResolverSet::new(all_resolvers()),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
             test_desktop(&store),
         );
         let outcome = service.install(
@@ -2126,8 +2329,8 @@ mod tests {
         ));
         store.save_prefix(&prefix)?;
         let service = InstallService::new(
-            store,
-            ResolverSet::new(all_resolvers()),
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
             test_desktop(&TreeStore::new(root)),
         );
         let err = service
@@ -2169,7 +2372,7 @@ mod tests {
         );
         let service = InstallService::new(
             store.clone(),
-            ResolverSet::new(all_resolvers()),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
             test_desktop(&store),
         );
         let outcome = service.install(
@@ -2485,8 +2688,11 @@ mod tests {
             rendered.contains("launch balatro\n"),
             "the entry launches the app"
         );
-        let service =
-            InstallService::new(store.clone(), ResolverSet::new(all_resolvers()), desktop);
+        let service = InstallService::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+            desktop,
+        );
         service.uninstall("balatro")?;
         assert!(!entry.exists(), "uninstalling removes the launcher entry");
         Ok(())
@@ -2587,6 +2793,177 @@ mod tests {
             applications.join("open-with-cellar.desktop").exists(),
             "the Open-with-Cellar association is wired"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn runner_install_unknown_provider_is_an_operation_error() {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-runner-bad-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        let err = run_runner_install(&store, "cartman", "9.0")
+            .expect_err("an unknown provider is an operation error, never a guess");
+        assert!(
+            err.to_string().contains("proton") && err.to_string().contains("umu"),
+            "the error names the managed providers: {err}"
+        );
+    }
+
+    #[test]
+    fn runner_list_renders_managed_rows_and_json() -> anyhow::Result<()> {
+        // The inventory is the authoritative record (blueprint §6): a
+        // hand-written `providers.toml` renders as the managed rows of
+        // `runner list`. The discover-only half depends on host state
+        // (PATH, Steam dirs) — covered at the provider level; here the
+        // inventory + both output shapes are pinned.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-runner-list-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar/runtime"))?;
+        std::fs::write(
+            home.join("cellar/runtime/providers.toml"),
+            "schema_version = 1\n\n[[runner]]\nprovider_id = \"proton\"\n\
+             version = \"GE-Proton11-5\"\ninstall = \"proton/GE-Proton11-5\"\n\
+             [[runner]]\nprovider_id = \"umu\"\n\
+             version = \"1.4.4\"\ninstall = \"umu/1.4.4\"\n",
+        )?;
+        assert_eq!(run_runner_list(&store, false)?, ExitCode::SUCCESS);
+        assert_eq!(run_runner_list(&store, true)?, ExitCode::SUCCESS);
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_for_a_managed_proton_app_shows_the_umu_stack() -> anyhow::Result<()> {
+        // AC: the dry-run plan for a managed Proton app shows the
+        // canonical stack — `umu-run → (SLR, internal) → proton
+        // waitforexitandrun → exe` — as the delegation (research #18)
+        // with the umu env contract contributed by the wrapper, riding
+        // the real registry over the test tree.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-managed-plan-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        // Managed installs exactly as the pipeline lays them out (probe
+        // targets included — resolution scans dirs, not the inventory).
+        write_executable(&home.join("cellar/runtime/proton/GE-Proton11-5/proton"))?;
+        write_executable(&home.join("cellar/runtime/umu/1.4.4/umu-run"))?;
+        let exe = home.join("cellar/game.exe");
+        std::fs::write(&exe, "MZ")?;
+        let desktop = test_desktop(&store);
+        run_install(
+            &store,
+            &desktop,
+            &InstallArgs {
+                path: exe.clone(),
+                prefix: None,
+                name: None,
+                kind: AppKind::Game,
+                artifact: Some(ArtifactKind::Standalone),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+        )?;
+        let app = LaunchApp::with_chain(store.clone(), resolvers_for(&store), wrappers_for);
+        let plan = app.plan("game", &[])?;
+        assert_eq!(
+            plan.argv.first(),
+            Some(
+                &home
+                    .join("cellar/runtime/umu/1.4.4/umu-run")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "umu-run is the outermost of the spawn — the delegation"
+        );
+        assert_eq!(plan.argv.get(1), Some(&exe.to_string_lossy().into_owned()));
+        assert_eq!(plan.env.get("GAMEID").map(String::as_str), Some("umu-game"));
+        assert_eq!(
+            plan.env.get("WINEPREFIX").map(String::as_str),
+            store.prefix_dir("default").to_str()
+        );
+        assert_eq!(
+            plan.env.get("PROTONPATH").map(String::as_str),
+            Some(
+                home.join("cellar/runtime/proton/GE-Proton11-5")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            plan.env.get("PROTON_VERB").map(String::as_str),
+            Some("waitforexitandrun")
+        );
+        assert_eq!(plan.wrappers, [cellar_core::Layer::Container]);
+        Ok(())
+    }
+
+    #[test]
+    fn gamescope_joins_the_display_layer_when_the_prefix_configures_it() -> anyhow::Result<()> {
+        // AC: gamescope contributes at the Display layer when configured
+        // (the prefix's `graphics = "gamescope"` default) — outermost of
+        // the same managed-Proton chain.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-gamescope-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        write_executable(&home.join("cellar/runtime/proton/GE-Proton11-5/proton"))?;
+        write_executable(&home.join("cellar/runtime/umu/1.4.4/umu-run"))?;
+        let exe = home.join("cellar/game.exe");
+        std::fs::write(&exe, "MZ")?;
+        let desktop = test_desktop(&store);
+        run_install(
+            &store,
+            &desktop,
+            &InstallArgs {
+                path: exe.clone(),
+                prefix: None,
+                name: None,
+                kind: AppKind::Game,
+                artifact: Some(ArtifactKind::Standalone),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+        )?;
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.graphics = Some("gamescope".to_owned());
+        store.save_prefix(&prefix)?;
+        let app = LaunchApp::with_chain(store.clone(), resolvers_for(&store), wrappers_for);
+        let plan = app.plan("game", &[])?;
+        assert_eq!(
+            plan.wrappers,
+            [cellar_core::Layer::Display, cellar_core::Layer::Container]
+        );
+        assert_eq!(plan.argv.first().map(String::as_str), Some("gamescope"));
+        assert!(plan.argv[1].ends_with("umu-run"));
+        Ok(())
+    }
+
+    fn write_executable(path: &Path) -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, "#!/bin/sh\nexit 0\n")?;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
         Ok(())
     }
 

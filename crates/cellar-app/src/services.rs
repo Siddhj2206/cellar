@@ -23,9 +23,10 @@ use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
 use cellar_core::errors::DesktopError;
 use cellar_core::errors::StorageError;
 use cellar_core::health::TreeHealth;
-use cellar_core::ports::{DesktopIntegrator, RunnerResolver, Storage};
+use cellar_core::manifest::{ManagedRecord, RunnerManifest};
+use cellar_core::ports::{DesktopIntegrator, RunnerResolver, Storage, WrapperContributor};
 use cellar_core::slug;
-use cellar_core::types::{LaunchPlan, RunnerSpec};
+use cellar_core::types::{LaunchPlan, ResolvedRunner, RunnerFamily, RunnerSpec};
 use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
 
 use std::collections::BTreeSet;
@@ -239,6 +240,7 @@ pub struct InstallService<S: Storage, R: RunnerResolver, D: DesktopIntegrator> {
     storage: S,
     resolver: R,
     desktop: D,
+    chain: ChainBuilder,
 }
 
 impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D> {
@@ -250,6 +252,20 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             storage,
             resolver,
             desktop,
+            chain: empty_chain,
+        }
+    }
+
+    /// The service with an explicit wrapper-chain builder — the
+    /// composition root wires the registry's activation rule; the default
+    /// chain is empty (`empty_chain`), keeping call sites honest about
+    /// what they enable.
+    pub fn with_chain(storage: S, resolver: R, desktop: D, chain: ChainBuilder) -> Self {
+        Self {
+            storage,
+            resolver,
+            desktop,
+            chain,
         }
     }
 
@@ -594,7 +610,14 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             source_installer: None,
             installed_at: None,
         };
-        let plan = plan_for(&self.storage, &self.resolver, &entry, bound, &[])?;
+        let plan = plan_for(
+            &self.storage,
+            &self.resolver,
+            &entry,
+            bound,
+            &[],
+            self.chain,
+        )?;
         let log_path = launch_log_path(&self.storage, &slug);
         let process = cellar_launch::spawn(&plan, &log_path, LaunchMode::Foreground)?;
         let status = process.wait()?;
@@ -666,6 +689,41 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
     }
 }
 
+/// The managed runner lifecycle (blueprint §5, §8: `cellar runner …`): the
+/// storage-owned installer pipeline driven by a provider manifest and a
+/// version pin, plus the authoritative inventory. This slice (#34)
+/// lands it: `install` downloads (resumable), verifies (SHA-512 when the
+/// manifest names a checksum source), extracts, probes, and records — and
+/// the inventory makes the runtime dir rebuildable at any time (AC).
+pub struct RunnerService<S: Storage> {
+    storage: S,
+}
+
+impl<S: Storage> RunnerService<S> {
+    /// The service over one storage adapter.
+    pub fn new(storage: S) -> Self {
+        Self { storage }
+    }
+
+    /// Install one managed runner version: fetch → verify → extract →
+    /// record (the shared pipeline). Idempotent — an installed version
+    /// returns its directory unchanged. Returns the install directory.
+    pub fn install(
+        &self,
+        manifest: &RunnerManifest,
+        version: &str,
+    ) -> Result<PathBuf, StorageError> {
+        self.storage.install_managed(manifest, version)
+    }
+
+    /// The authoritative inventory (`runtime/providers.toml`): every
+    /// recorded managed install, deterministic order — `runner list`'s
+    /// managed half, and the rebuild seed.
+    pub fn installed(&self) -> Result<Vec<ManagedRecord>, StorageError> {
+        self.storage.managed_inventory()
+    }
+}
+
 /// The re-derivation use-case (blueprint §6: the cache is re-derivable at
 /// any time): every registered app's launcher entry and icon are re-derived
 /// from the tree, stale entry files are pruned — a renamed or gone app
@@ -710,8 +768,7 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
                     icons += 1;
                     Some(icon)
                 }
-                Ok(None) => None,
-                Err(_) => None,
+                Ok(None) | Err(_) => None,
             };
             // A fresh create under the current slug; the stale sweep
             // removes any entry left under an old slug.
@@ -727,6 +784,34 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
     }
 }
 
+/// The per-launch wrapper-chain builder (blueprint §5 activation rules):
+/// given the resolved runner, the resolved `umu-run` (the Container
+/// layer's binary, when the plan needs one), the bound prefix, its
+/// directory, and the launch's `GAMEID`, the concrete wrapper instances
+/// for this one launch. The registry implements the rule
+/// (`cellar_providers::wrappers_for`); `app` only transports the
+/// function — providers stay provider-crate types, never named below the
+/// composition root.
+pub type ChainBuilder = fn(
+    resolved: &ResolvedRunner,
+    umu_run: Option<&ResolvedRunner>,
+    prefix: &Prefix,
+    prefix_dir: &Path,
+    game_id: &str,
+) -> Vec<Box<dyn WrapperContributor>>;
+
+/// The empty chain — the default every service constructs with;
+/// presentations wire the registry's rule explicitly.
+pub fn empty_chain(
+    _resolved: &ResolvedRunner,
+    _umu_run: Option<&ResolvedRunner>,
+    _prefix: &Prefix,
+    _prefix_dir: &Path,
+    _game_id: &str,
+) -> Vec<Box<dyn WrapperContributor>> {
+    Vec::new()
+}
+
 /// The frozen plan for one entry over already-loaded state — the pipeline
 /// tail (selection → resolution → check → plan, blueprint §7) shared by
 /// registered launches (#28) and the install session's artifact runs (#30).
@@ -736,6 +821,7 @@ fn plan_for<S: Storage, R: RunnerResolver>(
     entry: &AppEntry,
     prefix: &Prefix,
     args: &[String],
+    chain: ChainBuilder,
 ) -> Result<LaunchPlan, LaunchError> {
     let settings = storage.load_settings().map_err(LaunchError::Storage)?;
     // Selection: app override → prefix default → defaults floor picks the
@@ -743,6 +829,20 @@ fn plan_for<S: Storage, R: RunnerResolver>(
     // PATH, research #18).
     let spec = select_spec(entry, prefix, &settings);
     let runner = resolver.resolve(&spec).map_err(LaunchError::Resolve)?;
+    // The umu container binary: every Proton-family plan delegates to a
+    // resolved umu-run (research #18: a Proton launch outside the umu
+    // container is unsupported). Resolved through the same registry in
+    // its own order (configured → managed → PATH); a missing umu fails
+    // the plan loudly — a `SuggestInstall` names what to install.
+    let umu_run = if spec.family == RunnerFamily::Proton {
+        Some(
+            resolver
+                .resolve(&RunnerSpec::new(RunnerFamily::Umu))
+                .map_err(LaunchError::Resolve)?,
+        )
+    } else {
+        None
+    };
     // The check stage: exactly this launch's dependencies — the exe must
     // still be a regular file.
     storage
@@ -754,10 +854,19 @@ fn plan_for<S: Storage, R: RunnerResolver>(
             },
             other => LaunchError::Storage(other),
         })?;
-    // The plan stage: the pure, printable plan. The wrapper chain is empty
-    // this slice (no wrapper activation rules yet, #34).
+    // The plan stage: the pure, printable plan — the wrapper chain is the
+    // activation-rule output for this launch (Display when the prefix's
+    // graphics selects gamescope, Container for Proton-family plans).
     let prefix_dir = storage.prefix_dir(&prefix.slug);
-    build_plan(entry, prefix, &runner, &prefix_dir, &[], args)
+    let wrappers = chain(
+        &runner,
+        umu_run.as_ref(),
+        prefix,
+        &prefix_dir,
+        &format!("umu-{}", entry.slug),
+    );
+    let wrappers: Vec<&dyn WrapperContributor> = wrappers.iter().map(AsRef::as_ref).collect();
+    build_plan(entry, prefix, &runner, &prefix_dir, &wrappers, args)
 }
 
 /// The per-launch log file: `<slug>-<timestamp>.log` under the disposable
@@ -811,13 +920,30 @@ fn exit_info(status: ExitStatus) -> (Option<i32>, Option<i32>) {
 pub struct LaunchApp<S: Storage, R: RunnerResolver> {
     storage: S,
     resolver: R,
+    chain: ChainBuilder,
 }
 
 impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
     /// The use-case over one storage adapter and one resolver — the
     /// composition root injects the concrete registry composite (#28).
+    /// The wrapper chain is the empty default; presentations wire the
+    /// registry's activation rule with [`LaunchApp::with_chain`] (#34).
     pub fn new(storage: S, resolver: R) -> Self {
-        Self { storage, resolver }
+        Self {
+            storage,
+            resolver,
+            chain: empty_chain,
+        }
+    }
+
+    /// Over an explicit wrapper-chain builder (the registry's
+    /// `wrappers_for`) — the managed-Proton/gamescope activation rules.
+    pub fn with_chain(storage: S, resolver: R, chain: ChainBuilder) -> Self {
+        Self {
+            storage,
+            resolver,
+            chain,
+        }
     }
 
     /// The frozen plan for one registered app, or the first pre-flight
@@ -851,7 +977,14 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
                 other => LaunchError::Storage(other),
             })?;
         // The shared pipeline tail: selection → resolution → check → plan.
-        plan_for(&self.storage, &self.resolver, &entry, &prefix, args)
+        plan_for(
+            &self.storage,
+            &self.resolver,
+            &entry,
+            &prefix,
+            args,
+            self.chain,
+        )
     }
 
     /// The execute phase (blueprint §7): freeze the plan exactly as
@@ -950,7 +1083,7 @@ impl<S: Storage> DoctorService<S> {
 mod tests {
     use super::{
         ArtifactKind, DesktopSync, DoctorService, InstallError, InstallOutcome, InstallResult,
-        InstallService, LaunchApp, PrefixService, Storage,
+        InstallService, LaunchApp, PrefixService, RunnerService, Storage,
     };
 
     use std::collections::BTreeSet;
@@ -960,8 +1093,8 @@ mod tests {
     use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides, Settings};
     use cellar_core::errors::{DesktopError, ResolveError, StorageError};
     use cellar_core::health::TreeHealth;
-    use cellar_core::manifest::RunnerManifest;
-    use cellar_core::ports::{__sealed, DesktopIntegrator, RunnerResolver};
+    use cellar_core::manifest::{ManagedRecord, RunnerManifest};
+    use cellar_core::ports::{__sealed, DesktopIntegrator, RunnerResolver, WrapperContributor};
     use cellar_core::types::{
         ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
     };
@@ -976,6 +1109,8 @@ mod tests {
     struct MockStorage {
         created: Mutex<Vec<String>>,
         deleted: Mutex<Vec<String>>,
+        /// `(provider, version)` pairs a `runner install` asked for.
+        install_records: Mutex<Vec<(String, String)>>,
         prefixes: Mutex<Vec<Prefix>>,
         apps: Mutex<Vec<AppEntry>>,
         /// App slugs claimed by hand-edited files — the dedupe domain.
@@ -1002,6 +1137,7 @@ mod tests {
             Self {
                 created: Mutex::new(Vec::new()),
                 deleted: Mutex::new(Vec::new()),
+                install_records: Mutex::new(Vec::new()),
                 prefixes: Mutex::new(Vec::new()),
                 apps: Mutex::new(Vec::new()),
                 taken_app_slugs: Mutex::new(Vec::new()),
@@ -1259,8 +1395,35 @@ mod tests {
                 .clone())
         }
 
-        fn install_managed(&self, _manifest: &RunnerManifest) -> Result<PathBuf, StorageError> {
-            Err(StorageError::Unimplemented("mock".to_owned()))
+        fn install_managed(
+            &self,
+            manifest: &RunnerManifest,
+            version: &str,
+        ) -> Result<PathBuf, StorageError> {
+            // The pipeline is storage-tested; the mock records the pin
+            // and reports the version's dir.
+            let dir = PathBuf::from("/mock/runtime")
+                .join(&manifest.provider_id)
+                .join(version);
+            self.install_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((manifest.provider_id.clone(), version.to_owned()));
+            Ok(dir)
+        }
+
+        fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError> {
+            Ok(self
+                .install_records
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(provider, version)| ManagedRecord {
+                    provider_id: provider.clone(),
+                    version: version.clone(),
+                    install: format!("{provider}/{version}"),
+                })
+                .collect())
         }
     }
 
@@ -1987,7 +2150,8 @@ mod tests {
                 .seen
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+                .first()
+                .cloned()
                 .ok_or_else(|| "the selection walk never ran".to_owned())
         };
         let pinned = seek_spec(Some(RunnerSpec::new(RunnerFamily::Proton)))
@@ -2310,21 +2474,48 @@ mod tests {
         Ok(())
     }
 
-    /// A resolver double: a canned outcome plus the last spec it saw —
-    /// records what the selection walk produced for the orchestration.
-    /// The `seen` record is `Arc`-shared so tests can inspect it after the
-    /// resolver has been moved into the service.
+    #[test]
+    fn runner_service_installs_and_reads_back_the_inventory() -> anyhow::Result<()> {
+        // The managed-runner use-case (blueprint §5, §8): install drives
+        // the storage pipeline from the manifest + pin; the inventory
+        // read-back is the `runner list` managed half and the rebuild
+        // seed.
+        let service = RunnerService::new(MockStorage::new(healthy_tree()));
+        let manifest = RunnerManifest {
+            provider_id: "proton".to_owned(),
+            source: cellar_core::manifest::ReleaseSource {
+                url_template: "https://example.test/{tag}-{arch}.tar.gz".to_owned(),
+                checksum_url_template: None,
+            },
+            checksum: cellar_core::manifest::ChecksumScheme::Sha512,
+            archive: cellar_core::manifest::ArchiveLayout::ExtractsToSingleRootDir,
+            install_kind: cellar_core::manifest::InstallKind::CompatTool,
+        };
+        let dir = service.install(&manifest, "GE-Proton11-5")?;
+        assert_eq!(dir, PathBuf::from("/mock/runtime/proton/GE-Proton11-5"));
+        let installed = service.installed()?;
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].version, "GE-Proton11-5");
+        assert_eq!(installed[0].install, "proton/GE-Proton11-5");
+        Ok(())
+    }
+
+    /// A resolver double: a canned outcome plus every spec it was asked —
+    /// records what the selection walk produced for the orchestration
+    /// (one resolve per stage; Proton-family plans resolve the umu layer
+    /// too, #34). The `seen` record is `Arc`-shared so tests can inspect
+    /// it after the resolver has been moved into the service.
     #[derive(Debug)]
     struct StubResolver {
         result: Result<ResolvedRunner, ResolveError>,
-        seen: Arc<Mutex<Option<RunnerSpec>>>,
+        seen: Arc<Mutex<Vec<RunnerSpec>>>,
     }
 
     impl StubResolver {
         fn new(result: Result<ResolvedRunner, ResolveError>) -> Self {
             Self {
                 result,
-                seen: Arc::new(Mutex::new(None)),
+                seen: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -2341,10 +2532,10 @@ mod tests {
         }
 
         fn resolve(&self, spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
-            *self
-                .seen
+            self.seen
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(spec.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(spec.clone());
             self.result.clone()
         }
     }
@@ -2511,7 +2702,7 @@ mod tests {
                 ..PrefixDefaults::default()
             },
         });
-        let seen = Arc::new(Mutex::new(None));
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let service = LaunchApp::new(
             mock,
             StubResolver {
@@ -2523,11 +2714,18 @@ mod tests {
             .plan("balatro", &[])
             .unwrap_or_else(|e| panic!("plan: {e}"));
         assert_eq!(
-            *seen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            Some(RunnerSpec::new(RunnerFamily::Proton)),
-            "the binding override selects whose defaults apply"
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first(),
+            Some(&RunnerSpec::new(RunnerFamily::Proton)),
+            "the binding override selects whose defaults apply — the proton spec is selected"
+        );
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(1),
+            Some(&RunnerSpec::new(RunnerFamily::Umu)),
+            "a Proton-family plan also resolves the umu container layer (#34)"
         );
         assert_eq!(
             plan.env.get("WINEPREFIX").map(String::as_str),

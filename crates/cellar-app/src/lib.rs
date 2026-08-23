@@ -30,6 +30,7 @@ pub use archive::{ArchiveError, extract_zip};
 pub use services::{
     ArtifactKind, DesktopSync, DesktopSyncReport, DoctorService, EntryStatus, InstallError,
     InstallOutcome, InstallResult, InstallService, LaunchApp, ListedEntry, PrefixService,
+    RunnerService,
 };
 
 // The launch surface presentations consume — through `app`, never directly
