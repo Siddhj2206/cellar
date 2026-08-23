@@ -27,7 +27,7 @@ A per-AppEntry setting that replaces one of its prefix's defaults — including 
 _Avoid_: setting, option, assignment
 
 **InstallSession**:
-The uniform first-run flow for any artifact — standalone exe, installer, or archive: pick or create a prefix, pick runner defaults, run the artifact, discover executables, confirm which become AppEntries. An installer is run inside the prefix (its exit awaited), an archive is extracted into the prefix, a standalone exe is registered without executing. One session touches exactly one prefix and may register zero or more AppEntries (an installer dropping five exes yields one prefix and up to five entries). Sessions are transient — they leave no history record; the durable result is the AppEntry plus its current-state metadata (runner, source installer, installed_at).
+The uniform first-run flow for any artifact — standalone exe, installer, or archive: pick or create a prefix, pick runner defaults, run the artifact, discover executables, confirm which become AppEntries. An installer is run inside the prefix (its exit awaited), an archive is extracted into the prefix, a standalone exe is registered without executing. One session touches exactly one prefix and may register zero or more AppEntries (an installer dropping five exes yields one prefix and up to five entries). Sessions are transient — they leave no history record; the durable result is the AppEntry plus its current-state metadata (runner, source installer, installed_at). The pick-or-create prefix and artifact questions are the interactive TTY flow (#32) — the same presentation entrypoint the "Open with Cellar" popup invokes for files (ADR 0004).
 _Avoid_: first-run wizard, setup, install
 
 **Discovery**:

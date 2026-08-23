@@ -6,16 +6,22 @@
 //! future `cellar-gui` leaf; flipping primary is `default-members`, zero
 //! edits below presentation.
 //!
-//! Surface for this slice (#31): `cellar install <path>` completes the
-//! flagship flow — the artifact branch is decided by filename hint and
-//! asked once on a TTY (never guessed silently), the candidates the
-//! installer/archive branches discovered are reviewed (interactive
-//! keep/hide/manual-add with a y/N confirmation, or the `--keep` /
-//! `--keep-all` / `--add` flag equivalents under `--no-input`), the
-//! confirmed entries register bound to the session's one prefix, and the
-//! summary lists them with their next command (`cellar launch <slug>`).
-//! On top of #29's `cellar launch <app>`, #27's install/list/uninstall,
-//! #26's `cellar prefix …` and `cellar doctor`. Exit codes (ADR 0004):
+//! Surface for this slice (#32): the guided TTY flow completes — step 1's
+//! prefix pick-or-create is now interactive (list existing, name a new
+//! one, empty line = `default`), asked only when stdin is a TTY, no
+//! `--no-input`, and no `--prefix` flag; every prompt keeps its flag
+//! equivalent. The "Open with Cellar" popup is this same entrypoint (ADR
+//! 0004): the MIME association's exec line calls `cellar install <path>`
+//! directly — no popup binary, no shell wrapper — and the no-TTY
+//! invocation drives everything from the filename hint plus flags, never
+//! a silent guess. (From #31: the artifact branch is decided by filename
+//! hint and asked once on a TTY; the candidates the installer/archive
+//! branches discovered are reviewed — interactive keep/hide/manual-add
+//! with a y/N confirmation, or the `--keep` / `--keep-all` / `--add` flag
+//! equivalents; confirmed entries register bound to the session's one
+//! prefix; the summary lists them with `cellar launch <slug>`.) On top of
+//! #29's `cellar launch <app>`, #27's install/list/uninstall, #26's
+//! `cellar prefix …` and `cellar doctor`. Exit codes (ADR 0004):
 //! 0 success, 1 operation error or doctor problems, 2 usage; `launch`
 //! propagates the game's exit code raw (§7), the collision with 1
 //! documented, not mapped.
@@ -73,9 +79,14 @@ enum Command {
 struct InstallArgs {
     /// Path to the Windows artifact to install.
     path: PathBuf,
-    /// Prefix to bind the entry to; created when missing.
-    #[arg(long, default_value = "default")]
-    prefix: String,
+    /// Prefix to bind the entry to; created when missing. Accepts the
+    /// same names the prompt does: a valid slug passes through, a human
+    /// name is slugified and reuses the existing prefix it names. Absent
+    /// on a TTY: interactive pick-or-create — the existing prefixes are
+    /// listed, a new one is named, and the empty line is `default` (the
+    /// blueprint §8 default). Absent without a TTY: `default`.
+    #[arg(long)]
+    prefix: Option<String>,
     /// Display name for a new entry (default: the exe's file name).
     #[arg(long)]
     name: Option<String>,
@@ -295,20 +306,27 @@ fn raw_exit_code(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
 }
 
-/// The `cellar install` handler — the flagship flow (blueprint §8):
-/// bind/create the prefix, handle the artifact (branch hinted from the
-/// file name, asked once on a TTY), review the discovered candidates
-/// (interactive keep/hide/manual-add with a y/N confirmation when stdin is
-/// a TTY and no decision flags are given; `--keep`/`--keep-all`/`--add`
-/// otherwise), register the confirmed entries bound to the session's one
-/// prefix, and print the summary with the next command. Nothing registers
-/// without confirmation: an unreviewed candidate list registers nothing.
+/// The `cellar install` handler — the flagship flow (blueprint §8): bind
+/// or create the prefix — the flag, or the interactive pick-or-create on a
+/// TTY, or the `default` default (step 1) — handle the artifact (branch
+/// hinted from the file name, asked once on a TTY, never silently), review
+/// the discovered candidates (interactive keep/hide/manual-add with a y/N
+/// confirmation when stdin is a TTY and no decision flags are given;
+/// `--keep`/`--keep-all`/`--add` otherwise), register the confirmed
+/// entries bound to the session's one prefix, and print the summary with
+/// the next command. Nothing registers without confirmation: an
+/// unreviewed candidate list registers nothing. The same handler is the
+/// "Open with Cellar" popup entrypoint (#32): a file-manager exec line
+/// calls `cellar install <path>` directly — no TTY, no wrapper binary —
+/// and the no-prompt path is exactly the flag/hint path below.
 fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode> {
     // Interactive iff stdin is a TTY and `--no-input` is absent
     // (blueprint §8) — and only when the decision flags leave nothing to
-    // ask (`--keep`/`--keep-all`/`--add` skip the review prompt).
+    // ask (a given `--prefix`/`--artifact`/`--keep`/`--keep-all`/`--add`
+    // skips its prompt).
     let interactive = std::io::stdin().is_terminal() && !args.no_input;
     let service = InstallService::new(store.clone(), ResolverSet::new(all_resolvers()));
+    let prefix = resolve_prefix_slug(args.prefix.as_deref(), interactive, store)?;
     let artifact = match args.artifact {
         Some(kind) => kind,
         None if interactive => prompt_artifact_kind(&args.path)?,
@@ -327,7 +345,7 @@ fn run_install(store: &TreeStore, args: &InstallArgs) -> anyhow::Result<ExitCode
     };
     let outcome = service.install(
         &args.path,
-        &args.prefix,
+        &prefix,
         args.name.as_deref(),
         args.kind,
         artifact,
@@ -464,6 +482,73 @@ fn parse_artifact_choice(input: &str, default: ArtifactKind) -> Option<ArtifactK
     }
 }
 
+/// One pick from the prefix pick-or-create prompt (blueprint §8 step 1):
+/// an existing prefix by its listed number, or the name of a new one —
+/// the empty line is the `default` default. The resolution against the
+/// listed prefixes happens in [`resolve_prefix_pick`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrefixPick {
+    /// The zero-based index of a listed existing prefix.
+    Existing(usize),
+    /// The name of a new prefix (slugified on resolution).
+    New(String),
+}
+
+/// Parse a pick-or-create line: empty input names the new prefix
+/// `default` (the blueprint §8 default, also the `--prefix` default), a
+/// number picks the listed existing prefix (1-based), anything else is a
+/// name for a new one.
+fn parse_prefix_choice(input: &str, count: usize) -> Result<PrefixPick, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(PrefixPick::New("default".to_owned()));
+    }
+    if let Ok(index) = trimmed.parse::<usize>() {
+        if index == 0 || index > count {
+            return Err(format!(
+                "prefix {index} is out of range (the list showed 1..={count})"
+            ));
+        }
+        return Ok(PrefixPick::Existing(index - 1));
+    }
+    Ok(PrefixPick::New(trimmed.to_owned()))
+}
+
+/// Resolve a pick against the listed prefixes to the slug the session
+/// binds: an existing entry by its number; a name — slugified, reusing the
+/// existing prefix its slug names (typing "My Games" picks `my-games`),
+/// or the slug the session creates for the new one.
+fn resolve_prefix_pick(pick: PrefixPick, prefixes: &[Prefix]) -> Result<String, String> {
+    match pick {
+        PrefixPick::Existing(index) => prefixes
+            .get(index)
+            .map(|prefix| prefix.slug.clone())
+            .ok_or_else(|| {
+                format!(
+                    "prefix {index} is out of range (the list showed 1..={})",
+                    prefixes.len()
+                )
+            }),
+        PrefixPick::New(name) => resolve_prefix_name(&name, prefixes),
+    }
+}
+
+/// Resolve a prefix name the way the prompt does: slugified (blueprint §6
+/// naming), reusing the existing prefix its slug names, or the slug the
+/// session will create. A name that already is a valid slug passes through
+/// unchanged — the `--prefix` flag and the prompt accept the same
+/// vocabulary, because every prompt has a flag equivalent.
+fn resolve_prefix_name(name: &str, prefixes: &[Prefix]) -> Result<String, String> {
+    let slug = cellar_core::slug::slugify(name);
+    if slug.is_empty() {
+        return Err(format!("cannot form a prefix slug from {name:?}"));
+    }
+    if let Some(existing) = prefixes.iter().find(|prefix| prefix.slug == slug) {
+        return Ok(existing.slug.clone());
+    }
+    Ok(slug)
+}
+
 /// The candidates the review's flags keep: `--keep-all` keeps every one;
 /// `--keep N…` keeps the printed numbers (validated against the list,
 /// repeated numbers kept once); no flags keep nothing — the review never
@@ -589,6 +674,57 @@ fn interactive_review(candidates: &[Candidate]) -> anyhow::Result<(Vec<Candidate
         add.push(PathBuf::from(line.trim()));
     }
     Ok((keep, add))
+}
+
+/// The session's prefix slug (blueprint §8 step 1): the `--prefix` flag's
+/// answer when given, the interactive pick-or-create's answer when the
+/// session can prompt, and the `default` default otherwise. The flag
+/// resolves exactly like the prompt (a name is slugified and reuses the
+/// existing prefix it names), so the flag equivalent is faithful — and the
+/// non-interactive popup path can express everything the TTY path accepts.
+fn resolve_prefix_slug(
+    flag: Option<&str>,
+    interactive: bool,
+    store: &TreeStore,
+) -> anyhow::Result<String> {
+    let prefixes = PrefixService::new(store.clone()).list()?;
+    match flag {
+        Some(name) => resolve_prefix_name(name, &prefixes).map_err(anyhow::Error::msg),
+        None if interactive => prompt_prefix(store),
+        None => Ok("default".to_owned()),
+    }
+}
+
+/// The interactive prefix pick-or-create (blueprint §8 step 1): the
+/// existing prefixes are listed, the user picks one by number or names a
+/// new one — the empty line is `default`. A typed name reuses the existing
+/// prefix it slugifies to; a genuinely new name is created by the session
+/// itself (the install binds-or-creates, dedupe-safe). Re-asked on bad
+/// input; guarded by the caller's `interactive` gate — never reached
+/// without a TTY, and skipped entirely when `--prefix` decided.
+fn prompt_prefix(store: &TreeStore) -> anyhow::Result<String> {
+    let service = PrefixService::new(store.clone());
+    let prefixes = service.list()?;
+    loop {
+        if prefixes.is_empty() {
+            print!("No prefixes yet — name the new one (default `default`): ");
+        } else {
+            println!("Existing prefixes:");
+            for (index, prefix) in prefixes.iter().enumerate() {
+                println!("  {}. {}", index + 1, prefix.slug);
+            }
+            print!("Use an existing prefix or name a new one (default `default`): ");
+        }
+        flush_stdout()?;
+        let line = read_line()?;
+        match parse_prefix_choice(&line, prefixes.len()) {
+            Ok(pick) => match resolve_prefix_pick(pick, &prefixes) {
+                Ok(slug) => return Ok(slug),
+                Err(message) => eprintln!("cellar: {message}"),
+            },
+            Err(message) => eprintln!("cellar: {message}"),
+        }
+    }
 }
 
 /// The artifact-kind question: the three branches with the filename-hint
@@ -961,7 +1097,8 @@ mod tests {
     };
     use cellar_core::ports::Storage as _;
     use cellar_core::{
-        AppEntry, AppKind, Overrides, PrefixDefaults, RunnerFamily, RunnerInstall, RunnerRef,
+        AppEntry, AppKind, Overrides, Prefix, PrefixDefaults, RunnerFamily, RunnerInstall,
+        RunnerRef,
     };
 
     static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1079,7 +1216,11 @@ mod tests {
             panic!("unexpected command");
         };
         assert_eq!(args.path, PathBuf::from("/games/balatro.exe"));
-        assert_eq!(args.prefix, "default", "the default prefix is `default`");
+        assert!(
+            args.prefix.is_none(),
+            "the prefix is decided by the prompt or defaults to `default` — \
+             the flag is absent unless given"
+        );
         assert!(
             args.name.is_none(),
             "the name defaults to the exe file name"
@@ -1104,7 +1245,7 @@ mod tests {
         let Command::Install(args) = cli.command else {
             panic!("unexpected command");
         };
-        assert_eq!(args.prefix, "games");
+        assert_eq!(args.prefix.as_deref(), Some("games"));
         assert_eq!(args.name.as_deref(), Some("Balatro"));
         assert_eq!(args.kind, AppKind::Tool);
     }
@@ -2025,6 +2166,163 @@ mod tests {
         assert_eq!(parse_artifact_choice("q", default), None);
     }
 
+    fn pick_prefix(slug: &str) -> Prefix {
+        Prefix {
+            slug: slug.to_owned(),
+            defaults: cellar_core::PrefixDefaults::default(),
+        }
+    }
+
+    #[test]
+    fn parse_prefix_choice_picks_numbers_new_names_and_the_default() {
+        // Blueprint §8: the empty line is the `default` default; a number
+        // picks a listed prefix; anything else names a new one.
+        assert_eq!(
+            parse_prefix_choice("", 2).unwrap(),
+            PrefixPick::New("default".to_owned()),
+            "the empty line is the default"
+        );
+        assert_eq!(
+            parse_prefix_choice("2", 2).unwrap(),
+            PrefixPick::Existing(1),
+            "the numbers are 1-based over the listing"
+        );
+        assert_eq!(
+            parse_prefix_choice("my games", 2).unwrap(),
+            PrefixPick::New("my games".to_owned())
+        );
+        assert_eq!(
+            parse_prefix_choice("  0 ", 2).unwrap_err(),
+            "prefix 0 is out of range (the list showed 1..=2)"
+        );
+        assert_eq!(
+            parse_prefix_choice("3", 2).unwrap_err(),
+            "prefix 3 is out of range (the list showed 1..=2)"
+        );
+        assert_eq!(
+            parse_prefix_choice("1", 0).unwrap_err(),
+            "prefix 1 is out of range (the list showed 1..=0)"
+        );
+    }
+
+    #[test]
+    fn resolve_prefix_pick_reuses_existing_and_slugifies_new_names() {
+        let prefixes = [pick_prefix("default"), pick_prefix("my-games")];
+        // A number resolves to the listed prefix's slug.
+        assert_eq!(
+            resolve_prefix_pick(PrefixPick::Existing(1), &prefixes).unwrap(),
+            "my-games"
+        );
+        // A name that slugifies to an existing prefix reuses it — typing
+        // "My Games" picks `my-games`, it never creates a `-2` sibling.
+        assert_eq!(
+            resolve_prefix_pick(PrefixPick::New("My Games".to_owned()), &prefixes).unwrap(),
+            "my-games"
+        );
+        assert_eq!(
+            resolve_prefix_pick(PrefixPick::New("default".to_owned()), &prefixes).unwrap(),
+            "default",
+            "the default name reuses the existing default prefix"
+        );
+        // A genuinely new name resolves to its slug; the session creates it.
+        assert_eq!(
+            resolve_prefix_pick(PrefixPick::New("New Games".to_owned()), &prefixes).unwrap(),
+            "new-games"
+        );
+        // An unslugifiable name is refused before the session sees it.
+        assert_eq!(
+            resolve_prefix_pick(PrefixPick::New("!!!".to_owned()), &prefixes).unwrap_err(),
+            "cannot form a prefix slug from \"!!!\""
+        );
+        assert!(
+            resolve_prefix_pick(PrefixPick::Existing(9), &prefixes).is_err(),
+            "an out-of-range index is refused, never a panic"
+        );
+    }
+
+    #[test]
+    fn resolve_prefix_slug_flag_prompt_and_default_are_one_decision() -> anyhow::Result<()> {
+        // Blueprint §8: the flag, the prompt, and the default resolve the
+        // same way; the prompt only when the session is interactive (stdin
+        // is a TTY, no `--no-input`); the `default` default otherwise —
+        // the popup's flagless invocation (#32) is exactly the third arm.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-prefix-resolve-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        PrefixService::new(store.clone()).create("My Games")?;
+        assert_eq!(
+            resolve_prefix_slug(Some("games"), true, &store)?,
+            "games",
+            "a valid slug passes through — the flag decides, no prompt"
+        );
+        assert_eq!(
+            resolve_prefix_slug(Some("games"), false, &store)?,
+            "games",
+            "the flag also decides the non-interactive path"
+        );
+        assert_eq!(
+            resolve_prefix_slug(None, false, &store)?,
+            "default",
+            "flagless and non-interactive is the default"
+        );
+        // The flag is the prompt's equivalent: the same name resolution —
+        // slugified, reusing the existing prefix the slug names.
+        assert_eq!(
+            resolve_prefix_slug(Some("My Games"), false, &store)?,
+            "my-games",
+            "a human name through the flag reuses the existing prefix"
+        );
+        assert_eq!(
+            resolve_prefix_slug(Some("New Games"), false, &store)?,
+            "new-games",
+            "a new name through the flag is the slug the session creates"
+        );
+        assert!(
+            resolve_prefix_slug(Some("!!!"), false, &store).is_err(),
+            "an unslugifiable flag is an operation error, never a guess"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_install_defaults_the_prefix_flaglessly_without_a_tty() -> anyhow::Result<()> {
+        // The no-TTY, no-flag session is the popup invocation (#32): the
+        // prefix defaults to `default` (blueprint §8) — the flag, prompt,
+        // and default are the same decision made at the right layer.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-popup-default-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let exe = root.join("balatro.exe");
+        std::fs::write(&exe, "MZ")?;
+        let code = run_install(
+            &store,
+            &InstallArgs {
+                path: exe,
+                prefix: None,
+                name: None,
+                kind: AppKind::Game,
+                artifact: None,
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+        )?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        let apps = store.list_apps()?;
+        assert_eq!(apps.len(), 1, "the session registered the exe");
+        assert_eq!(apps[0].prefix, "default", "the flagless default prefix");
+        Ok(())
+    }
+
     fn review_candidate(label: &str) -> Candidate {
         Candidate {
             exe: PathBuf::from(format!("/prefix/drive_c/{label}.exe")),
@@ -2037,7 +2335,7 @@ mod tests {
         let candidates = ["a", "b", "c"].map(review_candidate);
         let args = || InstallArgs {
             path: PathBuf::from("/tmp/setup.exe"),
-            prefix: "default".to_owned(),
+            prefix: None,
             name: None,
             kind: AppKind::Game,
             artifact: Some(ArtifactKind::Installer),
@@ -2167,7 +2465,7 @@ mod tests {
             &store,
             &InstallArgs {
                 path: installer,
-                prefix: "default".to_owned(),
+                prefix: None,
                 name: None,
                 kind: AppKind::Game,
                 artifact: Some(ArtifactKind::Installer),
@@ -2205,7 +2503,7 @@ mod tests {
             &store,
             &InstallArgs {
                 path: installer,
-                prefix: "default".to_owned(),
+                prefix: None,
                 name: None,
                 kind: AppKind::Game,
                 artifact: Some(ArtifactKind::Installer),
@@ -2234,7 +2532,7 @@ mod tests {
             &store,
             &InstallArgs {
                 path: installer,
-                prefix: "default".to_owned(),
+                prefix: None,
                 name: None,
                 kind: AppKind::Game,
                 artifact: Some(ArtifactKind::Installer),
