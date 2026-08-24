@@ -30,10 +30,9 @@ There is no setup step: the first command creates Cellar's state directory
 and install something:
 
 ```bash
-cellar runner install proton GE-Proton11-5    # check upstream releases for current tags
+cellar runner install proton GE-Proton11-5    # or just `latest` / no version for the newest release
 cellar install ~/Downloads/game_setup.exe
 ```
-
 ## Installing apps — `cellar install <path>`
 
 One flow handles all three artifact kinds:
@@ -139,9 +138,10 @@ cellar runner list
 
 Managed installs download resumably into the disposable cache, verify against the published
 SHA-512 where one exists, extract, probe, and record in the authoritative inventory
-(`runtime/providers.toml`). Versions are explicit pins — there is no guessed "latest"; installing
-an already-installed version is a no-op, and a wiped `runtime/` can be restored by reinstalling the
-recorded versions.
+(`runtime/providers.toml`). The version is a release tag; omitting it — or passing `latest` —
+resolves the provider's newest published release through its feed and installs that concrete
+tag (the inventory records the real tag, never "latest"). Installing an already-installed
+version is a no-op, and a wiped `runtime/` can be restored by reinstalling the recorded versions.
 
 Downloads show phase progress — `Downloading GE-Proton11-5  143.2 MB / 402.1 MB (36%)`, then
 `Verifying SHA-512…` and `Extracting…` — on **stderr**, repainted in place while they run. Piping

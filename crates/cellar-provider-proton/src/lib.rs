@@ -57,6 +57,10 @@ impl ProtonProvider {
                         "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/{tag}/{tag}-{arch}.sha512sum"
                             .to_owned(),
                     ),
+                    latest_url: Some(
+                        "https://github.com/GloriousEggroll/proton-ge-custom/releases/latest"
+                            .to_owned(),
+                    ),
                 },
                 checksum: ChecksumScheme::Sha512,
                 archive: ArchiveLayout::ExtractsToSingleRootDir,

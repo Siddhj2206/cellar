@@ -28,8 +28,8 @@ pub use entities::{AppEntry, AppKind, Candidate, Overrides, Prefix, PrefixDefaul
 pub use errors::{DesktopError, ResolveError, StorageError};
 pub use health::TreeHealth;
 pub use manifest::{
-    ArchiveLayout, ChecksumScheme, InstallKind, ManagedInventory, ManagedRecord, ReleaseSource,
-    RunnerManifest,
+    ArchiveLayout, ChecksumScheme, InstallKind, LATEST_PIN, ManagedInventory, ManagedRecord,
+    ReleaseSource, RunnerManifest,
 };
 pub use slug::{MAX_LEN, dedupe_slug, is_valid_slug, slugify};
 pub use types::{

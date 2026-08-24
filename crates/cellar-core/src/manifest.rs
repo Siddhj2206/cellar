@@ -27,7 +27,26 @@ pub struct ReleaseSource {
     /// (e.g. `<tag>-<arch>.sha512sum`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum_url_template: Option<String>,
+    /// The provider's "newest release" URL — the releases-latest page
+    /// (`https://github.com/<owner>/<repo>/releases/latest`) that
+    /// redirects to the newest release's page whose path ends in the
+    /// tag (#65). Explicit by design: never derived or guessed from
+    /// `url_template`; absent means the provider offers no latest
+    /// resolution — installing `latest` there is a loud refusal, not a
+    /// guess. Chosen over the GitHub REST API deliberately: the
+    /// unauthenticated API caps at 60 requests/hour per IP (shared
+    /// networks exhaust it instantly), while the releases page carries
+    /// no such budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_url: Option<String>,
 }
+
+/// The version sentinel that resolves through the provider's release feed
+/// at install time (`ReleaseSource::latest_url`) — also what an omitted
+/// version pin means on the CLI surface (#65). Resolution happens once,
+/// inside the installer pipeline; everything downstream (probe,
+/// inventory, list) sees only the concrete tag it resolved to.
+pub const LATEST_PIN: &str = "latest";
 
 /// Checksum algorithm used for verification. Research #18 corrected the
 /// ticket's "sha256": GE-Proton publishes SHA-512, and Cellar verifies it.

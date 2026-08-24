@@ -25,7 +25,9 @@
 //! threaded in from presentation ([`InstallProgress`]), which decides what
 //! reaches a screen (the CLI draws stderr lines).
 
-use cellar_core::manifest::{InstallKind, ManagedInventory, ManagedRecord, RunnerManifest};
+use cellar_core::manifest::{
+    InstallKind, LATEST_PIN, ManagedInventory, ManagedRecord, RunnerManifest,
+};
 use cellar_core::ports::InstallProgress;
 
 use flate2::read::GzDecoder;
@@ -73,7 +75,13 @@ pub(crate) fn install(
     version: &str,
     progress: &mut dyn FnMut(InstallProgress),
 ) -> Result<PathBuf, StorageError> {
-    validate_version_pin(version)?;
+    // The pin: a concrete tag passes through; the `latest` sentinel
+    // resolves through the provider's release feed (#65) — once, here,
+    // so everything downstream (probe, inventory, narration) sees only
+    // the concrete tag it resolved to. The resolved tag is validated
+    // like any pin below: a hostile feed never picks the directory.
+    let version = resolve_pin(manifest, version)?;
+    validate_version_pin(&version)?;
     let arch = target_arch()?;
     // The lock serializes one provider's concurrent installs (AC: flock
     // per-directory) — the build happens inside the lock, the idempotency
@@ -89,13 +97,13 @@ pub(crate) fn install(
         ))
     })?;
 
-    let install_dir = provider_dir.join(version);
+    let install_dir = provider_dir.join(&version);
     if probe_installed(manifest, &install_dir) {
         // An installed version is a no-op — and it is recorded, so a dir
         // placed by an earlier interrupted run (or by hand) joins the
         // authoritative inventory (reconciliation: the inventory always
         // mirrors what resolution serves).
-        record_inventory(root, manifest, version)?;
+        record_inventory(root, manifest, &version)?;
         return Ok(install_dir);
     }
     if install_dir.exists() {
@@ -106,7 +114,7 @@ pub(crate) fn install(
 
     // Fetch + verify: the resumable cache under the tree's disposable
     // downloads dir.
-    let artifact_url = substitute(&manifest.source.url_template, version, arch);
+    let artifact_url = substitute(&manifest.source.url_template, &version, arch);
     let artifact_name = artifact_name(&artifact_url)?;
     let downloads = root.join("cache").join("downloads");
     fs::create_dir_all(&downloads).map_err(storage_io(&downloads))?;
@@ -119,7 +127,7 @@ pub(crate) fn install(
         // tiny `.sha512sum` request and the whole-artifact hash pass are
         // one phase to the user (#37).
         progress(InstallProgress::Verify);
-        let checksum_url = substitute(template, version, arch);
+        let checksum_url = substitute(template, &version, arch);
         let checksum = fetch_checksum(&checksum_url, &downloads, &artifact_name)?;
         // The declared checksum is mandatory: a mismatch discards the
         // download and aborts — nothing is extracted, nothing recorded
@@ -172,7 +180,7 @@ pub(crate) fn install(
 
     // Record: the authoritative inventory — the runtime dir becomes
     // rebuildable from it (AC).
-    record_inventory(root, manifest, version)?;
+    record_inventory(root, manifest, &version)?;
 
     Ok(install_dir)
 }
@@ -208,6 +216,58 @@ fn record_inventory(
     // doctor/list reads deserve it.
     records.sort_by(|a, b| (&a.provider_id, &a.version).cmp(&(&b.provider_id, &b.version)));
     write_inventory(root, &records)
+}
+
+/// Resolve the version pin to a concrete tag (#65): any pin passes
+/// through unchanged; the [`LATEST_PIN`] sentinel resolves through the
+/// provider's release feed (`ReleaseSource::latest_url`). A manifest
+/// without a feed loudly refuses `latest` — never a guess — and the
+/// resolved tag is validated like any user-typed pin by the caller, so a
+/// hostile or broken feed never picks the install directory.
+fn resolve_pin(manifest: &RunnerManifest, version: &str) -> Result<String, StorageError> {
+    if version != LATEST_PIN {
+        return Ok(version.to_owned());
+    }
+    let api = manifest.source.latest_url.as_deref().ok_or_else(|| {
+        StorageError::Artifact(format!(
+            "{} publishes no release feed for \"latest\" — pass an explicit version \
+             (the release tag, e.g. GE-Proton11-5)",
+            manifest.provider_id
+        ))
+    })?;
+    fetch_latest_tag(api)
+}
+
+/// Ask the provider's releases-latest page for its newest tag (#65): the
+/// URL redirects to the newest release's page, whose path ends in the
+/// tag (`…/releases/latest` → `…/releases/tag/GE-Proton11-5`). The
+/// website, not the REST API: the unauthenticated API caps at 60
+/// requests per hour per IP (shared networks exhaust it instantly,
+/// observed live), while the releases page carries no such budget. A
+/// response that stayed put resolved nothing and refuses loudly.
+fn fetch_latest_tag(url: &str) -> Result<String, StorageError> {
+    let response = ureq::get(url)
+        .set("User-Agent", "cellar")
+        .call()
+        .map_err(|error| StorageError::Artifact(format!("release feed {url}: {error}")))?;
+    if response.status() != 200 {
+        return Err(StorageError::Artifact(format!(
+            "release feed {url}: unexpected status {}",
+            response.status()
+        )));
+    }
+    // Tags that survive pin validation use only unreserved URL
+    // characters (alnum, `.`, `_`, `-`) — characters that are never
+    // percent-encoded — so the redirected path's last segment *is* the
+    // tag text.
+    let final_url = response.get_url().to_owned();
+    let tag = final_url.rsplit('/').next().unwrap_or_default();
+    if tag.is_empty() || tag == "latest" {
+        return Err(StorageError::Artifact(format!(
+            "release feed {url} resolved to no tag (ended at {final_url})"
+        )));
+    }
+    Ok(tag.to_owned())
 }
 
 /// The version pin names the install directory verbatim — its one job —
@@ -543,11 +603,44 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Extraction: traversal-safe tar.gz into a private temp dir, then a
-// single-root move. Mirrors the zip extractor's two-pass vetting
-// (cellar-app archive.rs): the whole archive is read and vetted before
-// anything is written.
+// Extraction: tar (gzip-detected by content, never by file name) into a
+// private temp dir, then a single-root move. Mirrors the zip extractor's
+// two-pass vetting (cellar-app archive.rs): the whole archive is read and
+// vetted before anything is written.
 // ---------------------------------------------------------------------------
+
+/// The gzip magic number: the first two bytes of any gzip stream.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// The archive reader for one artifact: gzip-decompressed when the bytes
+/// carry the gzip magic, raw otherwise. Upstream publishes both shapes —
+/// GE-Proton's `.tar.gz` and umu's plain `.tar` zipapp — and the content
+/// decides, never the file name (#65 follow-up: the zipapp failed under a
+/// blanket `GzDecoder` with "invalid gzip header").
+fn archive_reader(file: fs::File) -> Result<Box<dyn io::Read>, StorageError> {
+    use std::io::Read;
+
+    let mut file = file;
+    let mut magic = [0u8; 2];
+    let mut filled = 0;
+    while filled < magic.len() {
+        match file.read(&mut magic[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) => return Err(StorageError::Io(format!("archive probe: {error}"))),
+        }
+    }
+    let is_gzip = filled == magic.len() && magic == GZIP_MAGIC;
+    // Both readers must see the whole stream: rewind past the probed
+    // magic either way.
+    file.rewind()
+        .map_err(|error| StorageError::Io(format!("archive rewind: {error}")))?;
+    if is_gzip {
+        Ok(Box::new(GzDecoder::new(file)))
+    } else {
+        Ok(Box::new(file))
+    }
+}
 
 /// Extract `archive` into `dest`, validating every entry path
 /// component-wise first (no `..`, no absolute roots, no drive prefixes),
@@ -564,7 +657,7 @@ fn extract_tarball(archive: &Path, dest: &Path) -> Result<(), StorageError> {
 /// hostile archive can neither escape `dest` nor extract partway.
 fn vet_tarball(archive: &Path) -> Result<Vec<VettedEntry>, StorageError> {
     let file = fs::File::open(archive).map_err(storage_io(archive))?;
-    let mut tar = tar::Archive::new(GzDecoder::new(file));
+    let mut tar = tar::Archive::new(archive_reader(file)?);
     let entries = tar
         .entries()
         .map_err(|error| StorageError::Artifact(format!("{}: {error}", archive.display())))?;
@@ -636,7 +729,7 @@ fn single_root_check(archive: &Path, vetted: &[VettedEntry]) -> Result<(), Stora
 /// during extraction.
 fn write_vetted(archive: &Path, dest: &Path, vetted: &[VettedEntry]) -> Result<(), StorageError> {
     let file = fs::File::open(archive).map_err(storage_io(archive))?;
-    let mut tar = tar::Archive::new(GzDecoder::new(file));
+    let mut tar = tar::Archive::new(archive_reader(file)?);
     let entries = tar
         .entries()
         .map_err(|error| StorageError::Artifact(format!("{}: {error}", archive.display())))?;
@@ -923,19 +1016,23 @@ mod tests {
         path
     }
 
-    /// An umu-shaped fixture: single root `umu` with an executable
-    /// `umu-run` — the root's name differs from the version pin.
+    /// An umu-shaped fixture — and a truthful one: upstream's zipapp is
+    /// a *plain* tar (the #65 follow-up: a blanket `GzDecoder` failed it
+    /// with "invalid gzip header"), so this fixture is uncompressed too,
+    /// exercising the content-sniffed raw extraction path. Single root
+    /// `umu` with an executable `umu-run` — the root's name differs from
+    /// the version pin.
     fn umu_tarball(dir: &Path, version: &str) -> PathBuf {
         let path = dir.join(format!("umu-{version}-{}.tar", arch()));
         let file = fs::File::create(&path).expect("fixture tarball");
-        let mut tar = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+        let mut tar = tar::Builder::new(file);
         append_dir(&mut tar, "umu", 0o755);
         append_file(&mut tar, "umu/umu-run", 0o755, "#!/bin/sh\nexit 0\n");
-        finish_tarball(tar);
+        tar.finish().expect("tar trailer");
         path
     }
 
-    fn append_dir(tar: &mut tar::Builder<GzEncoder<fs::File>>, name: &str, mode: u32) {
+    fn append_dir<W: std::io::Write>(tar: &mut tar::Builder<W>, name: &str, mode: u32) {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Directory);
         header.set_mode(mode);
@@ -944,7 +1041,12 @@ mod tests {
             .expect("tar dir");
     }
 
-    fn append_file(tar: &mut tar::Builder<GzEncoder<fs::File>>, name: &str, mode: u32, body: &str) {
+    fn append_file<W: std::io::Write>(
+        tar: &mut tar::Builder<W>,
+        name: &str,
+        mode: u32,
+        body: &str,
+    ) {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_mode(mode);
@@ -990,6 +1092,7 @@ mod tests {
                     "file://{}/{{tag}}-{{arch}}.tar.gz.sha512sum",
                     dir.display()
                 )),
+                latest_url: None,
             },
             checksum: ChecksumScheme::Sha512,
             archive: ArchiveLayout::ExtractsToSingleRootDir,
@@ -1005,6 +1108,7 @@ mod tests {
                 // upstream publishes no checksum for the zipapp (research
                 // #18) — the fixture omits the template the same way.
                 checksum_url_template: None,
+                latest_url: None,
             },
             checksum: ChecksumScheme::Sha512,
             archive: ArchiveLayout::ExtractsToSingleRootDir,
@@ -1407,15 +1511,8 @@ mod tests {
             write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
         let checksum_bytes =
             Arc::new(format!("{checksum_hex}  {version}-{}.tar.gz\n", arch()).into_bytes());
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let server = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                serve_one(&mut stream, &artifact_bytes, &checksum_bytes);
-            }
-        });
+        let (port, server) =
+            serve_locally(artifact_bytes, checksum_bytes, feed_tag("GE-Proton11-5"));
 
         let manifest = RunnerManifest {
             provider_id: "proton".to_owned(),
@@ -1424,6 +1521,7 @@ mod tests {
                 checksum_url_template: Some(format!(
                     "http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz.sha512sum"
                 )),
+                latest_url: None,
             },
             checksum: ChecksumScheme::Sha512,
             archive: ArchiveLayout::ExtractsToSingleRootDir,
@@ -1450,14 +1548,8 @@ mod tests {
             write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
         let checksum_bytes =
             Arc::new(format!("{checksum_hex}  {version}-{}.tar.gz\n", arch()).into_bytes());
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let port = listener.local_addr().expect("addr").port();
-        let server = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                serve_one(&mut stream, &artifact_bytes, &checksum_bytes);
-            }
-        });
+        let (port, server) =
+            serve_locally(artifact_bytes, checksum_bytes, feed_tag("GE-Proton11-5"));
 
         let manifest = RunnerManifest {
             provider_id: "proton".to_owned(),
@@ -1466,6 +1558,7 @@ mod tests {
                 checksum_url_template: Some(format!(
                     "http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz.sha512sum"
                 )),
+                latest_url: None,
             },
             checksum: ChecksumScheme::Sha512,
             archive: ArchiveLayout::ExtractsToSingleRootDir,
@@ -1622,10 +1715,13 @@ mod tests {
 
     /// One HTTP/1.1 exchange: reads the request line + headers, honors a
     /// `Range: bytes=N-` with a 206, and names the file by its URL path.
+    /// A `/releases/latest` path serves the feed body instead (the
+    /// GitHub-releases-API shape `latest` resolution rides, #65).
     fn serve_one(
         stream: &mut std::net::TcpStream,
         artifact: &Arc<Vec<u8>>,
         checksum: &Arc<Vec<u8>>,
+        feed: &Arc<Vec<u8>>,
     ) {
         use std::io::BufRead;
 
@@ -1649,6 +1745,19 @@ mod tests {
             .nth(1)
             .expect("request path")
             .to_owned();
+        // The release-feed branch (#65): the tag text in `feed` rides a
+        // 302's Location path — exactly how the real releases-latest
+        // page hands out its newest tag.
+        if path.contains("/releases/latest") {
+            let tag = std::str::from_utf8(feed).expect("feed tag");
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: /releases/tag/{tag}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).expect("redirect");
+            stream.flush().expect("flush");
+            return;
+        }
         let (body, from) = if path.ends_with(".sha512sum") {
             (checksum, 0)
         } else {
@@ -1675,5 +1784,177 @@ mod tests {
         stream.write_all(head.as_bytes()).expect("response head");
         stream.write_all(body).expect("response body");
         stream.flush().expect("flush");
+    }
+
+    /// The local Range-capable server of the #34 fixture, extended with
+    /// the release-feed path (#65): one artifact, its checksum, and a
+    /// GitHub-API-shaped feed body. Returns the bound port and the
+    /// server's join handle (kept alive for the test's duration).
+    fn serve_locally(
+        artifact: Arc<Vec<u8>>,
+        checksum: Arc<Vec<u8>>,
+        feed: Arc<Vec<u8>>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                serve_one(&mut stream, &artifact, &checksum, &feed);
+            }
+        });
+        (port, server)
+    }
+
+    /// The release-feed fixture (#65): the tag the `/releases/latest`
+    /// branch answers its 302 redirect with — the same way the real
+    /// releases-latest page hands out the newest tag.
+    fn feed_tag(tag: &str) -> Arc<Vec<u8>> {
+        Arc::new(tag.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn latest_resolves_through_the_feed_and_records_the_concrete_tag() {
+        // AC (#65): `latest` resolves once through the provider's feed,
+        // then runs the pinned pipeline — the install dir and inventory
+        // record the concrete tag, and a second run is the usual no-op.
+        let root = root("latest-http");
+        let version = "GE-Proton11-5";
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let tarball = proton_tarball(&fixtures, version);
+        let artifact_bytes = Arc::new(fs::read(&tarball).expect("artifact bytes"));
+        let checksum_hex =
+            write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
+        let checksum_bytes =
+            Arc::new(format!("{checksum_hex}  {version}-{}.tar.gz\n", arch()).into_bytes());
+        let (port, server) = serve_locally(artifact_bytes, checksum_bytes, feed_tag(version));
+
+        let manifest = RunnerManifest {
+            provider_id: "proton".to_owned(),
+            source: ReleaseSource {
+                url_template: format!("http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz"),
+                checksum_url_template: Some(format!(
+                    "http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz.sha512sum"
+                )),
+                latest_url: Some(format!("http://127.0.0.1:{port}/releases/latest")),
+            },
+            checksum: ChecksumScheme::Sha512,
+            archive: ArchiveLayout::ExtractsToSingleRootDir,
+            install_kind: InstallKind::CompatTool,
+        };
+        let install_dir = install(&root, &manifest, LATEST_PIN, &mut |_| {})
+            .expect("latest resolves and installs");
+        assert_eq!(
+            install_dir,
+            root.join("runtime/proton").join(version),
+            "the concrete tag names the install directory"
+        );
+        let records = inventory(&root).expect("inventory");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].version, version, "the concrete tag is recorded");
+        // Idempotent: the same feed state re-resolves to the same pin and
+        // hits the installed-version probe — a no-op.
+        assert_eq!(
+            install(&root, &manifest, LATEST_PIN, &mut |_| {}).expect("re-run"),
+            install_dir
+        );
+        assert_eq!(inventory(&root).expect("inventory").len(), 1);
+        let _ = server;
+    }
+
+    #[test]
+    fn latest_without_a_release_feed_is_a_loud_refusal() {
+        // A manifest with no `latest_url` offers no latest resolution:
+        // refused loudly before any path math or fetch — never guessed
+        // from the URL template (AC #65).
+        let root = root("latest-no-feed");
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let version = "GE-Proton11-5";
+        let tarball = proton_tarball(&fixtures, version);
+        write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
+        let mut manifest = proton_manifest(&fixtures, version);
+        manifest.source.latest_url = None;
+
+        let err =
+            install(&root, &manifest, LATEST_PIN, &mut |_| {}).expect_err("no feed, no latest");
+        assert!(err.to_string().contains("no release feed"), "{err}");
+        assert!(inventory(&root).expect("inventory").is_empty());
+    }
+
+    #[test]
+    fn the_archive_format_is_decided_by_content_not_name() {
+        // The #65 follow-up bug, pinned: a `.tar.gz`-named URL carrying a
+        // *plain* tar (umu's zipapp shape) must extract — the gzip magic
+        // in the bytes decides, never the file name. The inverse (gzip
+        // bytes through the decoder path) is every proton fixture.
+        let root = root("content-not-name");
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let version = "GE-Proton11-5";
+        let gz_name = format!("{version}-{}.tar.gz", arch());
+        let plain = fixtures.join(&gz_name);
+        let file = fs::File::create(&plain).expect("fixture tarball");
+        let mut tar = tar::Builder::new(file);
+        append_dir(&mut tar, version, 0o755);
+        append_file(
+            &mut tar,
+            &format!("{version}/proton"),
+            0o755,
+            "#!/bin/sh\nexit 0\n",
+        );
+        tar.finish().expect("tar trailer");
+        write_checksum(&fixtures, &plain, &gz_name);
+
+        let install_dir =
+            install_quiet(&root, &proton_manifest(&fixtures, version), version).expect("install");
+        assert!(executable_file(&install_dir.join("proton")));
+    }
+
+    #[test]
+    fn a_hostile_feed_tag_is_validated_like_a_pin() {
+        // The resolved tag picks the install directory, so it must pass
+        // the same validation as a typed pin: a traversal tag from a
+        // hostile or broken feed is refused whole, nothing installed
+        // (AC #65).
+        let root = root("latest-evil-feed");
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let version = "GE-Proton11-5";
+        let tarball = proton_tarball(&fixtures, version);
+        let artifact_bytes = Arc::new(fs::read(&tarball).expect("artifact bytes"));
+        let checksum_hex =
+            write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
+        let checksum_bytes =
+            Arc::new(format!("{checksum_hex}  {version}-{}.tar.gz\n", arch()).into_bytes());
+        // A percent-encoded traversal tag: it survives the redirect path
+        // verbatim (no `/` segmentation to eat it), and pin validation
+        // must refuse it whole — nothing installed, nothing recorded.
+        let (port, server) =
+            serve_locally(artifact_bytes, checksum_bytes, feed_tag("%2E%2E%2Fescape"));
+
+        let manifest = RunnerManifest {
+            provider_id: "proton".to_owned(),
+            source: ReleaseSource {
+                url_template: format!("http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz"),
+                checksum_url_template: Some(format!(
+                    "http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz.sha512sum"
+                )),
+                latest_url: Some(format!("http://127.0.0.1:{port}/releases/latest")),
+            },
+            checksum: ChecksumScheme::Sha512,
+            archive: ArchiveLayout::ExtractsToSingleRootDir,
+            install_kind: InstallKind::CompatTool,
+        };
+        let err = install(&root, &manifest, LATEST_PIN, &mut |_| {})
+            .expect_err("a traversal tag from the feed is refused");
+        assert!(err.to_string().contains("invalid version pin"), "{err}");
+        assert!(
+            !root.join("runtime/proton").join("%2E%2E%2Fescape").exists(),
+            "nothing was installed from the hostile tag"
+        );
+        assert!(inventory(&root).expect("inventory").is_empty());
+        let _ = server;
     }
 }

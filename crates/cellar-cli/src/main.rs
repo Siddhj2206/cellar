@@ -55,7 +55,9 @@
 //! renders them — `Downloading <version> … MB / … MB (…%)` repainted in
 //! place, then `Verifying SHA-512…` and `Extracting…` — on stderr only,
 //! and only when stderr is a terminal; `--quiet` silences it all while
-//! stdout keeps yielding clean data under pipes.
+//! stdout keeps yielding clean data under pipes. An omitted version pin
+//! — or the literal `latest` — resolves the provider's newest published
+//! release through its feed (#65) and installs that concrete tag.
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -161,7 +163,7 @@ enum Command {
         display_name = "cellar",
         subcommand_required = true,
         arg_required_else_help = true,
-        help_template = "{about-with-newline}Examples:\n  cellar runner list\n  cellar runner install proton GE-Proton11-5\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+        help_template = "{about-with-newline}Examples:\n  cellar runner list\n  cellar runner install proton GE-Proton11-5\n  cellar runner install umu latest\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
     )]
     Runner(RunnerArgs),
     /// Sectioned capability checks with fix hints; exits 1 on any problem.
@@ -353,19 +355,22 @@ enum RunnerCommand {
     #[command(
         display_name = "cellar",
         arg_required_else_help = true,
-        help_template = "{about-with-newline}Examples:\n  cellar runner install proton GE-Proton11-5\n  cellar runner install umu 1.4.4\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+        help_template = "{about-with-newline}Examples:\n  cellar runner install proton GE-Proton11-5\n  cellar runner install umu 1.4.4\n  cellar runner install umu latest\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
     )]
     Install {
         /// The provider's identifier (`proton`, `umu`).
         provider: String,
         /// The version to install — the release tag, e.g.
-        /// `GE-Proton11-5` (no guessed "latest": the artifact is named
-        /// deterministically by its tag).
+        /// `GE-Proton11-5`. Omitted or `latest`: resolve the provider's
+        /// newest published release through its feed and install that
+        /// concrete tag (recorded as-is in the inventory, so `runner
+        /// list` and re-installs always name a real tag).
+        //
         // The arg id avoids clashing with the standard `--version` flag
         // every command accepts (ADR 0004); `VERSION` stays the
         // placeholder either way.
         #[arg(id = "version_pin", value_name = "VERSION")]
-        version: String,
+        version: Option<String>,
     },
     /// List every runner: managed installs (the inventory) and
     /// discover-only host state (wine and umu-run on PATH, Steam Proton
@@ -776,10 +781,21 @@ fn resolvers_for(store: &TreeStore) -> ResolverSet {
 /// the storage-owned pipeline: fetch (resumable), verify (SHA-512 when
 /// the manifest names a checksum source), extract, probe, record — and
 /// the runtime dir is rebuildable from the recorded inventory (AC).
+/// What the progress line labels the download with (#37): a concrete pin
+/// is its own label; the `latest` sentinel is not (the tag only exists
+/// after resolution, inside the pipeline) — the provider's name stands in.
+fn progress_label(provider: &str, pin: &str) -> String {
+    if pin == cellar_core::manifest::LATEST_PIN {
+        provider.to_owned()
+    } else {
+        pin.to_owned()
+    }
+}
+
 fn run_runner_install(
     store: &TreeStore,
     provider: &str,
-    version: &str,
+    version: Option<&str>,
     quiet: bool,
 ) -> anyhow::Result<ExitCode> {
     let known: Vec<String> = all_managed()
@@ -795,20 +811,32 @@ fn run_runner_install(
                 known.join(", ")
             )
         })?;
+    // An omitted pin is the `latest` sentinel (#65): the pipeline
+    // resolves it through the provider's feed and installs the concrete
+    // tag — which is what the narration below reports, read back from
+    // the install directory. Until then the renderer labels the
+    // download by the provider (the tag is not known yet).
+    let pin = version.unwrap_or(cellar_core::manifest::LATEST_PIN);
     let service = RunnerService::new(store.clone());
     // Presentation owns the screen (ADR 0004): the storage pipeline
     // reports phase events through the threaded callback, and this
     // renderer draws them — stderr only, TTY-gated, --quiet-silenced
     // (#37). The final line below keeps its stdout narration contract.
-    let mut progress = ProgressRenderer::for_stderr(version, quiet);
-    let result = service.install(manifest.manifest(), version, &mut |event| {
+    let mut progress = ProgressRenderer::for_stderr(progress_label(provider, pin), quiet);
+    let result = service.install(manifest.manifest(), pin, &mut |event| {
         progress.event(&event);
     });
     progress.finish();
     let dir = result?;
     narrate(
         quiet,
-        format_args!("Installed {provider} {version} at {}", dir.display()),
+        format_args!(
+            "Installed {provider} {} at {}",
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(pin),
+            dir.display()
+        ),
     );
     Ok(ExitCode::SUCCESS)
 }
@@ -974,7 +1002,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         },
         Command::Runner(args) => match args.command {
             RunnerCommand::Install { provider, version } => {
-                run_runner_install(&store, &provider, &version, quiet)
+                run_runner_install(&store, &provider, version.as_deref(), quiet)
             }
             RunnerCommand::List { json } => run_runner_list(&store, json, color),
         },
@@ -2796,6 +2824,45 @@ mod tests {
     }
 
     #[test]
+    fn progress_label_names_the_provider_for_the_latest_sentinel() {
+        // The download line cannot know the resolved tag before the feed
+        // answers (#65 follow-up): `latest` is labeled by the provider;
+        // a concrete pin labels itself.
+        assert_eq!(progress_label("proton", "GE-Proton11-5"), "GE-Proton11-5");
+        assert_eq!(progress_label("umu", "latest"), "umu");
+    }
+
+    #[test]
+    fn parses_runner_install_with_an_optional_version_pin() {
+        // The pin is optional (#65): an omitted pin — or the literal
+        // `latest` — resolves through the provider's release feed at
+        // install time; a concrete tag passes through as before.
+        let cli = Cli::try_parse_from(["cellar", "runner", "install", "proton"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Runner(RunnerArgs {
+            command: RunnerCommand::Install { provider, version },
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(provider, "proton");
+        assert!(version.is_none(), "an omitted pin means latest");
+        let cli = Cli::try_parse_from(["cellar", "runner", "install", "umu", "latest"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Runner(RunnerArgs {
+            command: RunnerCommand::Install { provider, version },
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(
+            (provider.as_str(), version.as_deref()),
+            ("umu", Some("latest")),
+            "the literal sentinel passes through to the pipeline"
+        );
+    }
+
+    #[test]
     fn parses_list_and_uninstall() {
         let cli = Cli::try_parse_from(["cellar", "list", "--json"])
             .unwrap_or_else(|e| panic!("parse: {e}"));
@@ -3955,7 +4022,7 @@ mod tests {
             std::process::id()
         ));
         let store = TreeStore::new(home.join("cellar"));
-        let err = run_runner_install(&store, "cartman", "9.0", false)
+        let err = run_runner_install(&store, "cartman", Some("9.0"), false)
             .expect_err("an unknown provider is an operation error, never a guess");
         assert!(
             err.to_string().contains("proton") && err.to_string().contains("umu"),

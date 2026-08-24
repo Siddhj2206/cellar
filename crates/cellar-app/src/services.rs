@@ -2851,6 +2851,7 @@ mod tests {
             source: cellar_core::manifest::ReleaseSource {
                 url_template: "https://example.test/{tag}-{arch}.tar.gz".to_owned(),
                 checksum_url_template: None,
+                latest_url: None,
             },
             checksum: cellar_core::manifest::ChecksumScheme::Sha512,
             archive: cellar_core::manifest::ArchiveLayout::ExtractsToSingleRootDir,

@@ -56,6 +56,10 @@ impl UmuProvider {
                     // zipapp — the pipeline installs it unverified (research
                     // #18; a truncated artifact still fails at extraction).
                     checksum_url_template: None,
+                    latest_url: Some(
+                        "https://github.com/Open-Wine-Components/umu-launcher/releases/latest"
+                            .to_owned(),
+                    ),
                 },
                 checksum: ChecksumScheme::Sha512,
                 archive: ArchiveLayout::ExtractsToSingleRootDir,
