@@ -427,7 +427,6 @@ mod tests {
         let root = home("path");
         let path_dir = root.join("bin");
         write_executable(&path_dir.join("umu-run"), b"#!/bin/sh\nexit 0\n");
-        let provider = UmuProvider::with_runtime(root.join("runtime"));
         let spec = RunnerSpec::new(RunnerFamily::Umu);
         let resolved = UmuProvider::resolve_inner(
             &spec,
