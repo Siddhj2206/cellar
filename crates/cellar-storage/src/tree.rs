@@ -30,7 +30,7 @@ use cellar_core::entities::{AppEntry, Candidate, Prefix, PrefixDefaults, Setting
 use cellar_core::errors::StorageError;
 use cellar_core::health::TreeHealth;
 use cellar_core::manifest::{ManagedRecord, RunnerManifest};
-use cellar_core::ports::Storage;
+use cellar_core::ports::{InstallProgress, Storage};
 use cellar_core::slug;
 
 use crate::lnk;
@@ -664,8 +664,9 @@ impl Storage for TreeStore {
         &self,
         manifest: &RunnerManifest,
         version: &str,
+        progress: &mut dyn FnMut(InstallProgress),
     ) -> Result<PathBuf, StorageError> {
-        crate::installer::install(&self.root, manifest, version)
+        crate::installer::install(&self.root, manifest, version, progress)
     }
 
     fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError> {
@@ -1558,7 +1559,7 @@ mod tests {
         };
         // A missing artifact is a pipeline failure, not a stub.
         let err = store
-            .install_managed(&manifest, "9.0-4")
+            .install_managed(&manifest, "9.0-4", &mut |_| {})
             .expect_err("a missing artifact fails the pipeline");
         assert!(matches!(err, StorageError::Artifact(_)) || matches!(err, StorageError::Io(_)));
         assert!(store.managed_inventory().unwrap().is_empty());

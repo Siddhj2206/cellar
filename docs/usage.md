@@ -143,6 +143,11 @@ SHA-512 where one exists, extract, probe, and record in the authoritative invent
 an already-installed version is a no-op, and a wiped `runtime/` can be restored by reinstalling the
 recorded versions.
 
+Downloads show phase progress — `Downloading GE-Proton11-5  143.2 MB / 402.1 MB (36%)`, then
+`Verifying SHA-512…` and `Extracting…` — on **stderr**, repainted in place while they run. Piping
+stdout keeps yielding clean data, piping stderr prints no progress at all, and `--quiet` silences it;
+the final `Installed … at …` line stays on stdout as usual.
+
 `cellar runner list` merges two worlds: managed installs from the inventory, and discover-only host
 state — system wine and `umu-run` on `PATH`, plus Steam's Proton builds — shown strictly read-only.
 Cellar never modifies anything it discovers.

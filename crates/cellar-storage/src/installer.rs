@@ -19,8 +19,14 @@
 //! resumption is uniform: a `Range` request continues a `.part` file, and
 //! a server that ignores the range restarts the download from zero — never
 //! a corrupted append.
+//!
+//! The pipeline never prints (#37): phase progress — download offsets,
+//! verify, extract — is *reported* through the caller-supplied callback
+//! threaded in from presentation ([`InstallProgress`]), which decides what
+//! reaches a screen (the CLI draws stderr lines).
 
 use cellar_core::manifest::{InstallKind, ManagedInventory, ManagedRecord, RunnerManifest};
+use cellar_core::ports::InstallProgress;
 
 use flate2::read::GzDecoder;
 use fs2::FileExt;
@@ -65,6 +71,7 @@ pub(crate) fn install(
     root: &Path,
     manifest: &RunnerManifest,
     version: &str,
+    progress: &mut dyn FnMut(InstallProgress),
 ) -> Result<PathBuf, StorageError> {
     validate_version_pin(version)?;
     let arch = target_arch()?;
@@ -106,8 +113,12 @@ pub(crate) fn install(
     let artifact = downloads.join(&artifact_name);
     let source = ArtifactSource::parse(&artifact_url)
         .ok_or_else(|| StorageError::Artifact(format!("unusable source URL: {artifact_url}")))?;
-    download_resumable(&source, &artifact)?;
+    download_resumable(&source, &artifact, progress)?;
     if let Some(template) = &manifest.source.checksum_url_template {
+        // The verify phase opens before the digest is even fetched: the
+        // tiny `.sha512sum` request and the whole-artifact hash pass are
+        // one phase to the user (#37).
+        progress(InstallProgress::Verify);
         let checksum_url = substitute(template, version, arch);
         let checksum = fetch_checksum(&checksum_url, &downloads, &artifact_name)?;
         // The declared checksum is mandatory: a mismatch discards the
@@ -121,6 +132,7 @@ pub(crate) fn install(
 
     // Extract into a private temp dir, then move the single root into its
     // final name — the install dir appears atomically.
+    progress(InstallProgress::Extract);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = root.join("runtime").join(format!(
         ".install-{}-{}-{seq}",
@@ -321,18 +333,39 @@ impl ArtifactSource {
         None
     }
 
-    /// Stream from byte `from` onward into `out`. For `https` a `Range`
+    /// Stream from byte `from` onward into `out`, reporting `Download`
+    /// progress: one event up front (the resume offset — where this
+    /// attempt starts), then one per copied chunk. For `https` a `Range`
     /// request is sent when resuming; a server that ignores it (200)
     /// restarts the file from zero — never a corrupted tail append.
-    fn stream_from(&self, from: u64, out: &mut fs::File) -> Result<(), StorageError> {
+    fn stream_from(
+        &self,
+        from: u64,
+        out: &mut fs::File,
+        progress: &mut dyn FnMut(InstallProgress),
+    ) -> Result<(), StorageError> {
         match self {
             Self::File(path) => {
                 let mut input = fs::File::open(path)
                     .map_err(|error| StorageError::Io(format!("{}: {error}", path.display())))?;
+                let total = input
+                    .metadata()
+                    .map_err(|error| StorageError::Io(format!("{}: {error}", path.display())))?
+                    .len();
                 input.seek(SeekFrom::Start(from)).map_err(|error| {
                     StorageError::Artifact(format!("seek {}: {error}", path.display()))
                 })?;
-                io::copy(&mut input, out)
+                progress(InstallProgress::Download {
+                    offset: from,
+                    total: Some(total),
+                });
+                let mut counted = CountingRead {
+                    inner: &mut input,
+                    offset: from,
+                    total: Some(total),
+                    progress,
+                };
+                io::copy(&mut counted, out)
                     .map_err(|error| StorageError::Io(format!("copy: {error}")))?;
             }
             Self::Http(url) => {
@@ -343,17 +376,13 @@ impl ArtifactSource {
                 let response = request
                     .call()
                     .map_err(|error| StorageError::Artifact(format!("fetch {url}: {error}")))?;
+                // The server ignored the range (200), or the resume
+                // offset exceeds the current content (416 — a stale
+                // oversized `.part`): restart from zero, never append
+                // a corrupted tail.
+                let mut effective_from = from;
                 match response.status() {
-                    // The server ignored the range (200), or the resume
-                    // offset exceeds the current content (416 — a stale
-                    // oversized `.part`): restart from zero, never append
-                    // a corrupted tail.
-                    200 | 416 => {
-                        out.set_len(0)
-                            .map_err(|error| StorageError::Io(format!("truncate: {error}")))?;
-                        out.seek(SeekFrom::Start(0))
-                            .map_err(|error| StorageError::Io(format!("seek: {error}")))?;
-                    }
+                    200 | 416 => effective_from = 0,
                     206 => {}
                     status => {
                         return Err(StorageError::Artifact(format!(
@@ -361,8 +390,31 @@ impl ArtifactSource {
                         )));
                     }
                 }
+                // A range response's Content-Length names only the served
+                // remainder; the artifact total is that plus the resume
+                // offset. No length header (chunked) → no total to report.
+                let total = response
+                    .header("Content-Length")
+                    .and_then(|length| length.parse().ok())
+                    .map(|length: u64| effective_from + length);
+                if effective_from == 0 {
+                    out.set_len(0)
+                        .map_err(|error| StorageError::Io(format!("truncate: {error}")))?;
+                    out.seek(SeekFrom::Start(0))
+                        .map_err(|error| StorageError::Io(format!("seek: {error}")))?;
+                }
+                progress(InstallProgress::Download {
+                    offset: effective_from,
+                    total,
+                });
                 let mut reader = response.into_reader();
-                io::copy(&mut reader, out)
+                let mut counted = CountingRead {
+                    inner: &mut reader,
+                    offset: effective_from,
+                    total,
+                    progress,
+                };
+                io::copy(&mut counted, out)
                     .map_err(|error| StorageError::Io(format!("copy: {error}")))?;
             }
         }
@@ -371,15 +423,43 @@ impl ArtifactSource {
     }
 }
 
+/// A Read adapter that counts forwarded bytes and reports each chunk as a
+/// `Download` progress event (#37) — the byte offset rides the copy loop
+/// itself, so the percentage is nearly free. One final zero-byte read at
+/// EOF also reports, pinning the last tick at exactly `total`.
+struct CountingRead<'a, R: io::Read> {
+    inner: R,
+    offset: u64,
+    total: Option<u64>,
+    progress: &'a mut dyn FnMut(InstallProgress),
+}
+
+impl<R: io::Read> io::Read for CountingRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.offset += u64::try_from(read).unwrap_or(u64::MAX);
+        (self.progress)(InstallProgress::Download {
+            offset: self.offset,
+            total: self.total,
+        });
+        Ok(read)
+    }
+}
+
 /// The resumable download: continue from the `.part` file's current size
 /// (a prior interrupted run), or start fresh. The part becomes the
 /// artifact file only after verification (the caller renames it post-
 /// checksum — a corrupt download is deleted, never cached as complete).
-fn download_resumable(source: &ArtifactSource, artifact: &Path) -> Result<(), StorageError> {
+fn download_resumable(
+    source: &ArtifactSource,
+    artifact: &Path,
+    progress: &mut dyn FnMut(InstallProgress),
+) -> Result<(), StorageError> {
     if artifact.is_file() {
         // A previously completed and verified artifact in the disposable
         // cache — reuse it (the cache is disposable: remove it to fetch
-        // again).
+        // again). No download happens, so no Download events fire; verify
+        // and extract still report.
         return Ok(());
     }
     let part = artifact.with_extension("part");
@@ -389,9 +469,11 @@ fn download_resumable(source: &ArtifactSource, artifact: &Path) -> Result<(), St
         .open(&part)
         .map_err(storage_io(&part))?;
     let from = out.metadata().map_err(storage_io(&part))?.len();
-    source.stream_from(from, &mut out).map_err(|error| {
-        StorageError::Artifact(format!("download to {}: {error}", part.display()))
-    })?;
+    source
+        .stream_from(from, &mut out, progress)
+        .map_err(|error| {
+            StorageError::Artifact(format!("download to {}: {error}", part.display()))
+        })?;
     // The download completed: promote the part for verification.
     fs::rename(&part, artifact).map_err(storage_io(artifact))
 }
@@ -410,7 +492,10 @@ fn fetch_checksum(
         .ok_or_else(|| StorageError::Artifact(format!("unusable checksum URL: {url}")))?;
     let file = downloads.join(format!("{artifact_name}.sha512sum"));
     let mut out = fs::File::create(&file).map_err(storage_io(&file))?;
-    source.stream_from(0, &mut out)?;
+    // The checksum side-load is not artifact download progress: its bytes
+    // are reported through a no-op callback (#37 — the CLI's download
+    // line tracks the artifact only).
+    source.stream_from(0, &mut out, &mut |_| {})?;
     let text = fs::read_to_string(&file).map_err(storage_io(&file))?;
     for line in text.lines() {
         // `sha512sum` output: `<hex>  <name>` (two spaces) or `<hex> *<name>`.
@@ -756,6 +841,8 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -775,6 +862,41 @@ mod tests {
     /// `{arch}` from the same constant).
     fn arch() -> &'static str {
         std::env::consts::ARCH
+    }
+
+    /// Install with progress discarded — most of these tests are not
+    /// about #37's callback.
+    fn install_quiet(
+        root: &Path,
+        manifest: &RunnerManifest,
+        version: &str,
+    ) -> Result<PathBuf, StorageError> {
+        install(root, manifest, version, &mut |_| {})
+    }
+
+    /// A shared event sink for the #37 tests: hand the returned closure
+    /// to `install`, read `events` afterwards. The callback is `FnMut`,
+    /// so shared ownership keeps the sequence assertable post-return.
+    fn collector() -> (
+        Rc<RefCell<Vec<InstallProgress>>>,
+        impl FnMut(InstallProgress),
+    ) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&events);
+        (events, move |event| sink.borrow_mut().push(event))
+    }
+
+    /// The event sequence as phase tags — `D`ownload ticks, `V`erify,
+    /// `E`xtract — so order assertions read like the pipeline's shape.
+    fn tags(events: &[InstallProgress]) -> Vec<char> {
+        events
+            .iter()
+            .map(|event| match event {
+                InstallProgress::Download { .. } => 'D',
+                InstallProgress::Verify => 'V',
+                InstallProgress::Extract => 'E',
+            })
+            .collect()
     }
 
     /// Build a GE-Proton-shaped fixture tarball: a single top-level
@@ -900,7 +1022,7 @@ mod tests {
         fs::create_dir_all(&fixtures).expect("fixtures dir");
         let sentinel = root.join("evil");
         fs::write(&sentinel, "untouched").expect("sentinel");
-        let err = install(&root, &proton_manifest(&fixtures, "x"), "../evil")
+        let err = install_quiet(&root, &proton_manifest(&fixtures, "x"), "../evil")
             .expect_err("a traversal pin is refused");
         assert!(err.to_string().contains("invalid version pin"), "{err}");
         assert_eq!(
@@ -913,7 +1035,7 @@ mod tests {
         );
         assert!(
             matches!(
-                install(&root, &proton_manifest(&fixtures, "x"), ".."),
+                install_quiet(&root, &proton_manifest(&fixtures, "x"), ".."),
                 Err(StorageError::Artifact(_))
             ),
             "the dot-dot pin is refused too"
@@ -962,7 +1084,7 @@ mod tests {
         write_checksum(&fixtures, &path, &format!("{version}-{}.tar.gz", arch()));
 
         let install_dir =
-            install(&root, &proton_manifest(&fixtures, version), version).expect("install");
+            install_quiet(&root, &proton_manifest(&fixtures, version), version).expect("install");
         let link = install_dir.join("files/link");
         assert_eq!(
             fs::read_link(&link).expect("readlink"),
@@ -986,7 +1108,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("dir");
         fs::write(dir.join("proton"), "#!/bin/sh\nexit 0\n").expect("probe target");
         set_mode(&dir.join("proton"), 0o755).expect("executable probe");
-        install(&root, &proton_manifest(&fixtures, version), version).expect("no-op install");
+        install_quiet(&root, &proton_manifest(&fixtures, version), version).expect("no-op install");
         let records = inventory(&root).expect("inventory");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].version, version);
@@ -1002,7 +1124,7 @@ mod tests {
         write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
 
         let manifest = proton_manifest(&fixtures, version);
-        let install_dir = install(&root, &manifest, version).expect("install");
+        let install_dir = install_quiet(&root, &manifest, version).expect("install");
         assert_eq!(
             install_dir,
             root.join("runtime/proton/GE-Proton11-5"),
@@ -1019,7 +1141,7 @@ mod tests {
         assert_eq!(records[0].install, "proton/GE-Proton11-5");
         // Idempotent: a second install is a no-op returning the same dir.
         assert_eq!(
-            install(&root, &manifest, version).expect("re-install"),
+            install_quiet(&root, &manifest, version).expect("re-install"),
             install_dir
         );
         assert_eq!(inventory(&root).expect("inventory").len(), 1);
@@ -1039,7 +1161,7 @@ mod tests {
             format!("00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  {version}-{}.tar.gz", arch()),
         )
         .expect("bad checksum");
-        let err = install(&root, &proton_manifest(&fixtures, version), version)
+        let err = install_quiet(&root, &proton_manifest(&fixtures, version), version)
             .expect_err("a corrupt download must fail");
         assert!(matches!(err, StorageError::Artifact(_)), "{err}");
         assert!(
@@ -1050,7 +1172,8 @@ mod tests {
         // The corrupt download is discarded — a re-run refetches and, with
         // the checksum fixed, succeeds.
         write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
-        install(&root, &proton_manifest(&fixtures, version), version).expect("re-run succeeds");
+        install_quiet(&root, &proton_manifest(&fixtures, version), version)
+            .expect("re-run succeeds");
     }
 
     #[test]
@@ -1071,8 +1194,8 @@ mod tests {
         let whole = fs::read(&tarball).expect("fixture bytes");
         fs::write(&part, &whole[..7]).expect("partial download");
 
-        let install_dir =
-            install(&root, &proton_manifest(&fixtures, version), version).expect("install resumes");
+        let install_dir = install_quiet(&root, &proton_manifest(&fixtures, version), version)
+            .expect("install resumes");
         assert!(executable_file(&install_dir.join("proton")));
         // The completed artifact is byte-identical to the fixture — a
         // resumed append never corrupts.
@@ -1092,10 +1215,10 @@ mod tests {
 
         let root_a = root.clone();
         let manifest_a = manifest.clone();
-        let a = std::thread::spawn(move || install(&root_a, &manifest_a, version));
+        let a = std::thread::spawn(move || install_quiet(&root_a, &manifest_a, version));
         let root_b = root.clone();
         let manifest_b = manifest.clone();
-        let b = std::thread::spawn(move || install(&root_b, &manifest_b, version));
+        let b = std::thread::spawn(move || install_quiet(&root_b, &manifest_b, version));
         let (a, b) = (a.join().expect("thread a"), b.join().expect("thread b"));
         assert_eq!(
             a.expect("install a"),
@@ -1116,7 +1239,7 @@ mod tests {
         let version = "1.4.4";
         umu_tarball(&fixtures, version);
         let install_dir =
-            install(&root, &umu_manifest(&fixtures, version), version).expect("umu install");
+            install_quiet(&root, &umu_manifest(&fixtures, version), version).expect("umu install");
         assert_eq!(install_dir, root.join("runtime/umu/1.4.4"));
         assert!(
             executable_file(&install_dir.join("umu-run")),
@@ -1177,7 +1300,7 @@ mod tests {
 
         let manifest = proton_manifest(&fixtures, version);
         write_checksum(&fixtures, &path, &format!("{version}-{}.tar.gz", arch()));
-        let err = install(&root, &manifest, version).expect_err("traversal refused");
+        let err = install_quiet(&root, &manifest, version).expect_err("traversal refused");
         assert!(err.to_string().contains("escape"), "{err}");
         assert!(
             !root.join("runtime/proton/GE-Proton11-5").exists(),
@@ -1200,7 +1323,7 @@ mod tests {
         finish_tarball(tar);
         let manifest = proton_manifest(&fixtures, version);
         write_checksum(&fixtures, &path, &format!("{version}-{}.tar.gz", arch()));
-        let err = install(&root, &manifest, version).expect_err("two roots refused");
+        let err = install_quiet(&root, &manifest, version).expect_err("two roots refused");
         assert!(err.to_string().contains("single top-level"), "{err}");
     }
 
@@ -1217,7 +1340,7 @@ mod tests {
         append_file(&mut tar, "GE-Proton11-5/garbage", 0o644, "not a proton");
         finish_tarball(tar);
         write_checksum(&fixtures, &path, &format!("{version}-{}.tar.gz", arch()));
-        let err = install(&root, &proton_manifest(&fixtures, version), version)
+        let err = install_quiet(&root, &proton_manifest(&fixtures, version), version)
             .expect_err("a non-proton artifact is refused");
         assert!(
             err.to_string()
@@ -1236,7 +1359,7 @@ mod tests {
         let tarball = proton_tarball(&fixtures, version);
         fs::write(&tarball, b"this is not a gzip stream").expect("garbage");
         write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
-        let err = install(&root, &proton_manifest(&fixtures, version), version)
+        let err = install_quiet(&root, &proton_manifest(&fixtures, version), version)
             .expect_err("garbage archive refused");
         assert!(matches!(err, StorageError::Artifact(_)) || matches!(err, StorageError::Io(_)));
         assert!(!root.join("runtime/proton/GE-Proton11-5").exists());
@@ -1255,7 +1378,7 @@ mod tests {
         let tarball = proton_tarball(&fixtures, version);
         write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
         let manifest = proton_manifest(&fixtures, version);
-        install(&root, &manifest, version).expect("install");
+        install_quiet(&root, &manifest, version).expect("install");
 
         fs::remove_dir_all(root.join("runtime/proton")).expect("install wiped");
         fs::remove_dir_all(root.join("cache")).expect("cache wiped");
@@ -1265,7 +1388,7 @@ mod tests {
             (record.provider_id.as_str(), record.version.as_str()),
             ("proton", version)
         );
-        let rebuilt = install(&root, &manifest, &record.version).expect("rebuild");
+        let rebuilt = install_quiet(&root, &manifest, &record.version).expect("rebuild");
         assert!(executable_file(&rebuilt.join("proton")));
     }
 
@@ -1306,9 +1429,195 @@ mod tests {
             archive: ArchiveLayout::ExtractsToSingleRootDir,
             install_kind: InstallKind::CompatTool,
         };
-        let install_dir = install(&root, &manifest, version).expect("http install");
+        let install_dir = install_quiet(&root, &manifest, version).expect("http install");
         assert!(executable_file(&install_dir.join("proton")));
         let _ = server;
+    }
+
+    #[test]
+    fn progress_reports_download_ticks_then_verify_then_extract() {
+        // AC (#37): the callback event sequence over the real transport —
+        // download ticks first (offsets rising to the artifact size), one
+        // Verify, then Extract last. The local Range-capable server from
+        // #34 serves the bytes.
+        let root = root("progress-http");
+        let version = "GE-Proton11-5";
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let tarball = proton_tarball(&fixtures, version);
+        let artifact_bytes = Arc::new(fs::read(&tarball).expect("artifact bytes"));
+        let checksum_hex =
+            write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
+        let checksum_bytes =
+            Arc::new(format!("{checksum_hex}  {version}-{}.tar.gz\n", arch()).into_bytes());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                serve_one(&mut stream, &artifact_bytes, &checksum_bytes);
+            }
+        });
+
+        let manifest = RunnerManifest {
+            provider_id: "proton".to_owned(),
+            source: ReleaseSource {
+                url_template: format!("http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz"),
+                checksum_url_template: Some(format!(
+                    "http://127.0.0.1:{port}/{{tag}}-{{arch}}.tar.gz.sha512sum"
+                )),
+            },
+            checksum: ChecksumScheme::Sha512,
+            archive: ArchiveLayout::ExtractsToSingleRootDir,
+            install_kind: InstallKind::CompatTool,
+        };
+        let (events, mut report) = collector();
+        install(&root, &manifest, version, &mut report).expect("http install with progress");
+
+        let events = events.borrow();
+        let tags = tags(&events);
+        assert_eq!(
+            tags.last(),
+            Some(&'E'),
+            "extraction is the last phase: {events:?}"
+        );
+        assert_eq!(
+            tags.iter().rev().take(2).collect::<Vec<_>>(),
+            vec![&'E', &'V'],
+            "verify directly precedes extract: {events:?}"
+        );
+        assert!(
+            tags[..tags.len() - 2].iter().all(|tag| *tag == 'D'),
+            "every earlier event is a download tick (no checksum-fetch noise): {events:?}"
+        );
+
+        let total = u64::try_from(
+            fs::read(
+                root.join("cache")
+                    .join("downloads")
+                    .join(format!("{version}-{}.tar.gz", arch())),
+            )
+            .expect("cached artifact")
+            .len(),
+        )
+        .expect("fits");
+        let mut previous = 0u64;
+        for event in events.iter() {
+            let InstallProgress::Download {
+                offset,
+                total: announced,
+            } = event
+            else {
+                break;
+            };
+            assert_eq!(*announced, Some(total), "the total is known and stable");
+            assert!(*offset >= previous, "offsets never go back: {event:?}");
+            previous = *offset;
+        }
+        assert_eq!(previous, total, "the last tick lands exactly on the total");
+        let _ = server;
+    }
+
+    #[test]
+    fn a_resumed_download_reports_the_resume_offset_first() {
+        // The initial tick names where this attempt starts — a resumed
+        // `.part` continues at its own length, so the CLI's percentage
+        // picks up mid-download instead of restarting at zero.
+        let root = root("progress-resume");
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let version = "GE-Proton11-5";
+        let tarball = proton_tarball(&fixtures, version);
+        write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
+        let whole = fs::read(&tarball).expect("fixture bytes");
+        // The pipeline's part name: `with_extension("part")` on the
+        // artifact (`…x86_64.tar.gz`) replaces only its last extension —
+        // the fixture must sit exactly where the resume looks.
+        let part = root
+            .join("cache/downloads")
+            .join(format!("{version}-{}.tar.part", arch()));
+        fs::create_dir_all(part.parent().expect("downloads dir")).expect("cache dir");
+        fs::write(&part, &whole[..7]).expect("partial download");
+
+        let manifest = proton_manifest(&fixtures, version);
+        let (events, mut report) = collector();
+        install(&root, &manifest, version, &mut report).expect("resumed install");
+
+        let events = events.borrow();
+        let total = u64::try_from(whole.len()).expect("fits");
+        match events.first() {
+            Some(InstallProgress::Download {
+                offset,
+                total: announced,
+            }) => {
+                assert_eq!(*offset, 7, "the resume offset opens the phase");
+                assert_eq!(*announced, Some(total));
+            }
+            other => panic!("the first event is a download tick, got {other:?}"),
+        }
+        let last_download = events
+            .iter()
+            .rev()
+            .find(|event| matches!(event, InstallProgress::Download { .. }))
+            .expect("at least one download tick");
+        assert_eq!(
+            last_download,
+            &InstallProgress::Download {
+                offset: total,
+                total: Some(total)
+            },
+            "the final tick lands on the completed artifact"
+        );
+        // And the phases still close in order around the ticks.
+        assert!(tags(&events).ends_with(&['V', 'E']), "{events:?}");
+    }
+
+    #[test]
+    fn a_cached_artifact_skips_download_but_still_verifies_and_extracts() {
+        // A complete artifact in the disposable cache means no download
+        // runs — so no Download events fire — but verify and extract are
+        // real phases of the run and report as such (#37).
+        let root = root("progress-cached");
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let version = "GE-Proton11-5";
+        let tarball = proton_tarball(&fixtures, version);
+        write_checksum(&fixtures, &tarball, &format!("{version}-{}.tar.gz", arch()));
+        let manifest = proton_manifest(&fixtures, version);
+        install_quiet(&root, &manifest, version).expect("first install fills the cache");
+
+        // Wipe the runtime: the next install reuses only the cached
+        // artifact (the idempotent no-op would fire no phases at all).
+        fs::remove_dir_all(root.join("runtime/proton")).expect("runtime wiped");
+        let (events, mut report) = collector();
+        install(&root, &manifest, version, &mut report).expect("install from cache");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [InstallProgress::Verify, InstallProgress::Extract],
+            "no download ticks for a cached artifact"
+        );
+    }
+
+    #[test]
+    fn a_checksum_less_manifest_skips_the_verify_phase() {
+        // umu publishes no digest (research #18): its manifest names no
+        // checksum source, so there is nothing to verify — the event
+        // sequence goes straight from download ticks to extract.
+        let root = root("progress-umu");
+        let fixtures = root.join("fixtures");
+        fs::create_dir_all(&fixtures).expect("fixtures dir");
+        let version = "1.4.4";
+        umu_tarball(&fixtures, version);
+        let manifest = umu_manifest(&fixtures, version);
+        let (events, mut report) = collector();
+        install(&root, &manifest, version, &mut report).expect("umu install with progress");
+
+        let tags = tags(&events.borrow());
+        assert!(
+            !tags.contains(&'V') && tags.ends_with(&['D', 'E']),
+            "download ticks then extract, never verify: {tags:?}"
+        );
     }
 
     /// One HTTP/1.1 exchange: reads the request line + headers, honors a

@@ -28,7 +28,9 @@ use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
 use cellar_core::errors::{DesktopError, ResolveError, StorageError};
 use cellar_core::health::TreeHealth;
 use cellar_core::manifest::{ManagedRecord, RunnerManifest};
-use cellar_core::ports::{DesktopIntegrator, RunnerResolver, Storage, WrapperContributor};
+use cellar_core::ports::{
+    DesktopIntegrator, InstallProgress, RunnerResolver, Storage, WrapperContributor,
+};
 use cellar_core::slug;
 use cellar_core::types::{LaunchPlan, ResolvedRunner, RunnerFamily, RunnerSpec};
 use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
@@ -712,12 +714,15 @@ impl<S: Storage> RunnerService<S> {
     /// Install one managed runner version: fetch → verify → extract →
     /// record (the shared pipeline). Idempotent — an installed version
     /// returns its directory unchanged. Returns the install directory.
+    /// Phase progress is *reported* through `progress` (#37) — the
+    /// pipeline never prints; rendering belongs to presentation (ADR 0004).
     pub fn install(
         &self,
         manifest: &RunnerManifest,
         version: &str,
+        progress: &mut dyn FnMut(InstallProgress),
     ) -> Result<PathBuf, StorageError> {
-        self.storage.install_managed(manifest, version)
+        self.storage.install_managed(manifest, version, progress)
     }
 
     /// The authoritative inventory (`runtime/providers.toml`): every
@@ -1447,7 +1452,7 @@ mod tests {
     use cellar_core::errors::{DesktopError, ResolveError, StorageError};
     use cellar_core::health::TreeHealth;
     use cellar_core::manifest::{ManagedRecord, RunnerManifest};
-    use cellar_core::ports::{__sealed, DesktopIntegrator, RunnerResolver};
+    use cellar_core::ports::{__sealed, DesktopIntegrator, InstallProgress, RunnerResolver};
     use cellar_core::types::{
         ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
     };
@@ -1752,6 +1757,7 @@ mod tests {
             &self,
             manifest: &RunnerManifest,
             version: &str,
+            _progress: &mut dyn FnMut(InstallProgress),
         ) -> Result<PathBuf, StorageError> {
             // The pipeline is storage-tested; the mock records the pin
             // and reports the version's dir.
@@ -2850,7 +2856,7 @@ mod tests {
             archive: cellar_core::manifest::ArchiveLayout::ExtractsToSingleRootDir,
             install_kind: cellar_core::manifest::InstallKind::CompatTool,
         };
-        let dir = service.install(&manifest, "GE-Proton11-5")?;
+        let dir = service.install(&manifest, "GE-Proton11-5", &mut |_| {})?;
         assert_eq!(dir, PathBuf::from("/mock/runtime/proton/GE-Proton11-5"));
         let installed = service.installed()?;
         assert_eq!(installed.len(), 1);

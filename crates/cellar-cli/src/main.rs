@@ -49,6 +49,13 @@
 //! plain tables). The `--json` shapes for `list`, `doctor`, and
 //! `launch --dry-run` (plus `prefix list` and `runner list`) are
 //! contractual — documented with samples in `docs/cli-json.md`.
+//!
+//! Runner installs are no longer silent (#37): the storage pipeline
+//! reports phase events through a threaded callback and this binary
+//! renders them — `Downloading <version> … MB / … MB (…%)` repainted in
+//! place, then `Verifying SHA-512…` and `Extracting…` — on stderr only,
+//! and only when stderr is a terminal; `--quiet` silences it all while
+//! stdout keeps yielding clean data under pipes.
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -58,12 +65,13 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use cellar_app::{
     ArtifactKind, DesktopSync, DoctorReport, DoctorService, InstallOutcome, InstallResult,
     InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService, RunnerService,
 };
-use cellar_core::ports::{__sealed, RunnerResolver, Storage};
+use cellar_core::ports::{__sealed, InstallProgress, RunnerResolver, Storage};
 use cellar_core::{
     AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerFamily,
     RunnerInstall, RunnerRef, RunnerSpec,
@@ -80,13 +88,13 @@ use cellar_storage::TreeStore;
     propagate_version = true,
     arg_required_else_help = true,
     help_template = "{about-with-newline}Examples:\n  cellar install setup.exe\n  cellar launch balatro --dry-run\n  cellar list --json\n  cellar doctor\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}",
-    after_help = "Exit codes: 0 success, 1 operation error, 2 usage — unknown commands and flags get \"Did you mean?\" suggestions;\nlaunch propagates the game's exit code raw. --quiet silences status narration (delivered data and errors still print);\ncolor appears only on a terminal without NO_COLOR — piped output is always plain."
+    after_help = "Exit codes: 0 success, 1 operation error, 2 usage — unknown commands and flags get \"Did you mean?\" suggestions;\nlaunch propagates the game's exit code raw. --quiet silences status narration and install progress (delivered data and errors still print);\ncolor appears only on a terminal without NO_COLOR — piped output is always plain."
 )]
 struct Cli {
-    /// Suppress non-essential output: status and summary narration.
-    /// Delivered data (tables, JSON, plans, reports, the `--detach`
-    /// pid/log line) and errors always print; prompts are untouched
-    /// (`--no-input` is the scripting lever).
+    /// Suppress non-essential output: status and summary narration,
+    /// and install progress. Delivered data (tables, JSON, plans,
+    /// reports, the `--detach` pid/log line) and errors always print;
+    /// prompts are untouched (`--no-input` is the scripting lever).
     #[arg(short = 'q', long, global = true)]
     quiet: bool,
     #[command(subcommand)]
@@ -522,6 +530,199 @@ fn narrate_err(quiet: bool, message: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Whether install progress renders (#37): the narration rules of ADR 0004
+/// and clig.dev — silenced by `--quiet`, and rendered only when stderr is
+/// a terminal. A piped stderr prints nothing at all; stdout stays
+/// pipe-clean data regardless.
+fn progress_enabled_impl(quiet: bool, stderr_is_terminal: bool) -> bool {
+    !quiet && stderr_is_terminal
+}
+
+/// Megabytes with one decimal — decimal MB, as release pages name sizes.
+/// Integer math only: whole MB plus the floored tenth, no float rounding.
+fn human_mb(bytes: u64) -> String {
+    format!("{}.{} MB", bytes / 1_000_000, (bytes % 1_000_000) / 100_000)
+}
+
+/// The download percentage rounded to nearest (143.2 of 402.1 → 36).
+/// The u128 intermediate cannot overflow for any real artifact size, and
+/// the result is bounded by 100 before the narrowing conversion.
+fn rounded_percent(offset: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    let offset = offset.min(total);
+    u64::try_from((u128::from(offset) * 100 + u128::from(total) / 2) / u128::from(total))
+        .unwrap_or(100)
+}
+
+/// One download line — the #37 contract shape:
+/// `Downloading GE-Proton11-5  143.2 MB / 402.1 MB (36%)`. An unknown
+/// total (a chunked source) drops the fraction tail honestly rather than
+/// inventing one.
+fn download_line(label: &str, offset: u64, total: Option<u64>) -> String {
+    match total.filter(|total| *total > 0) {
+        Some(total) => format!(
+            "Downloading {label}  {} / {} ({}%)",
+            human_mb(offset),
+            human_mb(total),
+            rounded_percent(offset, total)
+        ),
+        None => format!("Downloading {label}  {}", human_mb(offset)),
+    }
+}
+
+/// Phase-aware install progress rendering (#37): `Downloading <label>
+/// … MB / … MB (…%)` repainted in place on one stderr line, then
+/// `Verifying SHA-512…` and `Extracting…` lines as those phases open.
+/// No color styling is ever emitted; the one ANSI escape (clear-to-EOL)
+/// obeys the `NO_COLOR` contract like all color would (ADR 0004), and
+/// write errors are ignored — a closed stderr is the reader's choice,
+/// never an install failure.
+struct ProgressRenderer<W: std::io::Write> {
+    /// Where lines go; `None` renders nothing (`--quiet` or a piped
+    /// stderr) — every event is dropped before any byte is built.
+    sink: Option<W>,
+    /// Whether the ANSI clear-to-end-of-line escape may accompany the
+    /// carriage return: the color contract's `NO_COLOR` rule (any value,
+    /// empty included, disables — ADR 0004). The bare `\r` itself stays:
+    /// it is an ASCII control character, not an escape sequence.
+    clear: bool,
+    label: String,
+    /// Minimum interval between in-place repaints — a flood guard against
+    /// chunk-sized tick rates; zero in tests for deterministic bytes.
+    throttle: Duration,
+    /// A line is live on the terminal — a trailing newline is still owed.
+    painted: bool,
+    /// A tick arrived that has not been drawn; phase ends redraw it so a
+    /// throttled final state never lags into the next phase's line.
+    pending: bool,
+    /// The current download line's text (redrawn at phase boundaries).
+    last_line: Option<String>,
+    last_paint: Option<Instant>,
+}
+
+impl ProgressRenderer<std::io::Stderr> {
+    /// The stderr renderer of `runner install`: enabled exactly when
+    /// [`progress_enabled_impl`] says narration would be audible, with
+    /// ANSI escapes subject to the `NO_COLOR` contract.
+    fn for_stderr(label: impl Into<String>, quiet: bool) -> Self {
+        Self::new(
+            progress_enabled_impl(quiet, std::io::stderr().is_terminal()).then(std::io::stderr),
+            label,
+            Duration::from_millis(100),
+        )
+    }
+}
+
+impl<W: std::io::Write> ProgressRenderer<W> {
+    fn new(sink: Option<W>, label: impl Into<String>, throttle: Duration) -> Self {
+        Self {
+            sink,
+            // The pure color decision (ADR 0004): any `NO_COLOR` value —
+            // empty included — disables, terminal or not.
+            clear: std::env::var_os("NO_COLOR").is_none(),
+            label: label.into(),
+            throttle,
+            painted: false,
+            pending: false,
+            last_line: None,
+            last_paint: None,
+        }
+    }
+
+    /// Draw one pipeline phase event (#37's callback seam).
+    fn event(&mut self, event: &InstallProgress) {
+        match event {
+            InstallProgress::Download { offset, total } => {
+                self.tick(download_line(&self.label, *offset, *total));
+            }
+            InstallProgress::Verify => self.phase("Verifying SHA-512…"),
+            InstallProgress::Extract => self.phase("Extracting…"),
+        }
+    }
+
+    /// End of the command: close a dangling download line so whatever
+    /// prints next starts on a fresh line. A completed run never dangles
+    /// (extract closes it); this tidies failure paths.
+    fn finish(&mut self) {
+        if !self.painted {
+            return;
+        }
+        self.painted = false;
+        if let Some(sink) = self.sink.as_mut() {
+            let _ = sink.write_all(b"\n");
+            let _ = sink.flush();
+        }
+    }
+
+    /// One more byte count on the same line: first paint immediately,
+    /// repaints throttled. Undrawn ticks stay pending — a later phase
+    /// boundary flushes them.
+    fn tick(&mut self, line: String) {
+        if self.sink.is_none() {
+            return;
+        }
+        self.last_line = Some(line);
+        self.pending = true;
+        let due = self
+            .last_paint
+            .is_none_or(|at| at.elapsed() >= self.throttle);
+        if !self.painted || due {
+            self.redraw();
+        }
+    }
+
+    /// Paint the current line now: bare text on the first paint, carriage
+    /// return — plus clear-to-end-of-line when `NO_COLOR` allows ANSI —
+    /// before each repaint. One live line, never a scroll of stale
+    /// percentages.
+    fn redraw(&mut self) {
+        let Some(sink) = self.sink.as_mut() else {
+            return;
+        };
+        let Some(line) = &self.last_line else {
+            return;
+        };
+        if self.painted {
+            let _ = sink.write_all(b"\r");
+            if self.clear {
+                let _ = sink.write_all(b"\x1b[K");
+            }
+        }
+        let _ = sink.write_all(line.as_bytes());
+        let _ = sink.flush();
+        self.painted = true;
+        self.pending = false;
+        self.last_paint = Some(Instant::now());
+    }
+
+    /// Close the active line and open the next phase's own line.
+    fn phase(&mut self, text: &str) {
+        if self.sink.is_none() {
+            return;
+        }
+        if self.painted {
+            if self.pending {
+                // The throttle may have skipped the closing ticks: redraw
+                // the latest state before leaving the line, so the frozen
+                // percentage never lies about where the download ended.
+                self.redraw();
+            }
+            self.painted = false;
+            self.last_paint = None;
+            if let Some(sink) = self.sink.as_mut() {
+                let _ = sink.write_all(b"\n");
+            }
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            let _ = sink.write_all(text.as_bytes());
+            let _ = sink.write_all(b"\n");
+            let _ = sink.flush();
+        }
+    }
+}
+
 /// Pretty-print JSON with the one trailing newline pipes expect — the
 /// single shape every `--json` output ends with.
 fn pretty_json<T: serde::Serialize>(value: &T) -> anyhow::Result<String> {
@@ -595,7 +796,16 @@ fn run_runner_install(
             )
         })?;
     let service = RunnerService::new(store.clone());
-    let dir = service.install(manifest.manifest(), version)?;
+    // Presentation owns the screen (ADR 0004): the storage pipeline
+    // reports phase events through the threaded callback, and this
+    // renderer draws them — stderr only, TTY-gated, --quiet-silenced
+    // (#37). The final line below keeps its stdout narration contract.
+    let mut progress = ProgressRenderer::for_stderr(version, quiet);
+    let result = service.install(manifest.manifest(), version, &mut |event| {
+        progress.event(&event);
+    });
+    progress.finish();
+    let dir = result?;
     narrate(
         quiet,
         format_args!("Installed {provider} {version} at {}", dir.display()),
@@ -1886,6 +2096,157 @@ mod tests {
         assert_eq!(status_color("ok"), "32");
         assert_eq!(status_color("missing-exe"), "33");
         assert_eq!(status_color("broken-future-status"), "31");
+    }
+
+    #[test]
+    fn progress_renders_only_when_audible_and_terminal() {
+        // The #37 gates, pinned pure: `--quiet` silences everything, and
+        // a piped stderr prints nothing at all — stdout stays clean data
+        // either way.
+        assert!(progress_enabled_impl(false, true));
+        assert!(
+            !progress_enabled_impl(true, true),
+            "--quiet silences progress"
+        );
+        assert!(
+            !progress_enabled_impl(false, false),
+            "piped stderr prints no progress"
+        );
+    }
+
+    #[test]
+    fn download_lines_follow_the_contract_shape() {
+        // The issue's sample line, verbatim arithmetic: one-decimal MB,
+        // nearest-rounded percentage.
+        assert_eq!(
+            download_line("GE-Proton11-5", 143_200_000, Some(402_100_000)),
+            "Downloading GE-Proton11-5  143.2 MB / 402.1 MB (36%)"
+        );
+        assert_eq!(
+            download_line("GE-Proton11-5", 0, Some(402_100_000)),
+            "Downloading GE-Proton11-5  0.0 MB / 402.1 MB (0%)"
+        );
+        assert_eq!(
+            rounded_percent(402_100_000, 402_100_000),
+            100,
+            "the completed artifact reads exactly 100%"
+        );
+        assert_eq!(
+            download_line("umu", 999_999, None),
+            "Downloading umu  0.9 MB",
+            "an unknown total drops the fraction tail honestly"
+        );
+    }
+
+    #[test]
+    fn progress_repaints_one_line_then_phase_lines_terminate_it() {
+        // The TTY byte contract: the download repaints a single line
+        // (`\r` + clear-to-EOL), each later phase closes it and opens its
+        // own line — matching the issue's sample shape. `clear` is pinned
+        // so the assertion is hermetic of the ambient NO_COLOR.
+        let mut renderer = ProgressRenderer::new(Some(Vec::new()), "GE-Proton11-5", Duration::ZERO);
+        renderer.clear = true;
+        renderer.event(&InstallProgress::Download {
+            offset: 0,
+            total: Some(20_000_000),
+        });
+        renderer.event(&InstallProgress::Download {
+            offset: 10_000_000,
+            total: Some(20_000_000),
+        });
+        renderer.event(&InstallProgress::Verify);
+        renderer.event(&InstallProgress::Extract);
+        renderer.finish();
+        assert_eq!(
+            String::from_utf8(renderer.sink.take().unwrap_or_default()).expect("utf-8"),
+            "Downloading GE-Proton11-5  0.0 MB / 20.0 MB (0%)\r\x1b[K\
+             Downloading GE-Proton11-5  10.0 MB / 20.0 MB (50%)\n\
+             Verifying SHA-512…\nExtracting…\n",
+            "one live line per phase, in the sample's shape"
+        );
+    }
+
+    #[test]
+    fn a_throttled_final_tick_is_flushed_at_the_phase_boundary() {
+        // A repaint-skipping throttle must never freeze a stale
+        // percentage: the phase boundary redraws the latest pending tick
+        // before terminating the line.
+        let mut renderer =
+            ProgressRenderer::new(Some(Vec::new()), "GE-Proton11-5", Duration::from_secs(3600));
+        renderer.clear = true;
+        renderer.event(&InstallProgress::Download {
+            offset: 0,
+            total: Some(20_000_000),
+        });
+        renderer.event(&InstallProgress::Download {
+            offset: 12_000_000,
+            total: Some(20_000_000),
+        });
+        renderer.event(&InstallProgress::Verify);
+        assert_eq!(
+            String::from_utf8(renderer.sink.take().unwrap_or_default()).expect("utf-8"),
+            "Downloading GE-Proton11-5  0.0 MB / 20.0 MB (0%)\r\x1b[K\
+             Downloading GE-Proton11-5  12.0 MB / 20.0 MB (60%)\n\
+             Verifying SHA-512\u{2026}\n",
+            "the pending 60% tick is flushed before Verify opens"
+        );
+    }
+
+    #[test]
+    fn finish_closes_a_dangling_download_line() {
+        // A failure mid-download leaves the live line unterminated;
+        // finish() owes the newline so error output starts fresh.
+        let mut renderer = ProgressRenderer::new(Some(Vec::new()), "GE-Proton11-5", Duration::ZERO);
+        renderer.clear = true;
+        renderer.event(&InstallProgress::Download {
+            offset: 5_000_000,
+            total: Some(20_000_000),
+        });
+        renderer.finish();
+        assert_eq!(
+            String::from_utf8(renderer.sink.take().unwrap_or_default()).expect("utf-8"),
+            "Downloading GE-Proton11-5  5.0 MB / 20.0 MB (25%)\n"
+        );
+    }
+
+    #[test]
+    fn no_color_drops_the_ansi_clear_escape() {
+        // The strict #37 color ruling: any `NO_COLOR` value — empty
+        // included — disables every ANSI escape. Repaints fall back to
+        // the plain ASCII carriage return; the download line only ever
+        // grows, so no clear is needed to stay legible.
+        let mut renderer = ProgressRenderer::new(Some(Vec::new()), "X", Duration::ZERO);
+        renderer.clear = false;
+        renderer.event(&InstallProgress::Download {
+            offset: 0,
+            total: Some(20_000_000),
+        });
+        renderer.event(&InstallProgress::Download {
+            offset: 10_000_000,
+            total: Some(20_000_000),
+        });
+        renderer.event(&InstallProgress::Verify);
+        assert_eq!(
+            String::from_utf8(renderer.sink.take().unwrap_or_default()).expect("utf-8"),
+            "Downloading X  0.0 MB / 20.0 MB (0%)\r\
+             Downloading X  10.0 MB / 20.0 MB (50%)\nVerifying SHA-512…\n",
+            "no \\x1b escape appears under NO_COLOR"
+        );
+    }
+
+    #[test]
+    fn silent_progress_writes_nothing_at_all() {
+        // The disabled renderer (quiet or piped stderr) drops every event:
+        // no sink is ever taken, and finish is a no-op.
+        let mut renderer = ProgressRenderer::<Vec<u8>>::new(None, "GE-Proton11-5", Duration::ZERO);
+        renderer.event(&InstallProgress::Download {
+            offset: 1,
+            total: Some(2),
+        });
+        renderer.event(&InstallProgress::Verify);
+        renderer.event(&InstallProgress::Extract);
+        renderer.finish();
+        assert!(renderer.sink.is_none());
     }
 
     #[test]

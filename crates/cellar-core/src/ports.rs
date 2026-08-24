@@ -20,6 +20,24 @@ use crate::health::TreeHealth;
 use crate::manifest::{ManagedRecord, RunnerManifest};
 use crate::types::{LaunchPlan, Layer, ResolvedRunner, RunnerSpec};
 
+/// The phase events of the managed-install pipeline (#37): the storage
+/// layer reports progress through the caller-supplied callback of
+/// [`Storage::install_managed`] — it never prints. Presentation owns the
+/// screen (ADR 0004): the CLI renders these as stderr progress lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallProgress {
+    /// The artifact download advanced: `offset` bytes are now on disk of a
+    /// `total`-byte artifact. `total` is `None` when the source names no
+    /// length (a chunked response), so no percentage is derivable; ticks
+    /// otherwise arrive per copied chunk, offsets monotonically rising to
+    /// `total`.
+    Download { offset: u64, total: Option<u64> },
+    /// Checksum verification started (SHA-512 over the whole artifact).
+    Verify,
+    /// Extraction into the runtime directory started.
+    Extract,
+}
+
 /// Marker that seals the port traits against implementations outside the
 /// Cellar workspace. Doc-hidden on purpose: the surface is closed to the
 /// outside world, open to this workspace's crates.
@@ -121,10 +139,16 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// The install directory (`runtime/<provider_id>/<version>`) is the
     /// return; an already-installed version is a no-op. Corrupt artifacts
     /// fail closed — nothing is extracted, nothing is recorded.
+    ///
+    /// Phase progress is *reported*, never printed (#37): implementations
+    /// emit [`InstallProgress`] events through `progress` and leave the
+    /// rendering to presentation (ADR 0004 — the screen belongs to the
+    /// CLI).
     fn install_managed(
         &self,
         manifest: &RunnerManifest,
         version: &str,
+        progress: &mut dyn FnMut(InstallProgress),
     ) -> Result<PathBuf, StorageError>;
 
     /// The authoritative managed-runner inventory (`runtime/providers.toml`
