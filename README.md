@@ -1,184 +1,82 @@
 # Cellar
 
-A wine prefix and game manager for Linux that simplifies running Windows games and applications.
+A Windows app/game runtime for Linux. Cellar provisions Wine prefixes, manages Proton and umu,
+discovers and registers Windows executables, and launches them through one uniform command —
+app-launcher-first: many apps per prefix, one launcher entry per executable.
 
-## Overview
-
-Cellar is a command-line tool designed to make managing Wine prefixes and Windows games easy on Linux.
+> Status: early development, CLI-only. A GUI is planned and will drive the same engine.
 
 ## Features
 
-- **Game Management**: Add, launch, list, and remove Windows games with ease
-- **Wine Prefix Management**: Create and manage isolated Wine environments
-- **Runner Support**: Automatic Proton-GE and DXVK installation and management (currently tested with Proton-GE only)
-- **Desktop Integration**: Automatic desktop shortcut creation with icon extraction
-- **Gamescope Integration**: Built-in support for Gamescope configuration
+- **Guided installs** — `cellar install <path>` handles standalone executables, Windows installers,
+  and zip archives through one flow: pick or create a prefix, run or extract the artifact, review
+  what it dropped, register the entries worth keeping.
+- **One-word launches** — `cellar launch <app>`, foreground or `--detach`, with `--dry-run` printing
+  the exact plan (a reproducible bug report).
+- **Managed runners** — Cellar downloads and maintains GE-Proton and umu-launcher itself: resumable
+  downloads, checksum verification, explicit version pins. System wine and Steam Proton installs are
+  discovered automatically and treated strictly read-only.
+- **Desktop integration** — launcher entries with icons extracted straight from the executables, plus
+  an "Open with Cellar" action for `.exe` files in your file manager. `cellar desktop sync`
+  re-derives all of it from the stored state.
+- **Inspectable state** — everything lives in hand-editable TOML under one directory; the cache is
+  disposable; `cellar doctor` reports problems with fix hints and never repairs silently.
 
-## Installation
+## Requirements
 
-### Prerequisites
+- Linux on x86_64 or aarch64
+- [Rust](https://rustup.rs) 1.85+ (to build)
+- Optional: system `wine` on `PATH` (used for tools), `gamescope`, a Steam install (its Proton
+  builds are detected automatically)
 
-- Rust (1.80+)
-- Wine
-- `umu launcher` (for Proton support)
-- `wineboot` (for Wine prefix creation)
-- `icoutils` (for icon extraction from executables)
-- `imagemagick` (for icon processing and conversion)
-- `gamemode` (optional, for performance optimization)
-- `gamescope` (optional, for display/window management)
-- `mangohud` (optional, for performance overlay)
+There is nothing else to set up by hand — GE-Proton and umu-launcher are installed and managed by
+Cellar itself.
 
-### Building from Source
+## Building from source
 
 ```bash
-git clone https://github.com/Siddhj2206/Cellar.git
+git clone https://github.com/Siddhj2206/cellar.git
 cd cellar
 cargo build --release
+cp target/release/cellar ~/.local/bin/   # put it on PATH; desktop entries exec it directly
 ```
 
-The binary will be available at `target/release/cellar`.
-
-**Important**: For desktop shortcuts to work properly, copy the binary to a directory in your PATH:
+## Quick start
 
 ```bash
-cp target/release/cellar ~/.local/bin/
+cellar runner install proton GE-Proton11-5     # a managed runner (check upstream for current tags)
+cellar install ~/Downloads/game_setup.exe      # guided when run in a terminal
+cellar list                                    # what's registered
+cellar launch game                             # run it
 ```
 
-## Quick Start
+Any Cellar command creates its state directory on first use — there is no setup step.
 
-1. **Install a Proton runner**:
-   ```bash
-   cellar runners install proton GE-Proton10-10
-   ```
+## Command overview
 
-2. **Add a game**:
-   ```bash
-   cellar add "My Game" --exe /path/to/game.exe
-   ```
+| Command | Purpose |
+| --- | --- |
+| `cellar install <path>` | Guided install of a standalone exe, installer, or archive |
+| `cellar launch <app>` | Launch a registered app (`--dry-run`, `--detach`) |
+| `cellar uninstall <app>` | Remove an entry (never deletes the app's own files) |
+| `cellar list` | Registered apps with status |
+| `cellar doctor` | Sectioned checks with fix hints; exit code = health |
+| `cellar prefix create \| list \| delete` | Manage Wine prefixes |
+| `cellar runner install \| list` | Managed runners; discover-only host runners shown read-only |
+| `cellar desktop sync` | Re-derive launcher entries, icons, and the file association |
 
-3. **Launch the game**:
-   ```bash
-   cellar launch "My Game"
-   ```
+Every command leads its `-h` output with examples; unknown commands and typos get suggestions.
+Scripted use: `--json` on data commands, global `-q/--quiet`, exit codes `0` success / `1` operation
+error / `2` usage, plain output under `NO_COLOR` or pipes.
 
-## Commands
+## Documentation
 
-### Game Management
+- [Usage guide](docs/usage.md) — the full manual: installing, launching, runners, doctor, storage
+  layout, scripting.
+- [`docs/cli-json.md`](docs/cli-json.md) — contractual `--json` shapes for scripts.
+- [`CONTEXT.md`](CONTEXT.md) — domain glossary; [`docs/adr/`](docs/adr/) — design decisions.
 
-- `cellar add <name>` - Add a new game
-  - `--exe <path>` - Path to existing executable
-  - `--proton <version>` - Specify Proton version
-  - `--prefix <name>` - Specify prefix name (defaults to game name)
+## Contributing
 
-- `cellar launch <name>` - Launch a game
-- `cellar list` - List all configured games
-- `cellar remove <name>` - Remove a game (with optional prefix cleanup)
-- `cellar info <name>` - Show detailed game information
-
-
-### Runner Management
-
-- `cellar runners list` - List installed runners
-- `cellar runners available` - Show available runners for download
-- `cellar runners install <type> <version>` - Install a runner (proton/dxvk)
-- `cellar runners remove <type> <version>` - Remove a runner
-- `cellar runners refresh` - Refresh runner cache
-- `cellar runners install-dxvk <version> <prefix>` - Install DXVK to specific prefix
-
-### Prefix Management
-
-- `cellar prefix create <name>` - Create a new Wine prefix
-  - `--proton <version>` - Use specific Proton version
-- `cellar prefix list` - List all prefixes
-- `cellar prefix remove <name>` - Remove a prefix
-- `cellar prefix run <prefix> <exe>` - Run executable in prefix
-  - `--proton <version>` - Use specific Proton version
-
-### Desktop Shortcuts
-
-- `cellar shortcut create <name>` - Create desktop shortcut for game
-- `cellar shortcut remove <name>` - Remove desktop shortcut
-- `cellar shortcut sync` - Sync all desktop shortcuts
-- `cellar shortcut list` - List all shortcuts
-- `cellar shortcut extract-icon <name>` - Extract icon from game executable
-- `cellar shortcut list-icons` - List all extracted icons
-
-## Configuration
-
-Games are configured using TOML files stored in `~/.local/share/cellar/configs/`. Each game has its own configuration file with settings for:
-
-- Wine/Proton configuration (esync, fsync, DXVK)
-- Gamescope settings (resolution, upscaling, refresh rate)
-- Launch options and environment variables
-- Desktop integration settings
-
-Example configuration:
-```toml
-[game]
-name = "My Game"
-executable = "/path/to/game.exe"
-wine_prefix = "/home/user/.local/share/cellar/prefixes/my-game"
-proton_version = "GE-Proton10-10"
-
-[wine_config]
-esync = true
-fsync = true
-dxvk = true
-dxvk_async = false
-
-[gamescope]
-enabled = false
-width = 1920
-height = 1080
-output_width = 1920
-output_height = 1080
-refresh_rate = 60
-upscaling = "fsr"
-```
-
-## Directory Structure
-
-Cellar organizes files in the following structure:
-```
-~/.local/share/cellar/
-├── configs/          # Game configuration files
-├── prefixes/         # Wine prefixes
-├── runners/          # Proton and DXVK installations
-├── cache/            # Runner cache and temporary files
-└── icons/            # Extracted game icons
-```
-
-## Dependencies
-
-### Runtime Dependencies
-- `anyhow` - Error handling
-- `clap` - Command-line parsing
-- `tokio` - Async runtime
-- `serde` - Serialization
-- `toml` - Configuration format
-- `reqwest` - HTTP client for downloads
-- `tar`, `zip`, `flate2` - Archive handling
-- `regex` - Pattern matching
-- `chrono` - Date/time handling
-- `dirs` - Directory utilities
-
-### Development Dependencies
-- `tempfile` - Temporary files for testing
-- `tokio-test` - Async testing utilities
-
-## Compatibility
-
-**Note**: This project has been primarily tested with Proton-GE runners. While other Proton versions may work, they have not been tested.
-
-## Testing
-
-Run the test suite:
-```bash
-cargo test
-```
-
-Run specific tests:
-```bash
-cargo test test_name
-cargo test module_name
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md). Development happens on the `next` branch; `cargo xtask
+check` is the one-command gate (fmt + clippy + tests + build).
