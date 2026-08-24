@@ -33,9 +33,27 @@
 //! Exit codes (ADR 0004): 0 success, 1 operation error or doctor
 //! problems, 2 usage; `launch` propagates the game's exit code raw (§7),
 //! the collision with 1 documented, not mapped.
+//!
+//! The surface contract completes with #36: every command accepts the
+//! standard flag set — `-q/--quiet` (global; silences status and summary
+//! narration — delivered data and errors always print), `--json` on the
+//! data commands, `--no-input`/`-n/--dry-run` where they mean something,
+//! and `-h/--help`/`--version` on every command (version propagated) —
+//! with consistent semantics (clig.dev, ADR 0004). Help leads with an
+//! Examples block (the help template of every command — `-h` and `--help`
+//! alike), unknown commands
+//! and flags get "Did you mean?" suggestions, and a bare required-arg
+//! invocation shows that command's examples-first help and exits 2
+//! ([`deep_command`]). Output is colorized only on a terminal without
+//! `NO_COLOR` (piped stdout is always plain — data commands degrade to
+//! plain tables). The `--json` shapes for `list`, `doctor`, and
+//! `launch --dry-run` (plus `prefix list` and `runner list`) are
+//! contractual — documented with samples in `docs/cli-json.md`.
 
-use clap::{Args, Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
@@ -56,8 +74,21 @@ use cellar_storage::TreeStore;
 
 /// The Cellar Windows app/game runtime for Linux.
 #[derive(Debug, Parser)]
-#[command(name = "cellar", version, about)]
+#[command(
+    name = "cellar",
+    version,
+    propagate_version = true,
+    arg_required_else_help = true,
+    help_template = "{about-with-newline}Examples:\n  cellar install setup.exe\n  cellar launch balatro --dry-run\n  cellar list --json\n  cellar doctor\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}",
+    after_help = "Exit codes: 0 success, 1 operation error, 2 usage — unknown commands and flags get \"Did you mean?\" suggestions;\nlaunch propagates the game's exit code raw. --quiet silences status narration (delivered data and errors still print);\ncolor appears only on a terminal without NO_COLOR — piped output is always plain."
+)]
 struct Cli {
+    /// Suppress non-essential output: status and summary narration.
+    /// Delivered data (tables, JSON, plans, reports, the `--detach`
+    /// pid/log line) and errors always print; prompts are untouched
+    /// (`--no-input` is the scripting lever).
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -66,28 +97,71 @@ struct Cli {
 enum Command {
     /// Install a Windows artifact — standalone exe, installer, or archive
     /// (three-armed handling, blueprint §8).
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar install setup.exe\n  cellar install balatro.exe --no-input\n  cellar install bundle.zip --artifact archive --keep-all\n  cellar install game.exe --prefix games\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Install(InstallArgs),
     /// List every registered app with its status.
+    #[command(
+        display_name = "cellar",
+        help_template = "{about-with-newline}Examples:\n  cellar list\n  cellar list --json\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     List(ListArgs),
     /// Launch a registered app through its launch plan — foreground by
     /// default with the exit code propagated raw, `--detach` to release
     /// the process from the terminal, `--dry-run` to preview spawn-free.
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar launch balatro\n  cellar launch balatro --dry-run\n  cellar launch balatro --detach\n  cellar launch balatro -- --fullscreen\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}",
+        after_help = "The game's exit code propagates raw — its collision with Cellar's operation-error code (1) is documented, never mapped."
+    )]
     Launch(LaunchArgs),
     /// Uninstall an app (removes its entry; app files stay on disk).
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar uninstall balatro\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Uninstall(UninstallArgs),
     /// Manage Cellar prefixes (blueprint §8: lifecycle objects get noun
     /// groups).
+    #[command(
+        display_name = "cellar",
+        subcommand_required = true,
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar prefix create my-games\n  cellar prefix list --json\n  cellar prefix delete my-games\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Prefix(PrefixArgs),
     /// The desktop integration noun group: the re-derivation sweep that
     /// rebuilds launcher entries, icons, and the file association from
     /// the tree (blueprint §6: everything derived is re-derivable) —
     /// an extension under the noun-group rule recorded in ADR 0004.
+    #[command(
+        display_name = "cellar",
+        subcommand_required = true,
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar desktop sync\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Desktop(DesktopArgs),
     /// Manage Cellar's runners (blueprint §8: lifecycle objects get noun
     /// groups): managed installs (fetch → verify → extract → record) and
     /// the merged managed + discover-only list.
+    #[command(
+        display_name = "cellar",
+        subcommand_required = true,
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar runner list\n  cellar runner install proton GE-Proton11-5\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Runner(RunnerArgs),
     /// Sectioned capability checks with fix hints; exits 1 on any problem.
+    #[command(
+        display_name = "cellar",
+        help_template = "{about-with-newline}Examples:\n  cellar doctor\n  cellar doctor --json\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}",
+        after_help = "Exit code is overall health: 0 healthy / 1 problems — scripts can health-check."
+    )]
     Doctor(DoctorArgs),
 }
 
@@ -169,6 +243,12 @@ struct LaunchArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    display_name = "cellar",
+    subcommand_required = true,
+    arg_required_else_help = true,
+    help_template = "{about-with-newline}Examples:\n  cellar prefix create my-games\n  cellar prefix list --json\n  cellar prefix delete my-games\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+)]
 struct PrefixArgs {
     #[command(subcommand)]
     command: PrefixCommand,
@@ -178,17 +258,31 @@ struct PrefixArgs {
 enum PrefixCommand {
     /// Create a prefix: slug naming plus `-2` dedupe; writes the prefix file
     /// with defaults.
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar prefix create my-games\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Create {
         /// Display name to create, slugified automatically.
         name: String,
     },
     /// List every prefix.
+    #[command(
+        display_name = "cellar",
+        help_template = "{about-with-newline}Examples:\n  cellar prefix list\n  cellar prefix list --json\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     List {
         /// Machine-readable JSON output.
         #[arg(long)]
         json: bool,
     },
     /// Delete a prefix and exactly its directory.
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar prefix delete my-games\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Delete {
         /// The prefix slug, as shown by `prefix list`.
         name: String,
@@ -203,6 +297,12 @@ struct DoctorArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    display_name = "cellar",
+    subcommand_required = true,
+    arg_required_else_help = true,
+    help_template = "{about-with-newline}Examples:\n  cellar desktop sync\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+)]
 struct DesktopArgs {
     #[command(subcommand)]
     command: DesktopCommand,
@@ -215,10 +315,20 @@ enum DesktopCommand {
     /// everything derived is rebuilt), and remove stale entries left by
     /// renamed or removed apps. The sweep reads app state only — it
     /// never writes back into the tree.
+    #[command(
+        display_name = "cellar",
+        help_template = "{about-with-newline}Examples:\n  cellar desktop sync\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Sync,
 }
 
 #[derive(Debug, Args)]
+#[command(
+    display_name = "cellar",
+    subcommand_required = true,
+    arg_required_else_help = true,
+    help_template = "{about-with-newline}Examples:\n  cellar runner list\n  cellar runner install proton GE-Proton11-5\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+)]
 struct RunnerArgs {
     #[command(subcommand)]
     command: RunnerCommand,
@@ -232,18 +342,31 @@ enum RunnerCommand {
     /// extract, probe, and record in the authoritative inventory
     /// (`runtime/providers.toml`) — the runtime dir is rebuildable from
     /// it. Idempotent: an installed version is a no-op.
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar runner install proton GE-Proton11-5\n  cellar runner install umu 1.4.4\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     Install {
         /// The provider's identifier (`proton`, `umu`).
         provider: String,
         /// The version to install — the release tag, e.g.
         /// `GE-Proton11-5` (no guessed "latest": the artifact is named
         /// deterministically by its tag).
+        // The arg id avoids clashing with the standard `--version` flag
+        // every command accepts (ADR 0004); `VERSION` stays the
+        // placeholder either way.
+        #[arg(id = "version_pin", value_name = "VERSION")]
         version: String,
     },
     /// List every runner: managed installs (the inventory) and
     /// discover-only host state (wine and umu-run on PATH, Steam Proton
     /// in Steam's compatibility layout). Discover-only entries are
     /// read-only — Cellar never modifies them.
+    #[command(
+        display_name = "cellar",
+        help_template = "{about-with-newline}Examples:\n  cellar runner list\n  cellar runner list --json\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+    )]
     List {
         /// Machine-readable JSON output.
         #[arg(long)]
@@ -252,7 +375,11 @@ enum RunnerCommand {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let cli = match parse_cellar() {
+        Ok(cli) => cli,
+        Err(err) => return handle_clap_error(&err),
+    };
+    match run(cli) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("cellar: {err:#}");
@@ -261,25 +388,178 @@ fn main() -> ExitCode {
     }
 }
 
+/// Parse the CLI through [`cellar_command`], so clap's own help/error/version
+/// rendering honors the same color contract as the data output: `NO_COLOR`
+/// with any value — empty included — disables ANSI (no-color.org).
+fn parse_cellar() -> Result<Cli, clap::Error> {
+    let matches = cellar_command().try_get_matches_from(std::env::args_os())?;
+    Cli::from_arg_matches(&matches)
+}
+
+/// The root command builder with the color override applied; shared by
+/// parsing and the deep-help walker so both render identically. anstream's
+/// Auto mode treats an *empty* `NO_COLOR` as unset (`non_empty` check), so
+/// the override forces `Never` whenever the variable exists at all.
+fn cellar_command() -> clap::Command {
+    let mut cmd = Cli::command();
+    if std::env::var_os("NO_COLOR").is_some() {
+        cmd = cmd.color(clap::ColorChoice::Never);
+    }
+    cmd
+}
+
+/// The clap exit-code contract (ADR 0004, audited in #36): help and
+/// version requests exit 0; every parse failure — an unknown command or
+/// flag (with the "Did you mean?" suggestion), or a bare required-arg
+/// invocation — is a usage error, exit 2. The bare-arg case prints the
+/// command's examples-first help (blueprint §8: "no-args on a
+/// required-arg command shows concise help with examples first") via
+/// [`deep_command`] instead of clap's condensed usage, because the
+/// examples live in the help template.
+fn handle_clap_error(err: &clap::Error) -> ExitCode {
+    match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            // A closed stdout (e.g. `cellar --help | head`) is the reader's
+            // choice, not an error — never panic on it.
+            let _ = err.print();
+            ExitCode::SUCCESS
+        }
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            use std::io::Write;
+
+            let argv: Vec<String> = std::env::args().collect();
+            let mut command = deep_command(&argv);
+            let help = command.render_long_help();
+            let _ = std::io::stdout().write_all(help.to_string().as_bytes());
+            ExitCode::from(2)
+        }
+        _ => {
+            let _ = err.print();
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The deepest command an argv names — the walker behind the bare-arg
+/// help. The argv's subcommand tokens are followed from the root (the
+/// first token that names no subcommand stops the walk), and the clone
+/// gets its full path back as the bin name so the usage line reads
+/// `cellar prefix create`, not a bare `create`. Used only for the
+/// missing-subcommand/argument display, where clap's own condensed usage
+/// would omit the examples.
+fn deep_command(argv: &[String]) -> clap::Command {
+    let mut cmd = cellar_command();
+    let mut path: Vec<String> = vec![
+        argv.first()
+            .and_then(|name| Path::new(name).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("cellar")
+            .to_owned(),
+    ];
+    for token in argv.iter().skip(1) {
+        match cmd.find_subcommand(token) {
+            Some(next) => {
+                path.push(token.clone());
+                cmd = next.clone().bin_name(path.join(" "));
+            }
+            None => break,
+        }
+    }
+    cmd
+}
+
+/// The presentation's color policy (ADR 0004, clig.dev): ANSI only when
+/// stdout is a terminal and `NO_COLOR` is unset — any value disables,
+/// empty included (no-color.org). Piped stdout is always plain, so data
+/// commands degrade to plain tables in pipes.
+fn color_enabled() -> bool {
+    color_enabled_impl(
+        std::env::var_os("NO_COLOR").as_deref(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+/// The pure color decision, split out for tests: env and terminal state
+/// are process-global, so the decision itself is pinned without touching
+/// either.
+fn color_enabled_impl(no_color: Option<&OsStr>, stdout_is_terminal: bool) -> bool {
+    no_color.is_none() && stdout_is_terminal
+}
+
+/// The SGR codes the presentation knows (`styled` and `status_color` use
+/// these).
+const BOLD: &str = "1";
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const RED: &str = "31";
+
+/// Wrap `text` in the ANSI SGR `code` when color is on; pass through
+/// unchanged otherwise (plain output under `NO_COLOR` or a pipe).
+fn styled(text: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// One narration line — the informational output `--quiet` silences
+/// (ADR 0004): status and summary prose. Delivered data (tables, JSON,
+/// plans, reports, the `--detach` pid/log line) and errors are never
+/// narration, and prompts are untouched.
+fn narrate(quiet: bool, message: std::fmt::Arguments<'_>) {
+    if !quiet {
+        println!("{message}");
+    }
+}
+
+/// The stderr variant of [`narrate`]: announcements on stderr (the
+/// filename-hint decision) are narration too — silenced by `--quiet`, while
+/// real errors always print.
+fn narrate_err(quiet: bool, message: std::fmt::Arguments<'_>) {
+    if !quiet {
+        eprintln!("{message}");
+    }
+}
+
+/// Pretty-print JSON with the one trailing newline pipes expect — the
+/// single shape every `--json` output ends with.
+fn pretty_json<T: serde::Serialize>(value: &T) -> anyhow::Result<String> {
+    Ok(format!("{}\n", serde_json::to_string_pretty(value)?))
+}
+
 /// The `cellar desktop sync` handler: re-derive every launcher entry and
 /// icon from the tree (blueprint §6: the cache is disposable), prune the
 /// stale entry files a rename or uninstall left behind, and wire the
 /// Open-with-Cellar association — the re-derivation `cellar list` and
 /// `cellar doctor` rely on, one-way (tree state is only read).
-fn run_desktop_sync(store: &TreeStore, desktop: &DesktopService) -> anyhow::Result<ExitCode> {
+fn run_desktop_sync(
+    store: &TreeStore,
+    desktop: &DesktopService,
+    quiet: bool,
+) -> anyhow::Result<ExitCode> {
     let report = DesktopSync::new(store.clone(), desktop.clone()).sync()?;
-    println!(
-        "Synced {} launcher entries ({} with icons)",
-        report.entries, report.icons
+    narrate(
+        quiet,
+        format_args!(
+            "Synced {} launcher entries ({} with icons)",
+            report.entries, report.icons
+        ),
     );
     if report.removed_entries.is_empty() {
-        println!("No stale entries to remove");
+        narrate(quiet, format_args!("No stale entries to remove"));
     } else {
         for path in &report.removed_entries {
-            println!("Removed stale entry {}", path.display());
+            narrate(
+                quiet,
+                format_args!("Removed stale entry {}", path.display()),
+            );
         }
     }
-    println!("Wired the Open-with-Cellar file association");
+    narrate(
+        quiet,
+        format_args!("Wired the Open-with-Cellar file association"),
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -299,6 +579,7 @@ fn run_runner_install(
     store: &TreeStore,
     provider: &str,
     version: &str,
+    quiet: bool,
 ) -> anyhow::Result<ExitCode> {
     let known: Vec<String> = all_managed()
         .iter()
@@ -315,13 +596,16 @@ fn run_runner_install(
         })?;
     let service = RunnerService::new(store.clone());
     let dir = service.install(manifest.manifest(), version)?;
-    println!("Installed {provider} {version} at {}", dir.display());
+    narrate(
+        quiet,
+        format_args!("Installed {provider} {version} at {}", dir.display()),
+    );
     Ok(ExitCode::SUCCESS)
 }
 
 /// One `runner list` row (blueprint §8): managed or discover-only, with
-/// the resolved version and path. The presentation's row shape — the
-/// `--json` contract is audited in the surface sweep (#36).
+/// the resolved version and path. The JSON shape is contractual since the
+/// surface sweep (#36) — see `docs/cli-json.md`.
 #[derive(serde::Serialize)]
 struct RunnerRow {
     mode: &'static str,
@@ -335,7 +619,7 @@ struct RunnerRow {
 /// Steam Proton in Steam's compatibility layout — each resolved through
 /// the same registry the launch pipeline uses. Discover-only entries are
 /// read-only: Cellar never modifies them.
-fn run_runner_list(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
+fn run_runner_list(store: &TreeStore, json: bool, color: bool) -> anyhow::Result<ExitCode> {
     let service = RunnerService::new(store.clone());
     let inventory = service.installed()?;
     let resolvers = resolvers_for(store);
@@ -375,10 +659,10 @@ fn run_runner_list(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
     if json {
         let mut all = managed;
         all.extend(discovered);
-        print!("{}", serde_json::to_string_pretty(&all)?);
+        println!("{}", pretty_json(&all)?);
         return Ok(ExitCode::SUCCESS);
     }
-    println!("Managed:");
+    println!("{}", styled("Managed:", BOLD, color));
     for row in &managed {
         println!(
             "  {:<8} {:<20} {}",
@@ -387,7 +671,14 @@ fn run_runner_list(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
             row.path.display()
         );
     }
-    println!("Discover-only (read-only — Cellar never modifies these):");
+    println!(
+        "{}",
+        styled(
+            "Discover-only (read-only — Cellar never modifies these):",
+            BOLD,
+            color
+        )
+    );
     for row in &discovered {
         println!(
             "  {:<8} {:<20} {}",
@@ -399,8 +690,7 @@ fn run_runner_list(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run() -> anyhow::Result<ExitCode> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let store = TreeStore::from_env()?;
     // The composition root builds the desktop adapter once: over the
     // tree root (the entries live beside it, the icons under its
@@ -410,12 +700,17 @@ fn run() -> anyhow::Result<ExitCode> {
         store.data_root().to_path_buf(),
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cellar")),
     );
+    // The presentation decisions are made once, at the root: `--quiet`
+    // silences narration, and terminal-plus-`NO_COLOR`-free output gets
+    // ANSI (piped stdout is plain everywhere).
+    let quiet = cli.quiet;
+    let color = color_enabled();
     match cli.command {
-        Command::Install(args) => run_install(&store, &desktop, &args),
+        Command::Install(args) => run_install(&store, &desktop, &args, quiet),
         Command::List(args) => {
             let service = InstallService::new(store.clone(), resolvers_for(&store), desktop);
             let entries = service.list()?;
-            print!("{}", render_app_list(&entries, args.json)?);
+            print!("{}", render_app_list(&entries, args.json, color)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Launch(args) => {
@@ -437,6 +732,8 @@ fn run() -> anyhow::Result<ExitCode> {
             };
             let process = service.spawn(&args.app, &args.args, mode)?;
             if args.detach {
+                // The pid and log path are the deliverable of --detach —
+                // never narration, so they print under --quiet too.
                 println!(
                     "Detached '{}' — pid {}, output: {}",
                     args.app,
@@ -453,43 +750,49 @@ fn run() -> anyhow::Result<ExitCode> {
             service.uninstall(&args.slug)?;
             // Glossary: Uninstall — entry removal for now; Cellar never
             // deletes the app's own files.
-            println!(
-                "Uninstalled '{}' — entry removed; Cellar never deletes the app's own files",
-                args.slug
+            narrate(
+                quiet,
+                format_args!(
+                    "Uninstalled '{}' — entry removed; Cellar never deletes the app's own files",
+                    args.slug
+                ),
             );
             Ok(ExitCode::SUCCESS)
         }
         Command::Desktop(args) => match args.command {
-            DesktopCommand::Sync => run_desktop_sync(&store, &desktop),
+            DesktopCommand::Sync => run_desktop_sync(&store, &desktop, quiet),
         },
         Command::Runner(args) => match args.command {
             RunnerCommand::Install { provider, version } => {
-                run_runner_install(&store, &provider, &version)
+                run_runner_install(&store, &provider, &version, quiet)
             }
-            RunnerCommand::List { json } => run_runner_list(&store, json),
+            RunnerCommand::List { json } => run_runner_list(&store, json, color),
         },
         Command::Prefix(args) => match args.command {
             PrefixCommand::Create { name } => {
                 let service = PrefixService::new(store.clone());
                 let prefix = service.create(&name)?;
                 let path = store.prefix_dir(&prefix.slug);
-                println!("Created prefix '{}' at {}", prefix.slug, path.display());
+                narrate(
+                    quiet,
+                    format_args!("Created prefix '{}' at {}", prefix.slug, path.display()),
+                );
                 Ok(ExitCode::SUCCESS)
             }
             PrefixCommand::List { json } => {
                 let service = PrefixService::new(store.clone());
                 let prefixes = service.list()?;
-                print!("{}", render_prefix_list(&prefixes, json)?);
+                print!("{}", render_prefix_list(&prefixes, json, color)?);
                 Ok(ExitCode::SUCCESS)
             }
             PrefixCommand::Delete { name } => {
                 let service = PrefixService::new(store.clone());
                 service.delete(&name)?;
-                println!("Deleted prefix '{name}'");
+                narrate(quiet, format_args!("Deleted prefix '{name}'"));
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Command::Doctor(args) => run_doctor(&store, args.json),
+        Command::Doctor(args) => run_doctor(&store, args.json, color),
     }
 }
 
@@ -500,7 +803,7 @@ fn run() -> anyhow::Result<ExitCode> {
 /// #36). The composition root wires the registry's wrapper chain and
 /// managed-install probe, so the plan section mirrors what launch would
 /// actually execute.
-fn run_doctor(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
+fn run_doctor(store: &TreeStore, json: bool, color: bool) -> anyhow::Result<ExitCode> {
     let service = DoctorService::with_checks(
         store.clone(),
         resolvers_for(store),
@@ -508,7 +811,7 @@ fn run_doctor(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
         probe_managed,
     );
     let report = service.check()?;
-    print!("{}", render_doctor_report(&report, json)?);
+    print!("{}", render_doctor_report(&report, json, color)?);
     if report.healthy {
         Ok(ExitCode::SUCCESS)
     } else {
@@ -562,11 +865,13 @@ fn run_install(
     store: &TreeStore,
     desktop: &DesktopService,
     args: &InstallArgs,
+    quiet: bool,
 ) -> anyhow::Result<ExitCode> {
     // Interactive iff stdin is a TTY and `--no-input` is absent
     // (blueprint §8) — and only when the decision flags leave nothing to
     // ask (a given `--prefix`/`--artifact`/`--keep`/`--keep-all`/`--add`
-    // skips its prompt).
+    // skips its prompt). `--quiet` never disables prompts — it silences
+    // narration, not questions.
     let interactive = std::io::stdin().is_terminal() && !args.no_input;
     let service = InstallService::with_chain(
         store.clone(),
@@ -583,10 +888,13 @@ fn run_install(
         // always overridable.
         None => {
             let hint = artifact_hint(&args.path);
-            eprintln!(
-                "Treating '{}' as {} (hint from the file name — pass --artifact to override)",
-                file_name(&args.path),
-                hint.as_str()
+            narrate_err(
+                quiet,
+                format_args!(
+                    "Treating '{}' as {} (hint from the file name — pass --artifact to override)",
+                    file_name(&args.path),
+                    hint.as_str()
+                ),
             );
             hint
         }
@@ -611,32 +919,44 @@ fn run_install(
             } else {
                 "Registered"
             };
-            println!(
-                "{verb} '{}' ({}) in prefix '{}'",
-                result.entry.slug,
-                result.entry.kind.as_str(),
-                result.entry.prefix
+            narrate(
+                quiet,
+                format_args!(
+                    "{verb} '{}' ({}) in prefix '{}'",
+                    result.entry.slug,
+                    result.entry.kind.as_str(),
+                    result.entry.prefix
+                ),
             );
-            println!("Run it with: cellar launch {}", result.entry.slug);
+            narrate(
+                quiet,
+                format_args!("Run it with: cellar launch {}", result.entry.slug),
+            );
         }
         ArtifactKind::Installer => {
-            println!(
-                "Ran installer '{}' in prefix '{}'",
-                file_name(&args.path),
-                outcome.prefix_slug
+            narrate(
+                quiet,
+                format_args!(
+                    "Ran installer '{}' in prefix '{}'",
+                    file_name(&args.path),
+                    outcome.prefix_slug
+                ),
             );
             if let Some(log) = &outcome.log_path {
-                println!("output: {}", log.display());
+                narrate(quiet, format_args!("output: {}", log.display()));
             }
-            review_and_register(&service, &outcome, args, interactive)?;
+            review_and_register(&service, &outcome, args, interactive, quiet)?;
         }
         ArtifactKind::Archive => {
-            println!(
-                "Extracted '{}' into prefix '{}'",
-                file_name(&args.path),
-                outcome.prefix_slug
+            narrate(
+                quiet,
+                format_args!(
+                    "Extracted '{}' into prefix '{}'",
+                    file_name(&args.path),
+                    outcome.prefix_slug
+                ),
             );
-            review_and_register(&service, &outcome, args, interactive)?;
+            review_and_register(&service, &outcome, args, interactive, quiet)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -654,6 +974,7 @@ fn review_and_register(
     outcome: &InstallOutcome,
     args: &InstallArgs,
     interactive: bool,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let decided = !args.keep.is_empty() || args.keep_all || !args.add.is_empty();
     let (keep, add) = if interactive && !decided {
@@ -670,14 +991,18 @@ fn review_and_register(
         && !decided
         && !confirm_registration(confirmed, &outcome.prefix_slug)?
     {
-        println!("Registered nothing — the confirmation was declined");
+        narrate(
+            quiet,
+            format_args!("Registered nothing — the confirmation was declined"),
+        );
         return Ok(());
     }
     let registrations = service.register_reviewed(outcome, &keep, &add, args.kind)?;
-    print!(
-        "{}",
-        registration_summary(&registrations, &outcome.prefix_slug)
-    );
+    // The summary's builder ends lines with `\n` (it is a multi-line
+    // report); `narrate` appends its own, so the trailing newline is
+    // trimmed here — no blank line between the summary and the prompt.
+    let summary = registration_summary(&registrations, &outcome.prefix_slug);
+    narrate(quiet, format_args!("{}", summary.trim_end()));
     Ok(())
 }
 
@@ -1054,15 +1379,42 @@ fn print_candidates(candidates: &[Candidate]) {
 
 /// A column table: header row, blank line, then padded, two-space-separated
 /// rows. Shared by `list` and `prefix list` — one table shape for both.
-fn render_table<const N: usize>(headers: [&str; N], mut rows: Vec<[String; N]>) -> String {
-    rows.insert(0, headers.map(str::to_owned));
+/// Headers render bold, and `list`'s status column carries its status
+/// color — but only on a colored terminal; a pipe or `NO_COLOR` gets the
+/// plain table (ADR 0004). Column widths always measure the plain text:
+/// ANSI escapes are applied at render time, never padded.
+fn render_table<const N: usize>(
+    headers: [&str; N],
+    rows: Vec<[String; N]>,
+    color: bool,
+    last_col_style: Option<fn(&str) -> &'static str>,
+) -> String {
+    let mut all: Vec<[String; N]> = Vec::with_capacity(rows.len() + 1);
+    all.push(headers.map(str::to_owned));
+    all.extend(rows);
     let widths: Vec<usize> = (0..N)
-        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .map(|col| all.iter().map(|row| row[col].len()).max().unwrap_or(0))
         .collect();
     let mut out = String::new();
-    for (i, row) in rows.iter().enumerate() {
+    for (i, row) in all.iter().enumerate() {
         let cells: Vec<String> = (0..N)
-            .map(|col| format!("{:width$}", row[col], width = widths[col]))
+            .map(|col| {
+                let cell = if i == 0 {
+                    styled(&row[col], BOLD, color)
+                } else if col == N - 1 {
+                    match last_col_style {
+                        Some(style) => styled(&row[col], style(&row[col]), color),
+                        None => row[col].clone(),
+                    }
+                } else {
+                    row[col].clone()
+                };
+                // Pad the styled cell to the plain text's width: the
+                // escapes are invisible, so the format width must absorb
+                // their length or the visible columns drift.
+                let hidden = cell.len() - row[col].len();
+                format!("{:width$}", cell, width = widths[col] + hidden)
+            })
             .collect();
         out.push_str(&cells.join("  "));
         out.push('\n');
@@ -1075,9 +1427,9 @@ fn render_table<const N: usize>(headers: [&str; N], mut rows: Vec<[String; N]>) 
 
 /// The human table (`list`): slug plus the prefix defaults a user can
 /// hand-edit — runner, graphics, Windows version.
-fn render_prefix_list(prefixes: &[Prefix], json: bool) -> anyhow::Result<String> {
+fn render_prefix_list(prefixes: &[Prefix], json: bool, color: bool) -> anyhow::Result<String> {
     if json {
-        return Ok(serde_json::to_string_pretty(prefixes)?);
+        return pretty_json(&prefixes);
     }
     let rows: Vec<[String; 4]> = prefixes
         .iter()
@@ -1095,6 +1447,8 @@ fn render_prefix_list(prefixes: &[Prefix], json: bool) -> anyhow::Result<String>
     Ok(render_table(
         ["Slug", "Runner", "Graphics", "Windows"],
         rows,
+        color,
+        None,
     ))
 }
 
@@ -1141,9 +1495,20 @@ fn runner_for(entry: &AppEntry, prefix_runner: Option<&cellar_core::RunnerSpec>)
     entry.kind.default_family().as_str().to_owned()
 }
 
+/// The status cell's color signal: `ok` green, `missing-exe` amber; an
+/// unknown future status fails closed to red — the table's only colored
+/// column (plain under a pipe or `NO_COLOR`).
+fn status_color(status: &str) -> &'static str {
+    match status {
+        "ok" => GREEN,
+        "missing-exe" => YELLOW,
+        _ => RED,
+    }
+}
+
 /// The human table (`list`): slug, kind, prefix, runner, status
 /// (blueprint §8) — or the machine JSON (entry fields plus status).
-fn render_app_list(entries: &[ListedEntry], json: bool) -> anyhow::Result<String> {
+fn render_app_list(entries: &[ListedEntry], json: bool, color: bool) -> anyhow::Result<String> {
     if json {
         let rows: Vec<JsonApp> = entries
             .iter()
@@ -1152,7 +1517,7 @@ fn render_app_list(entries: &[ListedEntry], json: bool) -> anyhow::Result<String
                 status: listed.status.as_str(),
             })
             .collect();
-        return Ok(serde_json::to_string_pretty(&rows)?);
+        return pretty_json(&rows);
     }
     let rows: Vec<[String; 5]> = entries
         .iter()
@@ -1169,6 +1534,8 @@ fn render_app_list(entries: &[ListedEntry], json: bool) -> anyhow::Result<String
     Ok(render_table(
         ["Slug", "Kind", "Prefix", "Runner", "Status"],
         rows,
+        color,
+        Some(status_color),
     ))
 }
 
@@ -1188,7 +1555,7 @@ fn render_plan(plan: &LaunchPlan, json: bool) -> anyhow::Result<String> {
     use std::fmt::Write;
 
     if json {
-        return Ok(serde_json::to_string_pretty(plan)?);
+        return pretty_json(plan);
     }
     let mut out = String::new();
     writeln!(out, "  argv: {}", plan.argv.join(" "))?;
@@ -1264,9 +1631,10 @@ impl RunnerResolver for ResolverSet {
 /// The doctor report rendered (blueprint §8): the locked sections, each
 /// pass/fail with the findings' fix hints, and an overall line that is
 /// the exit-code story (0 healthy / 1 problems). `--json` mirrors the
-/// report — the presentation-side shape follows the `JsonApp` pattern;
-/// the surface sweep (#36) audits the field vocabulary.
-fn render_doctor_report(report: &DoctorReport, json: bool) -> anyhow::Result<String> {
+/// report — the surface sweep (#36) audits the field vocabulary and
+/// documents it in `docs/cli-json.md`. Statuses render green/red on a
+/// colored terminal; a pipe or `NO_COLOR` gets plain text.
+fn render_doctor_report(report: &DoctorReport, json: bool, color: bool) -> anyhow::Result<String> {
     use std::fmt::Write;
 
     if json {
@@ -1307,11 +1675,15 @@ fn render_doctor_report(report: &DoctorReport, json: bool) -> anyhow::Result<Str
                 })
                 .collect(),
         };
-        return Ok(serde_json::to_string_pretty(&json_report)?);
+        return pretty_json(&json_report);
     }
     let mut out = String::new();
     for section in &report.sections {
-        let status = if section.healthy { "ok" } else { "FAIL" };
+        let status = if section.healthy {
+            styled("ok", GREEN, color)
+        } else {
+            styled("FAIL", RED, color)
+        };
         writeln!(out, "{:<17} {status}", section.name)?;
         for finding in &section.findings {
             writeln!(out, "  ✗ {} — {}.", finding.item, finding.problem)?;
@@ -1319,9 +1691,9 @@ fn render_doctor_report(report: &DoctorReport, json: bool) -> anyhow::Result<Str
         }
     }
     if report.healthy {
-        writeln!(out, "\nall checks pass")?;
+        writeln!(out, "\n{}", styled("all checks pass", GREEN, color))?;
     } else {
-        writeln!(out, "\nproblems found — exit 1")?;
+        writeln!(out, "\n{}", styled("problems found — exit 1", RED, color))?;
     }
     Ok(out)
 }
@@ -1400,15 +1772,153 @@ mod tests {
     }
 
     #[test]
+    fn quiet_is_accepted_on_every_command() {
+        // The standard flag set (ADR 0004): `-q/--quiet` is global — before
+        // or after the subcommand, at any nesting depth.
+        for argv in [
+            vec!["cellar", "-q", "list"],
+            vec!["cellar", "list", "-q"],
+            vec!["cellar", "install", "x.exe", "-q"],
+            vec!["cellar", "launch", "balatro", "-q"],
+            vec!["cellar", "uninstall", "balatro", "-q"],
+            vec!["cellar", "prefix", "create", "games", "-q"],
+            vec!["cellar", "prefix", "-q", "list"],
+            vec!["cellar", "prefix", "delete", "games", "-q"],
+            vec!["cellar", "desktop", "sync", "-q"],
+            vec!["cellar", "runner", "install", "proton", "9.0", "-q"],
+            vec!["cellar", "runner", "list", "-q"],
+            vec!["cellar", "doctor", "-q"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse: {e}"));
+            assert!(cli.quiet, "the flag parses everywhere");
+        }
+    }
+
+    #[test]
+    fn version_prints_on_every_command() {
+        // `--version` is part of the standard set (ADR 0004): propagated to
+        // every command — leaf, group, and nested — displayed as `cellar
+        // <version>` at every depth (each command's `display_name` pins the
+        // program name).
+        for argv in [
+            vec!["cellar", "--version"],
+            vec!["cellar", "list", "--version"],
+            vec!["cellar", "launch", "--version"],
+            vec!["cellar", "prefix", "--version"],
+            vec!["cellar", "prefix", "create", "--version"],
+            vec!["cellar", "runner", "install", "--version"],
+            vec!["cellar", "doctor", "--version"],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("--version displays, it does not parse");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion, "{err}");
+        }
+    }
+
+    #[test]
+    fn bare_required_arg_invocations_are_help_style_usage_errors() {
+        // Blueprint §8: "no-args on a required-arg command shows concise
+        // help with examples first" — clap classifies every bare invocation
+        // of a required-arg command, group, or the whole CLI as a
+        // help-style missing-argument error, `main` renders it as the
+        // examples-first long help through [`deep_command`], and the exit
+        // code is 2 (usage, ADR 0004).
+        for argv in [
+            vec!["cellar"],
+            vec!["cellar", "install"],
+            vec!["cellar", "launch"],
+            vec!["cellar", "uninstall"],
+            vec!["cellar", "prefix"],
+            vec!["cellar", "prefix", "create"],
+            vec!["cellar", "prefix", "delete"],
+            vec!["cellar", "runner"],
+            vec!["cellar", "runner", "install"],
+            vec!["cellar", "desktop"],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("bare invocation");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_commands_and_flags_get_did_you_mean_suggestions() {
+        // clap's suggestion machinery: a mistyped command or flag names the
+        // nearest match — the AC's "Did you mean?" surface.
+        let err = Cli::try_parse_from(["cellar", "lsit"]).expect_err("command typo");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("similar subcommand") && rendered.contains("'list'"),
+            "{rendered}"
+        );
+        let err =
+            Cli::try_parse_from(["cellar", "prefix", "delte", "games"]).expect_err("command typo");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("similar subcommand") && rendered.contains("'delete'"),
+            "{rendered}"
+        );
+        let err = Cli::try_parse_from(["cellar", "list", "--jnson"]).expect_err("flag typo");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("similar argument") && rendered.contains("'--json'"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn color_decision_honors_no_color_and_pipes() {
+        // ADR 0004 / clig.dev / no-color.org: `NO_COLOR` with any value —
+        // empty included — disables ANSI, and so does a non-TTY stdout.
+        assert!(color_enabled_impl(None, true));
+        assert!(
+            !color_enabled_impl(Some(OsStr::new("")), true),
+            "an empty NO_COLOR still disables"
+        );
+        assert!(!color_enabled_impl(Some(OsStr::new("1")), true));
+        assert!(!color_enabled_impl(None, false), "piped stdout is plain");
+    }
+
+    #[test]
+    fn status_colors_map_known_statuses_and_fail_closed() {
+        assert_eq!(status_color("ok"), "32");
+        assert_eq!(status_color("missing-exe"), "33");
+        assert_eq!(status_color("broken-future-status"), "31");
+    }
+
+    #[test]
+    fn deep_command_walker_finds_the_deepest_command_for_bare_args() {
+        // The walker behind the bare-arg help: `cellar prefix create`
+        // renders `create`'s examples-first long help with its full usage
+        // path restored.
+        let argv = ["cellar", "prefix", "create"].map(String::from);
+        let mut command = deep_command(&argv);
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("Examples:"), "{help}");
+        assert!(help.contains("cellar prefix create my-games"), "{help}");
+        assert!(
+            help.contains("Usage:") && help.contains("cellar prefix create <NAME>"),
+            "{help}"
+        );
+        // Unknown tokens (a flag) stop the walk at the top-level help.
+        let argv = ["cellar", "--quiet"].map(String::from);
+        let mut command = deep_command(&argv);
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("cellar doctor"), "top-level examples: {help}");
+    }
+
+    #[test]
     fn prefix_list_renders_human_table_and_json() -> anyhow::Result<()> {
         let prefix = Prefix {
             slug: "my-games".to_owned(),
             defaults: PrefixDefaults::default(),
         };
-        let human = render_prefix_list(std::slice::from_ref(&prefix), false)?;
+        let human = render_prefix_list(std::slice::from_ref(&prefix), false, false)?;
         assert!(human.contains("Slug"), "header missing:\n{human}");
         assert!(human.contains("my-games"), "row missing:\n{human}");
-        let json = render_prefix_list(&[prefix], true)?;
+        let json = render_prefix_list(&[prefix], true, false)?;
         assert!(
             json.contains("\"slug\": \"my-games\""),
             "json missing:\n{json}"
@@ -1428,7 +1938,7 @@ mod tests {
             }],
             healthy: true,
         };
-        let out = render_doctor_report(&healthy, false)?;
+        let out = render_doctor_report(&healthy, false, false)?;
         assert!(out.contains("tree health"), "section missing:\n{out}");
         assert!(out.contains("ok"), "passing section:\n{out}");
         assert!(out.contains("all checks pass"), "healthy overall:\n{out}");
@@ -1458,7 +1968,7 @@ mod tests {
             ],
             healthy: false,
         };
-        let out = render_doctor_report(&broken, false)?;
+        let out = render_doctor_report(&broken, false, false)?;
         assert!(out.contains("✗ balatro"), "finding missing:\n{out}");
         assert!(
             out.contains("fix: re-register it"),
@@ -1470,7 +1980,7 @@ mod tests {
         );
 
         // --json: the structured report, machine-readable.
-        let json = render_doctor_report(&broken, true)?;
+        let json = render_doctor_report(&broken, true, false)?;
         let value: serde_json::Value = serde_json::from_str(&json)?;
         assert_eq!(value["healthy"], serde_json::Value::Bool(false));
         assert_eq!(value["sections"][0]["name"], "exe integrity");
@@ -1483,6 +1993,128 @@ mod tests {
             "fix in json missing:\n{json}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn doctor_report_colors_only_when_enabled() -> anyhow::Result<()> {
+        use cellar_app::{DoctorFinding, DoctorSection};
+
+        // The colored terminal render paints FAIL and the exit story red;
+        // the plain render (pipe or NO_COLOR) has no ANSI at all.
+        let broken = DoctorReport {
+            sections: vec![DoctorSection {
+                name: "exe integrity",
+                healthy: false,
+                findings: vec![DoctorFinding {
+                    item: "balatro".to_owned(),
+                    problem: "registered executable missing from disk".to_owned(),
+                    fix: "re-register it".to_owned(),
+                }],
+            }],
+            healthy: false,
+        };
+        let colored = render_doctor_report(&broken, false, true)?;
+        assert!(
+            colored.contains("\x1b[31mFAIL\x1b[0m"),
+            "FAIL renders red on a terminal:\n{colored}"
+        );
+        assert!(
+            colored.contains("\x1b[31mproblems found — exit 1\x1b[0m"),
+            "the exit story renders red:\n{colored}"
+        );
+        let plain = render_doctor_report(&broken, false, false)?;
+        assert!(
+            !plain.contains("\x1b["),
+            "plain output has no ANSI:\n{plain}"
+        );
+        assert!(
+            plain.contains("FAIL") && plain.contains("problems found — exit 1"),
+            "{plain}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_list_colors_only_headers_and_status_when_enabled() -> anyhow::Result<()> {
+        let listed = listed_entry("balatro", AppKind::Game, EntryStatus::ExeMissing);
+        let colored = render_app_list(std::slice::from_ref(&listed), false, true)?;
+        assert!(
+            colored.contains("\x1b[1mSlug\x1b[0m"),
+            "headers render bold on a terminal:\n{colored}"
+        );
+        assert!(
+            colored.contains("\x1b[33mmissing-exe\x1b[0m"),
+            "a failing status renders amber:\n{colored}"
+        );
+        let plain = render_app_list(&[listed], false, false)?;
+        assert!(
+            !plain.contains("\x1b["),
+            "pipe/NO_COLOR output is plain:\n{plain}"
+        );
+        assert!(plain.contains("missing-exe"), "{plain}");
+        Ok(())
+    }
+
+    #[test]
+    fn short_help_also_leads_with_examples() {
+        // The Examples block lives in the help template, not the
+        // long_about — so `-h` short help teaches too, not only `--help`
+        // and the bare-arg help (the AC's "help leads with examples").
+        let mut root = Cli::command();
+        assert!(
+            root.render_help().to_string().contains("Examples:"),
+            "top-level short help:\n{}",
+            root.render_help()
+        );
+        for name in [
+            "install",
+            "list",
+            "launch",
+            "uninstall",
+            "prefix",
+            "desktop",
+            "runner",
+            "doctor",
+        ] {
+            let mut command = root.find_subcommand(name).expect(name).clone();
+            let short = command.render_help().to_string();
+            assert!(short.contains("Examples:"), "{name} short help:\n{short}");
+        }
+    }
+
+    #[test]
+    fn colored_table_keeps_plain_column_widths() -> anyhow::Result<()> {
+        // ANSI escapes must never inflate column widths: the colored
+        // render, with the escapes stripped, pads exactly like the plain
+        // render — colors wrap cells, they never re-flow the table.
+        let listed = listed_entry("balatro", AppKind::Game, EntryStatus::ExeMissing);
+        let colored = render_app_list(std::slice::from_ref(&listed), false, true)?;
+        let plain = render_app_list(&[listed], false, false)?;
+        assert_eq!(
+            strip_ansi(&colored),
+            plain,
+            "colors only wrap, never re-flow the table"
+        );
+        Ok(())
+    }
+
+    /// Remove SGR sequences (`ESC [ <params> m`) — the test-side mirror of
+    /// the presentations color stripping, for width comparisons.
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                for next in chars.by_ref() {
+                    if next == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     #[test]
@@ -1524,7 +2156,7 @@ mod tests {
             ConfiguredRunner::Path(wine),
         ));
         store.save_prefix(&prefix)?;
-        let code = run_doctor(&store, false)?;
+        let code = run_doctor(&store, false, false)?;
         assert_eq!(code, ExitCode::SUCCESS, "a healthy tree exits 0");
         Ok(())
     }
@@ -1558,7 +2190,7 @@ mod tests {
             )?,
         );
         std::fs::remove_file(&exe)?;
-        let code = run_doctor(&store, false)?;
+        let code = run_doctor(&store, false, false)?;
         assert_eq!(code, ExitCode::FAILURE, "a missing exe exits 1");
         Ok(())
     }
@@ -1580,7 +2212,7 @@ mod tests {
             root.join("cellar/runtime/providers.toml"),
             "schema_version = 1\n\n[[runner]]\nprovider_id = \"proton\"\nversion = \"GE-Proton11-5\"\ninstall = \"proton/GE-Proton11-5\"\n",
         )?;
-        let code = run_doctor(&store, false)?;
+        let code = run_doctor(&store, false, false)?;
         assert_eq!(code, ExitCode::FAILURE, "a broken managed install exits 1");
         Ok(())
     }
@@ -1839,7 +2471,7 @@ mod tests {
     #[test]
     fn app_list_renders_human_table_and_json() -> anyhow::Result<()> {
         let listed = listed_entry("balatro", AppKind::Game, EntryStatus::ExeMissing);
-        let human = render_app_list(std::slice::from_ref(&listed), false)?;
+        let human = render_app_list(std::slice::from_ref(&listed), false, false)?;
         for header in ["Slug", "Kind", "Prefix", "Runner", "Status"] {
             assert!(human.contains(header), "header {header} missing:\n{human}");
         }
@@ -1850,7 +2482,7 @@ mod tests {
             "defaults-floor preset missing:\n{human}"
         );
         assert!(human.contains("missing-exe"), "status missing:\n{human}");
-        let json = render_app_list(&[listed], true)?;
+        let json = render_app_list(&[listed], true, false)?;
         assert!(
             json.contains("\"slug\": \"balatro\""),
             "json missing:\n{json}"
@@ -2794,6 +3426,7 @@ mod tests {
                 keep_all: false,
                 add: Vec::new(),
             },
+            false,
         )?;
         assert_eq!(code, ExitCode::SUCCESS);
         let apps = store.list_apps()?;
@@ -2833,6 +3466,7 @@ mod tests {
                 keep_all: false,
                 add: Vec::new(),
             },
+            false,
         )?;
         let entry = home.join("cellar/applications/cellar-balatro.desktop");
         assert!(
@@ -2880,10 +3514,10 @@ mod tests {
             keep_all: false,
             add: Vec::new(),
         };
-        run_install(&store, &desktop, &args(None))?;
+        run_install(&store, &desktop, &args(None), false)?;
         let before = home.join("cellar/applications/cellar-balatro.desktop");
         assert!(before.exists(), "the first entry exists");
-        run_install(&store, &desktop, &args(Some("Poker Night")))?;
+        run_install(&store, &desktop, &args(Some("Poker Night")), false)?;
         assert!(!before.exists(), "the old entry file name is gone");
         let after = home.join("cellar/applications/cellar-poker-night.desktop");
         assert!(after.exists(), "the entry file name follows the rename");
@@ -2918,8 +3552,8 @@ mod tests {
         };
         let tool = home.join("cellar/helper.exe");
         std::fs::write(&tool, "MZ")?;
-        run_install(&store, &desktop, &args(&exe))?;
-        run_install(&store, &desktop, &args(&tool))?;
+        run_install(&store, &desktop, &args(&exe), false)?;
+        run_install(&store, &desktop, &args(&tool), false)?;
         let applications = home.join("cellar/applications");
         let balatro_entry = applications.join("cellar-balatro.desktop");
         let tool_entry = applications.join("cellar-helper.desktop");
@@ -2937,7 +3571,7 @@ mod tests {
         // One re-derivation restores everything derived and removes the
         // stale entry the rename left behind — the missing exe's entry
         // still re-derives (only its icon cannot).
-        let code = run_desktop_sync(&store, &desktop)?;
+        let code = run_desktop_sync(&store, &desktop, false)?;
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(applications.join("cellar-poker-night.desktop").exists());
         assert!(tool_entry.exists(), "the untouched app keeps its entry");
@@ -2960,7 +3594,7 @@ mod tests {
             std::process::id()
         ));
         let store = TreeStore::new(home.join("cellar"));
-        let err = run_runner_install(&store, "cartman", "9.0")
+        let err = run_runner_install(&store, "cartman", "9.0", false)
             .expect_err("an unknown provider is an operation error, never a guess");
         assert!(
             err.to_string().contains("proton") && err.to_string().contains("umu"),
@@ -2989,8 +3623,8 @@ mod tests {
              [[runner]]\nprovider_id = \"umu\"\n\
              version = \"1.4.4\"\ninstall = \"umu/1.4.4\"\n",
         )?;
-        assert_eq!(run_runner_list(&store, false)?, ExitCode::SUCCESS);
-        assert_eq!(run_runner_list(&store, true)?, ExitCode::SUCCESS);
+        assert_eq!(run_runner_list(&store, false, false)?, ExitCode::SUCCESS);
+        assert_eq!(run_runner_list(&store, true, false)?, ExitCode::SUCCESS);
         Ok(())
     }
 
@@ -3029,6 +3663,7 @@ mod tests {
                 keep_all: false,
                 add: Vec::new(),
             },
+            false,
         )?;
         let app = LaunchApp::with_chain(store.clone(), resolvers_for(&store), wrappers_for);
         let plan = app.plan("game", &[])?;
@@ -3095,6 +3730,7 @@ mod tests {
                 keep_all: false,
                 add: Vec::new(),
             },
+            false,
         )?;
         let mut prefix = store.load_prefix("default")?;
         prefix.defaults.graphics = Some("gamescope".to_owned());
@@ -3275,6 +3911,7 @@ mod tests {
                 keep_all: true,
                 add: Vec::new(),
             },
+            false,
         )?;
         assert_eq!(code, ExitCode::SUCCESS);
         let apps = store.list_apps()?;
@@ -3314,6 +3951,7 @@ mod tests {
                 keep_all: false,
                 add: Vec::new(),
             },
+            false,
         )?;
         let slugs: Vec<String> = store.list_apps()?.into_iter().map(|app| app.slug).collect();
         assert_eq!(
@@ -3344,6 +3982,7 @@ mod tests {
                 keep_all: false,
                 add: Vec::new(),
             },
+            false,
         )?;
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(
