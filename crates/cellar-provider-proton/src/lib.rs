@@ -94,7 +94,7 @@ impl ProtonProvider {
                         entry.path(),
                     )
                 })
-                .filter(|(name, path)| {
+                .filter(|(name, _path)| {
                     if root.file_name().is_some_and(|n| n == "common") {
                         name.starts_with("Proton")
                     } else {

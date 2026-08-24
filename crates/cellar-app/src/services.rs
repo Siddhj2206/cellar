@@ -17,11 +17,15 @@
 //! [`DesktopSync`] re-derives everything from the tree. The lifecycle is
 //! one-way: the desktop adapter derives host artifacts from the entries
 //! it is handed and never writes tree state.
+//!
+//! The managed-runner lifecycle lands with #34 ([`RunnerService`]) and
+//! the full doctor with #35 ([`DoctorService::check`]): the four locked
+//! sections — tree health, exe integrity, runner integrity, plan
+//! buildable — each pass/fail with a fix hint, read-only.
 
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
-use cellar_core::errors::DesktopError;
-use cellar_core::errors::StorageError;
+use cellar_core::errors::{DesktopError, ResolveError, StorageError};
 use cellar_core::health::TreeHealth;
 use cellar_core::manifest::{ManagedRecord, RunnerManifest};
 use cellar_core::ports::{DesktopIntegrator, RunnerResolver, Storage, WrapperContributor};
@@ -1058,32 +1062,381 @@ impl<S: Storage> PrefixService<S> {
     }
 }
 
-/// The tree-health doctor check (blueprint §7: the doctor is the check phase
-/// applied tree-wide). This slice checks the tree; runner-integrity and
-/// wrapper-runtime sections land with their slices (#28+).
-pub struct DoctorService<S: Storage> {
-    storage: S,
+/// One doctor finding (blueprint §7 dispositions, §8 surface): the check
+/// names the failure and the fix — the doctor never repairs, it points.
+/// The `--json` renderer mirrors these verbatim (the shape is audited in
+/// the surface sweep #36).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorFinding {
+    /// The check's subject: an app slug, a `provider version` pair, or a
+    /// tree-relative path.
+    pub item: String,
+    /// What is wrong, in the tree's own vocabulary.
+    pub problem: String,
+    /// The fix: a command, or an explicit hand-edit instruction. Never a
+    /// silent repair by the doctor.
+    pub fix: String,
 }
 
-impl<S: Storage> DoctorService<S> {
-    /// The service over one storage adapter.
-    pub fn new(storage: S) -> Self {
-        Self { storage }
+/// One doctor section: pass/fail plus its findings (a passing section has
+/// none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorSection {
+    /// The locked section name (blueprint §8): tree health, exe integrity,
+    /// runner integrity, plan buildable.
+    pub name: &'static str,
+    pub healthy: bool,
+    pub findings: Vec<DoctorFinding>,
+}
+
+/// The complete doctor report (blueprint §8): the locked sections, each
+/// pass/fail with fix hints; `healthy` drives the exit code (0 healthy /
+/// 1 problems) so scripts can health-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReport {
+    pub sections: Vec<DoctorSection>,
+    pub healthy: bool,
+}
+
+/// The integrity probe for one recorded managed install — provider-kind
+/// knowledge (the marker the installer pipeline probes at install time:
+/// the `proton` script / `umu-run` launcher). The registry supplies the
+/// concrete rule (`cellar_providers::probe_managed`); `app` transports
+/// the function — the same shape as [`ChainBuilder`], and for the same
+/// reason (provider types stay below the composition root).
+///
+/// `None` means intact; `Some((problem, fix))` means broken, with the
+/// damage and its fix in the provider's own vocabulary (an unknown
+/// provider names itself rather than mis-attributing the damage).
+pub type ManagedProbe = fn(record: &ManagedRecord, runtime_dir: &Path) -> Option<(String, String)>;
+
+/// The doctor use-case (blueprint §7, §8): the check phase applied
+/// tree-wide, sectioned — tree health, exe integrity, runner integrity
+/// (managed installs), plan buildable — each pass/fail with a fix hint
+/// (the §7 dispositions: `SuggestInstall`, reinstall, recreate, re-register).
+///
+/// Read-only: the doctor reports what is on disk; it never initializes,
+/// repairs, or overwrites — hand-edited state surfaces with its fix and is
+/// never silently replaced (ADR 0001). This slice (#35) lands the full
+/// surface; the exit code and `--json` shape are presentation's.
+pub struct DoctorService<S: Storage, R: RunnerResolver> {
+    storage: S,
+    resolver: R,
+    chain: ChainBuilder,
+    probe: ManagedProbe,
+}
+
+impl<S: Storage, R: RunnerResolver> DoctorService<S, R> {
+    /// The service over one storage adapter and one resolver. The wrapper
+    /// chain is the empty default and the managed-install probe is
+    /// fail-closed — an unwired probe refuses to declare installs intact:
+    /// a composition root that forgets to wire `with_checks` gets a loud
+    /// finding, never a silently-passed section.
+    pub fn new(storage: S, resolver: R) -> Self {
+        Self {
+            storage,
+            resolver,
+            chain: empty_chain,
+            probe: |_record, _runtime_dir| {
+                Some((
+                    "cannot verify — the managed-install probe is not wired".to_owned(),
+                    "wire cellar_providers::probe_managed in the composition root (a \
+                     presentation bug — report it)"
+                        .to_owned(),
+                ))
+            },
+        }
     }
 
-    /// The tree health report: root presence, required directories and files,
-    /// invalid hand-edits, orphan prefix dirs. No side effects — the doctor
-    /// reports what is on disk, it never initializes or repairs.
-    pub fn tree_health(&self) -> Result<TreeHealth, StorageError> {
-        self.storage.tree_health()
+    /// The service with the launch-pipeline wiring the doctor must mirror:
+    /// the registry's per-launch wrapper chain and its managed-install
+    /// probe.
+    pub fn with_checks(storage: S, resolver: R, chain: ChainBuilder, probe: ManagedProbe) -> Self {
+        Self {
+            storage,
+            resolver,
+            chain,
+            probe,
+        }
+    }
+
+    /// The full doctor: the four locked sections, each pass/fail with fix
+    /// hints. Check failures are findings, not errors — the report always
+    /// renders (a section that cannot operate says so in its own
+    /// findings); only the very first read failing propagates.
+    pub fn check(&self) -> Result<DoctorReport, StorageError> {
+        let health = self.storage.tree_health()?;
+        let tree = Self::tree_section(&health);
+        let exes = Self::exe_section(&health);
+        let runners = self.runner_section();
+        let plans = self.plan_section(&health);
+        let sections = vec![tree, exes, runners, plans];
+        let healthy = sections.iter().all(|section| section.healthy);
+        Ok(DoctorReport { sections, healthy })
+    }
+
+    /// Section one: the tree's own health (root, directories, files,
+    /// hand-edit damage, orphan dirs). Registered-exe presence is the exe
+    /// section's, not this one's. A missing root is one finding — the
+    /// per-directory list the storage reports for the same cause is not
+    /// repeated.
+    fn tree_section(health: &TreeHealth) -> DoctorSection {
+        let mut findings = Vec::new();
+        if !health.tree_exists {
+            findings.push(DoctorFinding {
+                item: health.root.display().to_string(),
+                problem: "the tree does not exist".to_owned(),
+                fix: "run any command — the next prefix/app command creates it".to_owned(),
+            });
+            return section("tree health", health.tree_exists, findings);
+        }
+        for dir in &health.missing_dirs {
+            findings.push(DoctorFinding {
+                item: dir.display().to_string(),
+                problem: "required directory missing".to_owned(),
+                fix: "Cellar recreates it on the next command".to_owned(),
+            });
+        }
+        for file in &health.missing_files {
+            findings.push(DoctorFinding {
+                item: file.display().to_string(),
+                problem: "required file missing".to_owned(),
+                fix: "Cellar recreates the defaults on the next command".to_owned(),
+            });
+        }
+        for file in &health.invalid_files {
+            // The degraded-entry contract (AC): hand-edit damage surfaces
+            // with its fix — never silently overwritten (ADR 0001).
+            findings.push(DoctorFinding {
+                item: file.display().to_string(),
+                problem: "unreadable (hand-edit damage)".to_owned(),
+                fix: "repair it by hand or delete it — Cellar never overwrites hand edits"
+                    .to_owned(),
+            });
+        }
+        for dir in &health.orphan_prefix_dirs {
+            findings.push(DoctorFinding {
+                item: dir.display().to_string(),
+                problem: "prefix directory without a prefix.toml (debris or an interrupted \
+                          create)"
+                    .to_owned(),
+                fix: "recreate the prefix with `cellar prefix create <name>`, or remove the \
+                      directory by hand"
+                    .to_owned(),
+            });
+        }
+        // The tree section's own predicate — deliberately not
+        // `health.is_healthy()`, which counts registered-exe presence:
+        // that is the exe section's job.
+        let healthy = health.tree_exists
+            && health.missing_dirs.is_empty()
+            && health.missing_files.is_empty()
+            && health.invalid_files.is_empty()
+            && health.orphan_prefix_dirs.is_empty();
+        section("tree health", healthy, findings)
+    }
+
+    /// Section two: every registered exe still on disk (deleted or moved
+    /// files break the launch plan before anything else would).
+    fn exe_section(health: &TreeHealth) -> DoctorSection {
+        let findings = health
+            .missing_exes
+            .iter()
+            .map(|slug| DoctorFinding {
+                item: slug.clone(),
+                problem: "registered executable missing from disk".to_owned(),
+                fix: format!(
+                    "re-register it with `cellar install <path>` or uninstall it with \
+                     `cellar uninstall {slug}`"
+                ),
+            })
+            .collect();
+        section("exe integrity", health.missing_exes.is_empty(), findings)
+    }
+
+    /// Section three: every recorded managed install intact — the probe
+    /// each record's provider applies at install time, in the provider's
+    /// own vocabulary (an unknown provider names itself). A storage
+    /// failure enumerating the inventory is itself a finding — the
+    /// section still renders.
+    fn runner_section(&self) -> DoctorSection {
+        let records = match self.storage.managed_inventory() {
+            Ok(records) => records,
+            Err(error) => {
+                return section(
+                    "runner integrity",
+                    false,
+                    vec![DoctorFinding {
+                        item: "runtime/providers.toml".to_owned(),
+                        problem: format!("the inventory could not be read: {error}"),
+                        fix: "see the message — the tree section's fix hints apply".to_owned(),
+                    }],
+                );
+            }
+        };
+        let runtime_dir = self.storage.data_root().join("runtime");
+        let mut findings = Vec::new();
+        for record in &records {
+            if let Some((problem, fix)) = (self.probe)(record, &runtime_dir) {
+                findings.push(DoctorFinding {
+                    item: format!("{} {}", record.provider_id, record.version),
+                    problem,
+                    fix,
+                });
+            }
+        }
+        section("runner integrity", findings.is_empty(), findings)
+    }
+
+    /// Section four: every registered app's plan buildable — the exact
+    /// pipeline a launch would run (resolve → check → plan, never spawn),
+    /// so a plan the doctor passes is a plan launch would execute.
+    ///
+    /// The section operates only on a complete tree: with the root or its
+    /// required files missing, every plan would fail on preconditions the
+    /// tree section already owns — and enumerating apps would *create*
+    /// the tree (the storage initializes on first access), which the
+    /// doctor must never do (ADR 0001: it reports, it never writes). The
+    /// section passes empty: a missing tree cannot make plans unbuildable,
+    /// only the tree section's findings matter there. Storage failures
+    /// mid-check are findings, not aborts.
+    fn plan_section(&self, health: &TreeHealth) -> DoctorSection {
+        if !health.tree_exists
+            || !health.missing_dirs.is_empty()
+            || !health.missing_files.is_empty()
+        {
+            // Not checkable without writing — and not needed: the tree
+            // section owns those findings (there are no readable apps to
+            // plan for).
+            return section("plan buildable", true, Vec::new());
+        }
+        let apps = match self.storage.list_apps() {
+            Ok(apps) => apps,
+            Err(error) => {
+                return section(
+                    "plan buildable",
+                    false,
+                    vec![DoctorFinding {
+                        item: "apps".to_owned(),
+                        problem: format!("registered apps could not be enumerated: {error}"),
+                        fix: "see the message — the tree section's fix hints apply".to_owned(),
+                    }],
+                );
+            }
+        };
+        let mut findings = Vec::new();
+        for entry in &apps {
+            // The exe-integrity section owns missing-exe findings; the
+            // plan section does not repeat them (same probe, same data).
+            if health.missing_exes.contains(&entry.slug) {
+                continue;
+            }
+            let prefix_slug = entry
+                .overrides
+                .prefix
+                .clone()
+                .unwrap_or_else(|| entry.prefix.clone());
+            let prefix = match self.storage.load_prefix(&prefix_slug) {
+                Ok(prefix) => prefix,
+                Err(StorageError::NotFound(_) | StorageError::Invalid(_)) => {
+                    findings.push(DoctorFinding {
+                        item: entry.slug.clone(),
+                        problem: format!(
+                            "its bound prefix {prefix_slug:?} is missing or unreadable \
+                             (hand-edit damage)"
+                        ),
+                        fix: format!("recreate it with `cellar prefix create {prefix_slug}`"),
+                    });
+                    continue;
+                }
+                Err(other) => {
+                    findings.push(DoctorFinding {
+                        item: entry.slug.clone(),
+                        problem: format!("its bound prefix could not be read: {other}"),
+                        fix: "see the message — the tree section's fix hints apply".to_owned(),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = plan_for(
+                &self.storage,
+                &self.resolver,
+                entry,
+                &prefix,
+                &[],
+                self.chain,
+            ) {
+                findings.push(Self::plan_finding(entry, &error));
+            }
+        }
+        section("plan buildable", findings.is_empty(), findings)
+    }
+
+    /// The §7 disposition of one launch failure, as a fixing finding. The
+    /// wording mirrors the error's own Display sentences (one vocabulary,
+    /// two renderings: the launch error text and the doctor's fix hint).
+    fn plan_finding(entry: &AppEntry, error: &LaunchError) -> DoctorFinding {
+        let problem = error.to_string();
+        let fix = match error {
+            LaunchError::PrefixMissing { slug } => {
+                format!("recreate it with `cellar prefix create {slug}`")
+            }
+            LaunchError::ExeMissing { slug, .. } => {
+                format!(
+                    "re-register it with `cellar install <path>` or uninstall it with `cellar uninstall {slug}`"
+                )
+            }
+            LaunchError::Resolve(ResolveError::NotInstalled { family }) => {
+                format!(
+                    "reinstall it: cellar runner install {} <version>",
+                    family.as_str()
+                )
+            }
+            LaunchError::Resolve(ResolveError::Unresolvable { family }) => {
+                format!(
+                    "install a {} runner (`cellar runner install {} <version>`) \
+                     or configure a path",
+                    family.as_str(),
+                    family.as_str()
+                )
+            }
+            LaunchError::PlanUnavailable { family } => {
+                format!(
+                    "the {} plan needs a runtime this system lacks — install it",
+                    family.as_str()
+                )
+            }
+            // `Spawn`/`AppNotFound` cannot fire pre-plan over registered
+            // entries; `Storage` failures are named by their message.
+            LaunchError::Storage(_)
+            | LaunchError::Spawn { .. }
+            | LaunchError::AppNotFound { .. } => {
+                "see the message — the tree section's fix hints apply".to_owned()
+            }
+        };
+        DoctorFinding {
+            item: entry.slug.clone(),
+            problem,
+            fix,
+        }
+    }
+}
+
+/// One completed section (the shared leaf of the section builders).
+fn section(name: &'static str, healthy: bool, findings: Vec<DoctorFinding>) -> DoctorSection {
+    DoctorSection {
+        name,
+        healthy,
+        findings,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, DesktopSync, DoctorService, InstallError, InstallOutcome, InstallResult,
-        InstallService, LaunchApp, PrefixService, RunnerService, Storage,
+        ArtifactKind, DesktopSync, DoctorFinding, DoctorService, InstallError, InstallOutcome,
+        InstallResult, InstallService, LaunchApp, PrefixService, RunnerService, Storage,
+        empty_chain,
     };
 
     use std::collections::BTreeSet;
@@ -1094,7 +1447,7 @@ mod tests {
     use cellar_core::errors::{DesktopError, ResolveError, StorageError};
     use cellar_core::health::TreeHealth;
     use cellar_core::manifest::{ManagedRecord, RunnerManifest};
-    use cellar_core::ports::{__sealed, DesktopIntegrator, RunnerResolver, WrapperContributor};
+    use cellar_core::ports::{__sealed, DesktopIntegrator, RunnerResolver};
     use cellar_core::types::{
         ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
     };
@@ -1476,12 +1829,18 @@ mod tests {
             .invalid_files
             .push(PathBuf::from("prefixes/broken/prefix.toml"));
         let mock = MockStorage::new(health);
-        let service = DoctorService::new(mock);
-        let report = service.tree_health()?;
-        assert!(!report.is_healthy());
+        let service = DoctorService::new(mock, StubResolver::ok());
+        let report = service.check()?;
+        let tree = &report.sections[0];
+        assert!(!tree.healthy);
         assert_eq!(
-            report.invalid_files,
-            [PathBuf::from("prefixes/broken/prefix.toml")]
+            tree.findings,
+            [DoctorFinding {
+                item: "prefixes/broken/prefix.toml".to_owned(),
+                problem: "unreadable (hand-edit damage)".to_owned(),
+                fix: "repair it by hand or delete it — Cellar never overwrites hand edits"
+                    .to_owned(),
+            }]
         );
         Ok(())
     }
@@ -2497,6 +2856,219 @@ mod tests {
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].version, "GE-Proton11-5");
         assert_eq!(installed[0].install, "proton/GE-Proton11-5");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_reports_a_healthy_tree_in_four_passing_sections() -> anyhow::Result<()> {
+        // AC: sections — tree health / exe integrity / runner integrity /
+        // plan buildable — each pass/fail with a fix hint; a healthy
+        // system reports all four passing and overall healthy.
+        let mock = MockStorage::new(healthy_tree());
+        let service = DoctorService::new(mock, StubResolver::ok());
+        let report = service.check()?;
+        assert!(report.healthy, "no findings at all");
+        let names: Vec<&str> = report.sections.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "tree health",
+                "exe integrity",
+                "runner integrity",
+                "plan buildable"
+            ]
+        );
+        assert!(
+            report
+                .sections
+                .iter()
+                .all(|s| s.healthy && s.findings.is_empty())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_surfaces_hand_edit_damage_with_its_fix_never_silently() -> anyhow::Result<()> {
+        // AC: degraded entries (hand-edit damage) surface with their fix,
+        // never silently fixed (ADR 0001: the doctor never overwrites).
+        let mut health = healthy_tree();
+        health.invalid_files = vec![PathBuf::from("prefixes/default/prefix.toml")];
+        let service = DoctorService::new(MockStorage::new(health), StubResolver::ok());
+        let report = service.check()?;
+        let tree = &report.sections[0];
+        assert!(!tree.healthy);
+        let finding = &tree.findings[0];
+        assert_eq!(finding.item, "prefixes/default/prefix.toml");
+        assert!(
+            finding.fix.contains("never overwrites hand edits"),
+            "the fix names the hand-edit contract: {}",
+            finding.fix
+        );
+        assert!(!report.healthy, "any failing section fails the report");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_missing_exes_with_a_re_registration_fix() -> anyhow::Result<()> {
+        let mut health = healthy_tree();
+        health.missing_exes = vec!["balatro".to_owned()];
+        let service = DoctorService::new(MockStorage::new(health), StubResolver::ok());
+        let report = service.check()?;
+        let exes = &report.sections[1];
+        assert!(!exes.healthy);
+        let finding = &exes.findings[0];
+        assert_eq!(finding.item, "balatro");
+        assert!(
+            finding.fix.contains("cellar uninstall balatro"),
+            "the fix names the exit: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_broken_managed_installs_with_a_reinstall_fix() -> anyhow::Result<()> {
+        // AC: runner integrity including managed installs — the probe the
+        // installer pipeline applies at install time, injected like the
+        // wrapper chain (the registry wires the real probe at the
+        // composition root).
+        let mock = MockStorage::new(healthy_tree());
+        mock.install_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(("proton".to_owned(), "GE-Proton11-5".to_owned()));
+        let service = DoctorService::with_checks(
+            mock,
+            StubResolver::ok(),
+            empty_chain,
+            |_record, _runtime_dir| {
+                // The provider's own vocabulary flows through the probe:
+                // the damage and its fix (review #35: an unknown provider
+                // must never be mis-attributed).
+                Some((
+                    "the install directory is missing, or its launcher is not executable"
+                        .to_owned(),
+                    "reinstall it: cellar runner install proton GE-Proton11-5".to_owned(),
+                ))
+            },
+        );
+        let report = service.check()?;
+        let runners = &report.sections[2];
+        assert!(!runners.healthy);
+        let finding = &runners.findings[0];
+        assert_eq!(finding.item, "proton GE-Proton11-5");
+        assert!(
+            finding
+                .fix
+                .contains("cellar runner install proton GE-Proton11-5"),
+            "the fix is the reinstall command: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_maps_unresolvable_plans_to_suggest_install() -> anyhow::Result<()> {
+        // The §7 disposition: an exhausted resolution order → doctor:
+        // SuggestInstall — the finding names the family and the command.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(
+            mock,
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Wine,
+            })),
+        );
+        let report = service.check()?;
+        let plans = &report.sections[3];
+        assert!(!plans.healthy);
+        let finding = &plans.findings[0];
+        assert_eq!(finding.item, "balatro");
+        assert!(
+            finding.problem.contains("wine"),
+            "the problem names the family: {}",
+            finding.problem
+        );
+        assert!(
+            finding.fix.contains("install a wine runner"),
+            "the fix is the SuggestInstall disposition: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_a_missing_bound_prefix_with_recreate() -> anyhow::Result<()> {
+        // Hand-edit damage on the binding: the entry's prefix is gone —
+        // the fix recreates it, the doctor never auto-recreates.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(mock, StubResolver::ok());
+        let report = service.check()?;
+        let plans = &report.sections[3];
+        assert!(!plans.healthy);
+        let finding = &plans.findings[0];
+        assert!(
+            finding.fix.contains("cellar prefix create default"),
+            "the fix recreates the bound prefix: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_without_a_wired_probe_fails_closed() -> anyhow::Result<()> {
+        // The probe default is a loud failure, never a silent pass: an
+        // unwired composition root gets a finding naming the wiring bug
+        // (review #35 — a health checker must not fail open).
+        let mock = MockStorage::new(healthy_tree());
+        mock.install_records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(("proton".to_owned(), "GE-Proton11-5".to_owned()));
+        let service = DoctorService::new(mock, StubResolver::ok());
+        let report = service.check()?;
+        let runners = &report.sections[2];
+        assert!(!runners.healthy, "an unwired probe must not pass installs");
+        let finding = &runners.findings[0];
+        assert!(
+            finding.fix.contains("probe_managed"),
+            "the finding names the wiring: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_does_not_check_plans_against_a_missing_tree() -> anyhow::Result<()> {
+        // The doctor never writes: with required tree pieces missing, the
+        // plan section passes without findings rather than enumerating
+        // apps — enumeration would *create* the tree (the storage
+        // initializes on first access), which the doctor must not do
+        // (review #35; ADR 0001). The tree section owns those findings.
+        let mut health = healthy_tree();
+        health.missing_dirs = vec![PathBuf::from("apps"), PathBuf::from("cache")];
+        let mock = MockStorage::new(health);
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(
+            mock,
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Wine,
+            })),
+        );
+        let report = service.check()?;
+        let plans = &report.sections[3];
+        assert!(
+            plans.healthy && plans.findings.is_empty(),
+            "no plan checks run against a missing tree (no writes): {:?}",
+            plans.findings
+        );
+        let tree = &report.sections[0];
+        assert!(!tree.healthy, "the tree section owns the damage");
         Ok(())
     }
 

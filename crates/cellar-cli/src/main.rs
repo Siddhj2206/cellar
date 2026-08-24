@@ -42,16 +42,16 @@ use std::process::{ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use cellar_app::{
-    ArtifactKind, DesktopSync, DoctorService, InstallOutcome, InstallResult, InstallService,
-    LaunchApp, LaunchMode, ListedEntry, PrefixService, RunnerService,
+    ArtifactKind, DesktopSync, DoctorReport, DoctorService, InstallOutcome, InstallResult,
+    InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService, RunnerService,
 };
 use cellar_core::ports::{__sealed, RunnerResolver, Storage};
 use cellar_core::{
-    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ProviderMode, ResolveError, ResolvedRunner,
-    RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec, TreeHealth,
+    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerFamily,
+    RunnerInstall, RunnerRef, RunnerSpec,
 };
 use cellar_desktop::DesktopService;
-use cellar_providers::{all_managed, all_resolvers, steam_protons, wrappers_for};
+use cellar_providers::{all_managed, all_resolvers, probe_managed, steam_protons, wrappers_for};
 use cellar_storage::TreeStore;
 
 /// The Cellar Windows app/game runtime for Linux.
@@ -489,16 +489,30 @@ fn run() -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Command::Doctor(args) => {
-            let service = DoctorService::new(store);
-            let health = service.tree_health()?;
-            print!("{}", render_tree_health(&health, args.json)?);
-            if health.is_healthy() {
-                Ok(ExitCode::SUCCESS)
-            } else {
-                Ok(ExitCode::from(1))
-            }
-        }
+        Command::Doctor(args) => run_doctor(&store, args.json),
+    }
+}
+
+/// The doctor handler (blueprint §8): the sectioned report — tree health,
+/// exe integrity, runner integrity, plan buildable — each pass/fail with
+/// a fix hint, the health exit code (0 healthy / 1 problems) for scripted
+/// checks, and the `--json` machine shape (audited in the surface sweep
+/// #36). The composition root wires the registry's wrapper chain and
+/// managed-install probe, so the plan section mirrors what launch would
+/// actually execute.
+fn run_doctor(store: &TreeStore, json: bool) -> anyhow::Result<ExitCode> {
+    let service = DoctorService::with_checks(
+        store.clone(),
+        resolvers_for(store),
+        wrappers_for,
+        probe_managed,
+    );
+    let report = service.check()?;
+    print!("{}", render_doctor_report(&report, json)?);
+    if report.healthy {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
     }
 }
 
@@ -1247,74 +1261,68 @@ impl RunnerResolver for ResolverSet {
     }
 }
 
-/// The doctor's tree section: one pass/fail line per check, every failure
-/// with a fix hint (blueprint §8).
-fn render_tree_health(health: &TreeHealth, json: bool) -> anyhow::Result<String> {
+/// The doctor report rendered (blueprint §8): the locked sections, each
+/// pass/fail with the findings' fix hints, and an overall line that is
+/// the exit-code story (0 healthy / 1 problems). `--json` mirrors the
+/// report — the presentation-side shape follows the `JsonApp` pattern;
+/// the surface sweep (#36) audits the field vocabulary.
+fn render_doctor_report(report: &DoctorReport, json: bool) -> anyhow::Result<String> {
     use std::fmt::Write;
 
     if json {
-        return Ok(serde_json::to_string_pretty(health)?);
+        #[derive(serde::Serialize)]
+        struct JsonFinding<'a> {
+            item: &'a str,
+            problem: &'a str,
+            fix: &'a str,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonSection<'a> {
+            name: &'a str,
+            healthy: bool,
+            findings: Vec<JsonFinding<'a>>,
+        }
+        #[derive(serde::Serialize)]
+        struct JsonDoctor<'a> {
+            healthy: bool,
+            sections: Vec<JsonSection<'a>>,
+        }
+        let json_report = JsonDoctor {
+            healthy: report.healthy,
+            sections: report
+                .sections
+                .iter()
+                .map(|section| JsonSection {
+                    name: section.name,
+                    healthy: section.healthy,
+                    findings: section
+                        .findings
+                        .iter()
+                        .map(|finding| JsonFinding {
+                            item: &finding.item,
+                            problem: &finding.problem,
+                            fix: &finding.fix,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        return Ok(serde_json::to_string_pretty(&json_report)?);
     }
-    let mut out = String::from("Tree checks:\n");
-    if !health.tree_exists {
-        writeln!(
-            out,
-            "  ✗ tree missing at {} — doctor only reports; the next prefix \
-             command creates it",
-            health.root.display()
-        )?;
-        return Ok(out);
+    let mut out = String::new();
+    for section in &report.sections {
+        let status = if section.healthy { "ok" } else { "FAIL" };
+        writeln!(out, "{:<17} {status}", section.name)?;
+        for finding in &section.findings {
+            writeln!(out, "  ✗ {} — {}.", finding.item, finding.problem)?;
+            writeln!(out, "    fix: {}", finding.fix)?;
+        }
     }
-    writeln!(out, "  ✓ root: {}", health.root.display())?;
-    if health.missing_dirs.is_empty() {
-        writeln!(out, "  ✓ directories: prefixes, apps, runtime, cache")?;
+    if report.healthy {
+        writeln!(out, "\nall checks pass")?;
+    } else {
+        writeln!(out, "\nproblems found — exit 1")?;
     }
-    for dir in &health.missing_dirs {
-        writeln!(
-            out,
-            "  ✗ missing directory: {} — Cellar recreates it on the next command",
-            dir.display()
-        )?;
-    }
-    if health.missing_files.is_empty()
-        && health.invalid_files.is_empty()
-        && health.missing_exes.is_empty()
-    {
-        writeln!(
-            out,
-            "  ✓ files and entries: settings.toml, every entry, and every registered exe parse"
-        )?;
-    }
-    for file in &health.missing_files {
-        writeln!(
-            out,
-            "  ✗ missing file: {} — Cellar recreates defaults on the next command",
-            file.display()
-        )?;
-    }
-    for file in &health.invalid_files {
-        writeln!(
-            out,
-            "  ✗ invalid file: {} — not read; repair or delete it (Cellar never \
-             overwrites hand edits)",
-            file.display()
-        )?;
-    }
-    for slug in &health.missing_exes {
-        writeln!(
-            out,
-            "  ✗ missing exe for entry '{slug}' — the registered exe is gone; \
-             re-register it with `cellar install` or uninstall the entry"
-        )?;
-    }
-    for dir in &health.orphan_prefix_dirs {
-        writeln!(
-            out,
-            "  ✗ orphan prefix directory: {} — no prefix.toml inside; delete it",
-            dir.display()
-        )?;
-    }
-    out.push('\n');
     Ok(out)
 }
 
@@ -1410,34 +1418,170 @@ mod tests {
 
     #[test]
     fn doctor_renders_pass_and_fail_sections() -> anyhow::Result<()> {
-        let healthy = TreeHealth {
-            root: PathBuf::from("/tmp/cellar"),
-            tree_exists: true,
-            missing_dirs: Vec::new(),
-            missing_files: Vec::new(),
-            invalid_files: Vec::new(),
-            orphan_prefix_dirs: Vec::new(),
-            missing_exes: Vec::new(),
-            schema_version: 1,
+        use cellar_app::{DoctorFinding, DoctorSection};
+
+        let healthy = DoctorReport {
+            sections: vec![DoctorSection {
+                name: "tree health",
+                healthy: true,
+                findings: Vec::new(),
+            }],
+            healthy: true,
         };
-        let out = render_tree_health(&healthy, false)?;
-        assert!(out.contains("✓"), "healthy tree should pass:\n{out}");
-        let mut broken = healthy.clone();
-        broken
-            .invalid_files
-            .push(PathBuf::from("prefixes/x/prefix.toml"));
-        let out = render_tree_health(&broken, false)?;
-        assert!(out.contains('✗'), "broken tree should fail:\n{out}");
-        assert!(out.contains("never overwrites"), "fix hint missing:\n{out}");
-        let mut gone = healthy;
-        gone.missing_exes.push("balatro".to_owned());
-        let out = render_tree_health(&gone, false)?;
-        assert!(out.contains('✗'), "missing exe should fail:\n{out}");
+        let out = render_doctor_report(&healthy, false)?;
+        assert!(out.contains("tree health"), "section missing:\n{out}");
+        assert!(out.contains("ok"), "passing section:\n{out}");
+        assert!(out.contains("all checks pass"), "healthy overall:\n{out}");
+
+        let broken = DoctorReport {
+            sections: vec![
+                DoctorSection {
+                    name: "exe integrity",
+                    healthy: false,
+                    findings: vec![DoctorFinding {
+                        item: "balatro".to_owned(),
+                        problem: "registered executable missing from disk".to_owned(),
+                        fix:
+                            "re-register it (`cellar install <path>`) or `cellar uninstall balatro`"
+                                .to_owned(),
+                    }],
+                },
+                DoctorSection {
+                    name: "runner integrity",
+                    healthy: false,
+                    findings: vec![DoctorFinding {
+                        item: "proton GE-Proton11-5".to_owned(),
+                        problem: "the install directory is missing".to_owned(),
+                        fix: "reinstall it: cellar runner install proton GE-Proton11-5".to_owned(),
+                    }],
+                },
+            ],
+            healthy: false,
+        };
+        let out = render_doctor_report(&broken, false)?;
+        assert!(out.contains("✗ balatro"), "finding missing:\n{out}");
         assert!(
-            out.contains("missing exe for entry 'balatro'"),
-            "flag missing:\n{out}"
+            out.contains("fix: re-register it"),
+            "fix hint missing:\n{out}"
         );
-        assert!(out.contains("re-register it"), "fix hint missing:\n{out}");
+        assert!(
+            out.contains("problems found — exit 1"),
+            "exit story:\n{out}"
+        );
+
+        // --json: the structured report, machine-readable.
+        let json = render_doctor_report(&broken, true)?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        assert_eq!(value["healthy"], serde_json::Value::Bool(false));
+        assert_eq!(value["sections"][0]["name"], "exe integrity");
+        assert_eq!(
+            value["sections"][1]["findings"][0]["item"],
+            "proton GE-Proton11-5"
+        );
+        assert!(
+            json.contains("reinstall it"),
+            "fix in json missing:\n{json}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_healthy_system_exits_zero() -> anyhow::Result<()> {
+        use cellar_core::ConfiguredRunner;
+
+        // A fully healthy system — tree, exes, no managed records, and a
+        // plan that builds (a configured stub wine) — exits 0, the
+        // scripted health-check contract (AC).
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-doctor-ok-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let wine = root.join("stub-wine");
+        write_stub_script(&wine, "exit 0\n")?;
+        let exe = root.join("drive_c/tool.exe");
+        std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(&exe, "MZ")?;
+        let _registered = only_registration(
+            InstallService::new(
+                store.clone(),
+                ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+                test_desktop(&store),
+            )
+            .install(
+                &exe,
+                "default",
+                Some("My Tool"),
+                AppKind::Tool,
+                ArtifactKind::Standalone,
+            )?,
+        );
+        let mut prefix = store.load_prefix("default")?;
+        prefix.defaults.runner = Some(RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(wine),
+        ));
+        store.save_prefix(&prefix)?;
+        let code = run_doctor(&store, false)?;
+        assert_eq!(code, ExitCode::SUCCESS, "a healthy tree exits 0");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_exits_one_when_a_registered_exe_is_gone() -> anyhow::Result<()> {
+        // The exe-integrity section: a registered exe deleted off disk
+        // surfaces in the doctor with a re-registration fix, exit 1.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-doctor-exe-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let exe = root.join("drive_c/tool.exe");
+        std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))?;
+        std::fs::write(&exe, "MZ")?;
+        let _registered = only_registration(
+            InstallService::new(
+                store.clone(),
+                ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+                test_desktop(&store),
+            )
+            .install(
+                &exe,
+                "default",
+                Some("My Tool"),
+                AppKind::Tool,
+                ArtifactKind::Standalone,
+            )?,
+        );
+        std::fs::remove_file(&exe)?;
+        let code = run_doctor(&store, false)?;
+        assert_eq!(code, ExitCode::FAILURE, "a missing exe exits 1");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_broken_managed_installs_and_exits_one() -> anyhow::Result<()> {
+        // The runner-integrity section with the registry's real probe: a
+        // recorded install whose directory is missing is a finding with a
+        // reinstall fix, exit 1 (AC: runner integrity including managed
+        // installs).
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-doctor-runner-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.join("cellar"));
+        std::fs::create_dir_all(root.join("cellar/runtime"))?;
+        std::fs::write(
+            root.join("cellar/runtime/providers.toml"),
+            "schema_version = 1\n\n[[runner]]\nprovider_id = \"proton\"\nversion = \"GE-Proton11-5\"\ninstall = \"proton/GE-Proton11-5\"\n",
+        )?;
+        let code = run_doctor(&store, false)?;
+        assert_eq!(code, ExitCode::FAILURE, "a broken managed install exits 1");
         Ok(())
     }
 
@@ -1815,8 +1959,20 @@ mod tests {
         std::fs::remove_file(&exe).unwrap_or_else(|e| panic!("remove: {e}"));
         let listed = service.list()?;
         assert_eq!(listed[0].status.as_str(), "missing-exe");
-        let health = DoctorService::new(store.clone()).tree_health()?;
-        assert_eq!(health.missing_exes, ["my-game"]);
+        let health = DoctorService::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+        )
+        .check()?;
+        let exes = &health.sections[1];
+        assert_eq!(
+            exes.findings
+                .iter()
+                .map(|f| f.item.as_str())
+                .collect::<Vec<_>>(),
+            ["my-game"],
+            "the exe-integrity section flags the missing exe"
+        );
         service.uninstall("my-game")?;
         assert!(service.list()?.is_empty());
         Ok(())

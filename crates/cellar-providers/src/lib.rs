@@ -15,6 +15,7 @@
 //! registry's return vocabulary (ADR 0002 amendment, 2026-08).
 
 use cellar_core::entities::Prefix;
+use cellar_core::manifest::ManagedRecord;
 use cellar_core::ports::{ManagedRunner, RunnerResolver, WrapperContributor};
 use cellar_core::types::{ResolvedRunner, RunnerFamily};
 use cellar_provider_gamescope::GamescopeProvider;
@@ -81,6 +82,42 @@ pub fn wrappers_for(
     wrappers
 }
 
+/// The integrity probe for one recorded managed install: the same marker
+/// the installer pipeline probes at install time — the provider's
+/// launcher (`proton` script / `umu-run`). Read-only; the doctor's
+/// composition root wires it through the app's `ManagedProbe` seam.
+///
+/// `None` means intact; `Some((problem, fix))` names the damage and its
+/// fix in the provider's own vocabulary. An unknown provider id names
+/// itself — a record Cellar cannot verify is never mis-attributed as a
+/// broken install (review #35).
+pub fn probe_managed(record: &ManagedRecord, runtime_dir: &Path) -> Option<(String, String)> {
+    let install = runtime_dir.join(&record.install);
+    let intact = match record.provider_id.as_str() {
+        "proton" => ProtonProvider::proton_dir_ok(&install),
+        "umu" => UmuProvider::umu_dir_ok(&install),
+        _ => {
+            return Some((
+                "unknown provider — Cellar cannot verify this record".to_owned(),
+                "no Cellar command installs it: remove the [[runner]] entry from \
+                 runtime/providers.toml by hand, or check whether a future provider ships it"
+                    .to_owned(),
+            ));
+        }
+    };
+    if intact {
+        None
+    } else {
+        Some((
+            "the install directory is missing, or its launcher is not executable".to_owned(),
+            format!(
+                "reinstall it: cellar runner install {} {}",
+                record.provider_id, record.version
+            ),
+        ))
+    }
+}
+
 /// Steam Proton discovery (read-only host state, research #18): every
 /// working install under the env-derived Steam roots, name-sorted — the
 /// discover-only enumeration `runner list` shows.
@@ -122,6 +159,57 @@ mod tests {
     use cellar_provider_umu::install_path;
 
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn probe_managed_names_intact_broken_and_unknown_records() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let runtime = std::env::temp_dir().join(format!(
+            "cellar-providers-probe-{}-{seq}",
+            std::process::id()
+        ));
+        let intact = runtime.join("proton/GE-Proton11-5");
+        std::fs::create_dir_all(&intact).unwrap();
+        std::fs::write(intact.join("proton"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(intact.join("proton"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(intact.join("proton"), perms).unwrap();
+
+        let record = |provider: &str| ManagedRecord {
+            provider_id: provider.to_owned(),
+            version: "GE-Proton11-5".to_owned(),
+            install: format!("{provider}/GE-Proton11-5"),
+        };
+        // Intact: the launcher passes the probe.
+        assert_eq!(probe_managed(&record("proton"), &runtime), None);
+        // Broken: the record points at an install that is not there.
+        let missing = probe_managed(&record("umu"), &runtime);
+        assert!(missing.is_some());
+        let (problem, fix) = missing.unwrap();
+        assert!(problem.contains("launcher is not executable"), "{problem}");
+        assert!(
+            fix.contains("cellar runner install umu GE-Proton11-5"),
+            "{fix}"
+        );
+        // Unknown: the record names itself — never mis-attributed damage.
+        let unknown = probe_managed(&record("halfling"), &runtime).unwrap();
+        assert!(
+            unknown.0.contains("unknown provider"),
+            "the record names itself: {}",
+            unknown.0
+        );
+        assert!(
+            !unknown.1.contains("cellar runner install halfling"),
+            "the fix must not lie about a reinstall: {}",
+            unknown.1
+        );
+    }
 
     #[test]
     fn registry_wires_every_provider() {
