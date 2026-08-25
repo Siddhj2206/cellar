@@ -27,6 +27,7 @@ mod icon;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cellar_core::entities::{AppEntry, AppKind};
@@ -104,6 +105,26 @@ fn remove_file(path: &Path) -> Result<(), DesktopError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(DesktopError::Io(format!("{}: {error}", path.display()))),
     }
+}
+
+/// The freedesktop MIME-database indexer, run best-effort after every
+/// association write (#55).
+const UPDATE_DESKTOP_DATABASE: &str = "update-desktop-database";
+
+/// Best-effort refresh of the MIME database over the entries directory:
+/// file managers discover entries through the generated
+/// `mimeinfo.cache`, so an association written without the index stays
+/// invisible — "wired" only on paper (#55). A missing indexer degrades
+/// silently; a failing run is non-fatal (the next association write
+/// retries). The cache lands beside our own entries — derived host
+/// state, same as the entries themselves.
+fn refresh_mime_database(entries_dir: &Path) {
+    let _ = Command::new(UPDATE_DESKTOP_DATABASE)
+        .arg(entries_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Atomic write in the target directory (temp file + rename): a reader
@@ -236,7 +257,11 @@ impl DesktopIntegrator for DesktopService {
             executable: &self.executable,
         }
         .render();
-        write_atomic(&path, rendered.as_bytes())
+        write_atomic(&path, rendered.as_bytes())?;
+        // The write alone is invisible to file managers until the MIME
+        // index refreshes — best-effort, right here (#55).
+        refresh_mime_database(&self.entries_dir());
+        Ok(())
     }
 }
 
@@ -420,7 +445,35 @@ mod tests {
         let rendered = fs::read_to_string(&path).expect("association readable");
         assert!(rendered.contains("Exec=/opt/cellar/bin/cellar install %f\n"));
         assert!(rendered.contains("NoDisplay=true\n"));
-        assert!(rendered.contains("MimeType=application/x-ms-dos-program;\n"));
+        assert!(rendered.contains("MimeType=application/vnd.microsoft.portable-executable;\n"));
+    }
+
+    /// Whether the MIME indexer is on PATH — the positive half of the
+    /// best-effort refresh only holds when the system ships one.
+    fn indexer_available() -> bool {
+        std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(UPDATE_DESKTOP_DATABASE).is_file())
+        })
+    }
+
+    #[test]
+    fn association_refreshes_the_mime_index_best_effort() {
+        let root = root("mime-index");
+        let service = service(&root);
+        // Success is unconditional — a missing indexer must degrade
+        // silently, never fail the association.
+        service.set_file_association().expect("association writes");
+        if !indexer_available() {
+            return;
+        }
+        let cache = service.entries_dir().join("mimeinfo.cache");
+        let indexed = fs::read_to_string(&cache).expect("the indexer indexed our entries dir");
+        assert!(
+            indexed.contains(
+                "application/vnd.microsoft.portable-executable=open-with-cellar.desktop;"
+            ),
+            "the cache indexes Cellar under the canonical .exe type"
+        );
     }
 
     #[test]

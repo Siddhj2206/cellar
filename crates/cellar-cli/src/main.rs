@@ -3906,6 +3906,11 @@ mod tests {
             rendered.contains("launch balatro\n"),
             "the entry launches the app"
         );
+        let association = home.join("cellar/applications/open-with-cellar.desktop");
+        assert!(
+            association.exists(),
+            "a fresh install wires the Open-with-Cellar association (#55) — no manual desktop sync"
+        );
         let service = InstallService::new(
             store.clone(),
             ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
@@ -3913,6 +3918,10 @@ mod tests {
         );
         service.uninstall("balatro")?;
         assert!(!entry.exists(), "uninstalling removes the launcher entry");
+        assert!(
+            association.exists(),
+            "uninstall leaves the association — global state, not the app's"
+        );
         Ok(())
     }
 

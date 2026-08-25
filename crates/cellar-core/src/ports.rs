@@ -196,6 +196,12 @@ pub trait DesktopIntegrator: __sealed::Sealed + Send + Sync + Debug {
     /// Wire the "Open with Cellar" file association for Windows
     /// executables: a no-display launcher whose exec line calls the
     /// presentation binary's install entrypoint directly — no wrapper
-    /// binary, no shell wrapper (ADR 0004).
+    /// binary, no shell wrapper (ADR 0004). The declared type is exactly
+    /// `application/vnd.microsoft.portable-executable`, and the
+    /// implementation refreshes the host MIME index (`mimeinfo.cache`)
+    /// best-effort so file managers see the association immediately
+    /// (#55). Every registration calls this too — the association is
+    /// never only a sync-time artifact; uninstall leaves it alone
+    /// (global state).
     fn set_file_association(&self) -> Result<(), DesktopError>;
 }

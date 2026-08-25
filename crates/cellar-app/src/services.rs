@@ -487,10 +487,12 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
     /// which renames the entry, #33), never duplicated; a fresh entry
     /// takes the deduped slug, the binding prefix, and the source
     /// metadata. Every registration closes with the entry's derived
-    /// launcher artifacts: the cached icon and the `.desktop` entry
+    /// launcher artifacts: the cached icon, the `.desktop` entry
     /// (created under the current slug, the renamed one removed — the
-    /// entry file name tracks the slug). Callers pre-flight: `base` is a
-    /// pre-slugified display name and `canonical` a verified exe path.
+    /// entry file name tracks the slug), and the global "Open with
+    /// Cellar" association (#55 — never only a sync-time artifact).
+    /// Callers pre-flight: `base` is a pre-slugified display name and
+    /// `canonical` a verified exe path.
     fn register_one(
         &self,
         canonical: &Path,
@@ -537,6 +539,10 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
                 (existing.slug != old_slug).then_some(old_slug).as_deref(),
                 icon.as_deref(),
             )?;
+            // Every registration also keeps the global "Open with Cellar"
+            // association fresh (#55): idempotent, so the file-manager
+            // popup is never left waiting for a manual `desktop sync`.
+            self.desktop.set_file_association()?;
             return Ok(InstallResult {
                 entry: existing,
                 was_update: true,
@@ -561,6 +567,9 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         let icon = self.desktop.install_icon(&app.exe)?;
         self.desktop
             .create_entry(&app, previous_slug, icon.as_deref())?;
+        // As in the update branch (#55): the association rides every
+        // successful registration.
+        self.desktop.set_file_association()?;
         Ok(InstallResult {
             entry: app,
             was_update: false,
@@ -1446,6 +1455,7 @@ mod tests {
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides, Settings};
@@ -2726,6 +2736,11 @@ mod tests {
             ["balatro".to_owned()],
             "the uninstall removes the app's entry"
         );
+        assert_eq!(
+            desktop.associations_wired(),
+            0,
+            "the uninstall never touches the association — global state, not the app's"
+        );
         Ok(())
     }
 
@@ -2835,6 +2850,51 @@ mod tests {
             desktop.prunes(),
             [vec!["balatro".to_owned(), "warpinator".to_owned()]],
             "the stale sweep keeps exactly the tree's apps"
+        );
+        assert_eq!(
+            desktop.associations_wired(),
+            1,
+            "the sync wires the Open-with-Cellar association once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn registration_wires_the_file_association_too() -> anyhow::Result<()> {
+        // AC (#55): every successful registration also wires the
+        // "Open with Cellar" association — the file-manager popup exists
+        // from the first install, never only after a manual
+        // `desktop sync`. Idempotent, so re-registrations just refresh it.
+        let desktop = StubDesktop::new();
+        let service = InstallService::new(
+            MockStorage::new(healthy_tree()),
+            StubResolver::ok(),
+            desktop.clone(),
+        );
+        service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            None,
+            AppKind::Game,
+            ArtifactKind::Standalone,
+        )?;
+        assert_eq!(
+            desktop.associations_wired(),
+            1,
+            "the fresh registration wired the association"
+        );
+        // An update-in-place rides the same seam.
+        service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            Some("Poker Night"),
+            AppKind::Game,
+            ArtifactKind::Standalone,
+        )?;
+        assert_eq!(
+            desktop.associations_wired(),
+            2,
+            "the re-registration refreshed the association"
         );
         Ok(())
     }
@@ -3137,6 +3197,8 @@ mod tests {
         icons: Arc<Mutex<Vec<PathBuf>>>,
         /// Every stale-sweep keep-list.
         prunes: Arc<Mutex<Vec<Vec<String>>>>,
+        /// How many times the "Open with Cellar" association was wired.
+        associations: Arc<AtomicUsize>,
     }
 
     impl StubDesktop {
@@ -3170,6 +3232,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
+        }
+
+        fn associations_wired(&self) -> usize {
+            self.associations.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -3214,6 +3280,8 @@ mod tests {
         }
 
         fn set_file_association(&self) -> Result<(), DesktopError> {
+            self.associations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }

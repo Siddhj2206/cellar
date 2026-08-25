@@ -96,11 +96,15 @@ fn exec_args(args: &[String]) -> String {
 /// Wire the "Open with Cellar" file association for Windows executables:
 /// a no-display launcher whose exec line calls the presentation binary's
 /// install entrypoint directly on the file the file manager hands it
-/// (`%f`) — no wrapper binary, no shell wrapper (ADR 0004). The
-/// association file makes Cellar *available* in a file manager's "Open
-/// With" dialog; the user's once-per-environment choice of default (and
-/// the `mimeapps.list` record) stays the user's and the file manager's —
-/// Cellar never overrides a default selection.
+/// (`%f`) — no wrapper binary, no shell wrapper (ADR 0004). The declared
+/// type is exactly `application/vnd.microsoft.portable-executable` —
+/// what `.exe` files resolve to on current shared-mime-info; legacy
+/// aliases (`x-ms-dos-program`) exist in none and declaring unresolvable
+/// types is its own bug (#55). The association file makes Cellar
+/// *available* in a file manager's "Open With" dialog; the user's
+/// once-per-environment choice of default (and the `mimeapps.list`
+/// record) stays the user's and the file manager's — Cellar never
+/// overrides a default selection.
 pub(crate) struct AssociationEntry<'a> {
     pub executable: &'a Path,
 }
@@ -113,7 +117,7 @@ impl AssociationEntry<'_> {
              Name=Open with Cellar\n\
              Exec={} install %f\n\
              NoDisplay=true\n\
-             MimeType=application/x-ms-dos-program;\n\
+             MimeType=application/vnd.microsoft.portable-executable;\n\
              Comment=Install this Windows executable through Cellar\n\
              Terminal=false\n",
             quote_exec_arg(self.executable),
@@ -194,6 +198,6 @@ mod tests {
         .render();
         assert!(rendered.contains("Exec=/opt/cellar/bin/cellar install %f\n"));
         assert!(rendered.contains("NoDisplay=true\n"));
-        assert!(rendered.contains("MimeType=application/x-ms-dos-program;\n"));
+        assert!(rendered.contains("MimeType=application/vnd.microsoft.portable-executable;\n"));
     }
 }
