@@ -4,7 +4,7 @@
 //! adapter writes what `render` produces.
 
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The freedesktop category a `Game` entry belongs to.
 pub(crate) const CATEGORY_GAME: &str = "Game";
@@ -85,6 +85,28 @@ pub(crate) fn quote_exec_arg(arg: &Path) -> String {
 /// the reserved characters must be quoted).
 fn is_safe(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '+' | '=' | '@')
+}
+
+/// The Exec line's first argument — the binary path — recovered from a
+/// rendered-by-us file: the inverse of [`quote_exec_arg`] for one
+/// argument (unquoted safe-set verbatim; double-quoted with the spec's
+/// escapes unescaped). `None` when the value is empty or unterminated.
+/// Foreign `.desktop` files are not an input contract — only our own
+/// renderer's output is parsed (#57).
+pub(crate) fn read_exec_arg(line: &str) -> Option<PathBuf> {
+    let value = line.strip_prefix("Exec=")?.trim_start();
+    if let Some(rest) = value.strip_prefix('"') {
+        let mut out = String::with_capacity(rest.len());
+        let mut chars = rest.chars();
+        loop {
+            match chars.next()? {
+                '\\' => out.push(chars.next()?),
+                '"' => return Some(PathBuf::from(out)),
+                other => out.push(other),
+            }
+        }
+    }
+    value.split_whitespace().next().map(PathBuf::from)
 }
 
 /// The space-joined argument list; every element is Exec-safe by

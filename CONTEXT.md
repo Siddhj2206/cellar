@@ -39,7 +39,7 @@ Removing an AppEntry: Cellar runs the app's Windows uninstaller when one is regi
 _Avoid_: unregister, remove, delete
 
 **Doctor**:
-The sectioned capability check (blueprint §8): tree health, exe integrity, runner integrity (managed installs), plan buildable — each pass/fail with a fix hint drawn from the §7 dispositions (SuggestInstall, reinstall, recreate, re-register). Read-only: it reports what is on disk and never repairs — hand-edit damage surfaces with its fix, never silently overwritten (ADR 0001). Its exit code is overall health (0 healthy / 1 problems), so scripts can health-check. (Landed with #35.)
+The sectioned capability check (blueprint §8): tree health, exe integrity, runner integrity (managed installs), plan buildable, desktop integration (#57) — each pass/fail with a fix hint drawn from the §7 dispositions (SuggestInstall, reinstall, recreate, re-register) or, for the host-facing fifth section, the sync pointer (self-reported "kept but unrepaired" when sync cannot repair). Read-only: it reports what is on disk and never repairs — hand-edit damage surfaces with its fix, never silently overwritten (ADR 0001). Its exit code is overall health (0 healthy / 1 problems), so scripts can health-check. (Landed with #35; fifth section with #57.)
 _Avoid_: diagnostics, status report, health check
 
 **Managed runner**:

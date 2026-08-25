@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use crate::entities::{AppEntry, Candidate, Prefix, Settings};
 use crate::errors::{DesktopError, ResolveError, StorageError};
-use crate::health::TreeHealth;
+use crate::health::{DesktopIntegration, TreeHealth};
 use crate::manifest::{ManagedRecord, RunnerManifest};
 use crate::types::{LaunchPlan, Layer, ResolvedRunner, RunnerSpec};
 
@@ -208,4 +208,24 @@ pub trait DesktopIntegrator: __sealed::Sealed + Send + Sync + Debug {
     /// never only a sync-time artifact; uninstall leaves it alone
     /// (global state).
     fn set_file_association(&self) -> Result<(), DesktopError>;
+
+    /// The Exec target our launcher entry for `slug` records — the binary
+    /// path a click would launch. `None` when no entry file exists for the
+    /// slug or its Exec line is unreadable: nothing recorded to compare.
+    fn entry_exec_target(&self, slug: &str) -> Result<Option<PathBuf>, DesktopError>;
+
+    /// What this integrator records into every Exec line it writes — the
+    /// comparison side of [`DesktopIntegrator::entry_exec_target`] (#57):
+    /// an entry whose recorded target differs from this is repointed by
+    /// the next rewrite, which is exactly the repaired count.
+    fn exec_target(&self) -> &Path;
+
+    /// The desktop-integration facts doctor's fifth section reports
+    /// (#57): which owned entries point at binaries that no longer exist,
+    /// and the Open-with-Cellar association's state. Staleness is
+    /// existence-only — a target that exists but differs from the running
+    /// binary is a legitimate multi-binary setup and is never reported;
+    /// icons are never reported (the cache is disposable). Read-only:
+    /// like [`Storage::tree_health`], it reports exactly what is on disk.
+    fn integration_health(&self) -> Result<DesktopIntegration, DesktopError>;
 }

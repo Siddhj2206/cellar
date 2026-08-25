@@ -32,9 +32,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use cellar_core::entities::{AppEntry, AppKind};
 use cellar_core::errors::DesktopError;
+use cellar_core::health::{AssociationState, DesktopIntegration};
 use cellar_core::ports::{__sealed, DesktopIntegrator};
 
-use entry::{AssociationEntry, CATEGORY_GAME, CATEGORY_TOOL, DesktopEntry};
+use entry::{AssociationEntry, CATEGORY_GAME, CATEGORY_TOOL, DesktopEntry, read_exec_arg};
 
 /// The desktop adapter the composition root injects into the generic app
 /// services: constructed over the tree root and the presentation binary
@@ -84,6 +85,15 @@ impl DesktopService {
     /// rename (and the previous file is removed by the caller).
     fn entry_path(&self, slug: &str) -> PathBuf {
         self.entries_dir().join(format!("cellar-{slug}.desktop"))
+    }
+
+    /// The Exec target recorded in a `.desktop` file we rendered, if its
+    /// Exec line carries a readable first argument (#57). An unreadable
+    /// or Exec-less file records nothing — there is no target to die.
+    fn read_exec_target(path: &Path) -> Option<PathBuf> {
+        let text = fs::read_to_string(path).ok()?;
+        let line = text.lines().find(|line| line.starts_with("Exec="))?;
+        read_exec_arg(line)
     }
 
     /// The cache file for one exe: a hash of the canonical exe path
@@ -263,6 +273,65 @@ impl DesktopIntegrator for DesktopService {
         refresh_mime_database(&self.entries_dir());
         Ok(())
     }
+
+    fn entry_exec_target(&self, slug: &str) -> Result<Option<PathBuf>, DesktopError> {
+        Ok(Self::read_exec_target(&self.entry_path(slug)))
+    }
+
+    fn exec_target(&self) -> &Path {
+        &self.executable
+    }
+
+    fn integration_health(&self) -> Result<DesktopIntegration, DesktopError> {
+        let dir = self.entries_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // No entries directory yet: this host was never integrated —
+            // nothing derived exists that could be broken (#57), which is
+            // exactly the association state the doctor passes clean.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DesktopIntegration::default());
+            }
+            Err(error) => {
+                return Err(DesktopError::Io(format!("{}: {error}", dir.display())));
+            }
+        };
+        let mut dead_entries = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| DesktopError::Io(format!("{}: {error}", dir.display())))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Our namespaced entry files only; another program's entries
+            // and the association file are not launcher entries.
+            let slug = name
+                .strip_prefix("cellar-")
+                .and_then(|rest| rest.strip_suffix(".desktop"));
+            let Some(slug) = slug else {
+                continue;
+            };
+            // A file with no readable Exec target has nothing to die;
+            // staleness itself is existence-only (#57): a target that
+            // exists but differs from this binary is a legitimate
+            // multi-binary setup, never a finding.
+            let Some(target) = Self::read_exec_target(&entry.path()) else {
+                continue;
+            };
+            if !target.exists() {
+                dead_entries.push((slug.to_owned(), target));
+            }
+        }
+        dead_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let association_path = dir.join(Self::ASSOCIATION_FILE);
+        let association = match Self::read_exec_target(&association_path) {
+            Some(target) if target.exists() => AssociationState::Wired,
+            Some(target) => AssociationState::Dead(target),
+            None => AssociationState::Missing,
+        };
+        Ok(DesktopIntegration {
+            dead_entries,
+            association,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +374,167 @@ mod tests {
     /// everywhere else assume the tree exists, like the real adapter).
     fn tree(root: &Path) {
         fs::create_dir_all(root).expect("tree dir");
+    }
+
+    #[test]
+    fn entry_exec_target_reads_back_what_create_entry_wrote() {
+        // #57: sync's repair counting compares the recorded target against
+        // what a rewrite records — the read-back must invert the Exec
+        // quoting exactly, spaces included.
+        let root = root("exec-target");
+        let dir = root.parent().unwrap();
+        let service = DesktopService::new(root.clone(), PathBuf::from("/opt/my bin dir/cellar"));
+        service
+            .create_entry(&app("balatro", AppKind::Game), None, None)
+            .expect("entry written");
+        assert_eq!(
+            service.entry_exec_target("balatro").expect("readable"),
+            Some(PathBuf::from("/opt/my bin dir/cellar")),
+            "the recorded target is the quoted path unquoted"
+        );
+        assert_eq!(
+            service
+                .entry_exec_target("never-registered")
+                .expect("readable"),
+            None,
+            "no entry file records no target"
+        );
+        let _ = dir;
+    }
+
+    #[test]
+    fn integration_health_reports_only_genuinely_dead_targets() {
+        // #57 decision 2: staleness is existence-only — entries whose
+        // target exists but differs from this binary are legitimate
+        // multi-binary setups and never reported; foreign files are
+        // invisible; an untouched host reports Untouched.
+        let root = root("integration-health");
+        tree(&root);
+        let gone = DesktopService::new(root.clone(), PathBuf::from("/nonexistent/bin/cellar-gone"));
+        gone.create_entry(&app("balatro", AppKind::Game), None, None)
+            .expect("dead-target entry");
+        gone.create_entry(&app("icon32", AppKind::Tool), None, None)
+            .expect("dead-target entry");
+        // A second binary sharing the entries directory: alive.
+        let live = DesktopService::new(root.clone(), PathBuf::from("/bin/false"));
+        live.create_entry(&app("warpinator", AppKind::Tool), None, None)
+            .expect("live-target entry");
+        // A foreign launcher must never be reported.
+        std::fs::write(
+            root.parent()
+                .unwrap()
+                .join("applications")
+                .join("other-app.desktop"),
+            "[Desktop Entry]\nType=Application\nExec=/nonexistent/foreign\n",
+        )
+        .expect("foreign entry");
+
+        let health = gone.integration_health().expect("readable");
+        assert_eq!(
+            health.dead_entries,
+            [
+                (
+                    "balatro".to_owned(),
+                    PathBuf::from("/nonexistent/bin/cellar-gone")
+                ),
+                (
+                    "icon32".to_owned(),
+                    PathBuf::from("/nonexistent/bin/cellar-gone")
+                ),
+            ],
+            "exactly our dead-targeted entries, sorted by slug"
+        );
+        assert_eq!(health.association, AssociationState::Missing);
+
+        // The same host through the live binary: the dead are still dead
+        // (existence-only), while warpinator's target — existing though it
+        // differs from this binary — stays unreported either way.
+        let health = live.integration_health().expect("readable");
+        assert_eq!(
+            health
+                .dead_entries
+                .iter()
+                .map(|(slug, _)| slug.as_str())
+                .collect::<Vec<_>>(),
+            ["balatro", "icon32"],
+            "warps' live target is never flagged despite differing"
+        );
+    }
+
+    #[test]
+    fn integration_health_on_an_untouched_host_passes_clean() {
+        // #57 AC: a fresh tree (no applications/ at all) has nothing
+        // derived to be broken — the doctor's fifth section passes clean.
+        let health = service(&root("untouched"))
+            .integration_health()
+            .expect("readable");
+        assert_eq!(
+            health,
+            DesktopIntegration {
+                dead_entries: Vec::new(),
+                association: AssociationState::Untouched,
+            }
+        );
+    }
+
+    #[test]
+    fn integration_health_tracks_the_association_states() {
+        // #57 AC: missing/broken association is flagged — Wired when the
+        // target lives, Dead when it does not, Missing when the file is
+        // gone or carries no readable Exec line.
+        let root = root("association-states");
+        tree(&root);
+        let gone = DesktopService::new(root.clone(), PathBuf::from("/nonexistent/bin/cellar"));
+        gone.set_file_association().expect("association written");
+        assert_eq!(
+            gone.integration_health().expect("readable").association,
+            AssociationState::Dead(PathBuf::from("/nonexistent/bin/cellar")),
+        );
+        let live = DesktopService::new(root.clone(), PathBuf::from("/bin/false"));
+        live.set_file_association().expect("association rewritten");
+        assert_eq!(
+            live.integration_health().expect("readable").association,
+            AssociationState::Wired,
+        );
+        let applications = root.parent().unwrap().join("applications");
+        std::fs::remove_file(applications.join("open-with-cellar.desktop")).expect("removed");
+        assert_eq!(
+            live.integration_health().expect("readable").association,
+            AssociationState::Missing,
+        );
+        std::fs::write(applications.join("open-with-cellar.desktop"), "garbage")
+            .expect("vandalized");
+        assert_eq!(
+            live.integration_health().expect("readable").association,
+            AssociationState::Missing,
+            "a file with no Exec line records nothing to check"
+        );
+    }
+
+    #[test]
+    fn a_vandalized_entry_carries_no_target_and_is_never_dead() {
+        // Foreign or damaged files in our namespace record nothing (#57):
+        // there is no Exec target whose death we could report.
+        let root = root("vandalized-entry");
+        tree(&root);
+        let applications = root.parent().unwrap().join("applications");
+        fs::create_dir_all(&applications).expect("entries dir");
+        std::fs::write(applications.join("cellar-x.desktop"), "not a desktop file")
+            .expect("written");
+        let desktop = service(&root);
+        assert_eq!(
+            desktop.entry_exec_target("x").expect("readable"),
+            None,
+            "no Exec line records no target"
+        );
+        assert!(
+            desktop
+                .integration_health()
+                .expect("readable")
+                .dead_entries
+                .is_empty(),
+            "a target-less entry cannot be reported dead"
+        );
     }
 
     #[test]

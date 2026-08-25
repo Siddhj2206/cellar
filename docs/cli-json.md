@@ -152,7 +152,24 @@ The report mirrors the human sections exactly: `healthy` is the overall verdict 
 }
 ```
 
-Sections: `tree health`, `exe integrity`, `runner integrity`, `plan buildable` (locked order).
+Sections, in locked order: `tree health`, `exe integrity`, `runner integrity`, `plan buildable`,
+`desktop integration` (#57 added the fifth). The desktop-integration section reports launcher
+entries whose Exec target no longer exists and a missing or dead Open-with-Cellar association; an
+entry whose app file is damaged (#56) self-reports instead of the sync hint:
+
+```json
+{
+  "name": "desktop integration",
+  "healthy": false,
+  "findings": [
+    {
+      "item": "cellar-icon32.desktop",
+      "problem": "its Exec target no longer exists",
+      "fix": "run cellar desktop sync to re-point it"
+    }
+  ]
+}
+```
 
 ## `cellar launch <app> --dry-run --json`
 

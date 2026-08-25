@@ -19,14 +19,15 @@
 //! it is handed and never writes tree state.
 //!
 //! The managed-runner lifecycle lands with #34 ([`RunnerService`]) and
-//! the full doctor with #35 ([`DoctorService::check`]): the four locked
+//! the full doctor with #35 ([`DoctorService::check`]): the locked
 //! sections — tree health, exe integrity, runner integrity, plan
-//! buildable — each pass/fail with a fix hint, read-only.
+//! buildable, and desktop integration (#57) — each pass/fail with a fix
+//! hint, read-only.
 
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
 use cellar_core::errors::{DesktopError, ResolveError, StorageError};
-use cellar_core::health::TreeHealth;
+use cellar_core::health::{AssociationState, DesktopIntegration, TreeHealth};
 use cellar_core::manifest::{ManagedRecord, RunnerManifest};
 use cellar_core::ports::{
     DesktopIntegrator, InstallProgress, RunnerResolver, Storage, WrapperContributor,
@@ -766,6 +767,11 @@ pub struct DesktopSyncReport {
     /// pruned or rebuilt (nothing derived is destroyed on a typo), and
     /// presentation warns that doctor owns the fix.
     pub damaged_slugs: Vec<String>,
+    /// How many existing entries were re-pointed by this run — their
+    /// recorded Exec target differed from what the rewrite records (#57).
+    /// The receipt for the moved-binary story: sync silently fixes every
+    /// dead entry, and this count is how the user hears it happened.
+    pub repaired_entries: usize,
 }
 
 impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
@@ -786,19 +792,20 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
         // `list_app_slugs` deliberately counts broken files (the dedupe
         // domain, ADR 0001); the difference against parsed apps is
         // exactly the hand-edit damage doctor flags.
-        let parsed: BTreeSet<&str> = apps.iter().map(|app| app.slug.as_str()).collect();
-        let mut damaged_slugs: Vec<String> = self
-            .storage
-            .list_app_slugs()?
+        let mut damaged_slugs: Vec<String> = damaged_slug_set(&self.storage, &apps)?
             .into_iter()
-            .filter(|slug| !parsed.contains(slug.as_str()))
             .collect();
         // Deterministic report order regardless of directory listing.
         damaged_slugs.sort();
         let mut icons = 0usize;
+        let mut repaired_entries = 0usize;
         let mut keep = Vec::with_capacity(apps.len() + damaged_slugs.len());
         for app in &apps {
             keep.push(app.slug.as_str());
+            // Read before rewriting (#57): an existing Exec target that
+            // differs from what this rewrite records means the entry was
+            // pointing elsewhere — usually a moved or deleted binary.
+            let recorded = self.desktop.entry_exec_target(&app.slug)?;
             // The icon's source may be gone (a deleted exe): the entry
             // still re-derives — it is the functional half; the icon
             // comes back once the exe does (US24/25: invalid entries are
@@ -813,6 +820,11 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
             // A fresh create under the current slug; the stale sweep
             // removes any entry left under an old slug.
             self.desktop.create_entry(app, None, icon.as_deref())?;
+            if matches!(&recorded, Some(target) if target != self.desktop.exec_target()) {
+                // An existing entry re-pointed: the repaired receipt
+                // (#57) — no recorded target, nothing to re-point.
+                repaired_entries += 1;
+            }
         }
         // A damaged app file is not a gone app (#56): its entry rides in
         // the keep-list, so the sweep never touches it.
@@ -826,6 +838,7 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
             icons,
             removed_entries,
             damaged_slugs,
+            repaired_entries,
         })
     }
 }
@@ -1125,7 +1138,8 @@ pub struct DoctorFinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorSection {
     /// The locked section name (blueprint §8): tree health, exe integrity,
-    /// runner integrity, plan buildable.
+    /// runner integrity, plan buildable — plus desktop integration (#57,
+    /// the ADR 0004 amendment).
     pub name: &'static str,
     pub healthy: bool,
     pub findings: Vec<DoctorFinding>,
@@ -1154,29 +1168,32 @@ pub type ManagedProbe = fn(record: &ManagedRecord, runtime_dir: &Path) -> Option
 
 /// The doctor use-case (blueprint §7, §8): the check phase applied
 /// tree-wide, sectioned — tree health, exe integrity, runner integrity
-/// (managed installs), plan buildable — each pass/fail with a fix hint
-/// (the §7 dispositions: `SuggestInstall`, reinstall, recreate, re-register).
+/// (managed installs), plan buildable, and desktop integration (#57 amends
+/// ADR 0004's four-section lock) — each pass/fail with a fix hint (the §7
+/// dispositions: `SuggestInstall`, reinstall, recreate, re-register).
 ///
 /// Read-only: the doctor reports what is on disk; it never initializes,
 /// repairs, or overwrites — hand-edited state surfaces with its fix and is
 /// never silently replaced (ADR 0001). This slice (#35) lands the full
 /// surface; the exit code and `--json` shape are presentation's.
-pub struct DoctorService<S: Storage, R: RunnerResolver> {
+pub struct DoctorService<S: Storage, D: DesktopIntegrator, R: RunnerResolver> {
     storage: S,
+    desktop: D,
     resolver: R,
     chain: ChainBuilder,
     probe: ManagedProbe,
 }
 
-impl<S: Storage, R: RunnerResolver> DoctorService<S, R> {
-    /// The service over one storage adapter and one resolver. The wrapper
-    /// chain is the empty default and the managed-install probe is
-    /// fail-closed — an unwired probe refuses to declare installs intact:
-    /// a composition root that forgets to wire `with_checks` gets a loud
-    /// finding, never a silently-passed section.
-    pub fn new(storage: S, resolver: R) -> Self {
+impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R> {
+    /// The service over one storage adapter, one desktop integrator, and
+    /// one resolver. The wrapper chain is the empty default and the
+    /// managed-install probe is fail-closed — an unwired probe refuses to
+    /// declare installs intact: a composition root that forgets to wire
+    /// `with_checks` gets a loud finding, never a silently-passed section.
+    pub fn new(storage: S, desktop: D, resolver: R) -> Self {
         Self {
             storage,
+            desktop,
             resolver,
             chain: empty_chain,
             probe: |_record, _runtime_dir| {
@@ -1193,26 +1210,48 @@ impl<S: Storage, R: RunnerResolver> DoctorService<S, R> {
     /// The service with the launch-pipeline wiring the doctor must mirror:
     /// the registry's per-launch wrapper chain and its managed-install
     /// probe.
-    pub fn with_checks(storage: S, resolver: R, chain: ChainBuilder, probe: ManagedProbe) -> Self {
+    pub fn with_checks(
+        storage: S,
+        desktop: D,
+        resolver: R,
+        chain: ChainBuilder,
+        probe: ManagedProbe,
+    ) -> Self {
         Self {
             storage,
+            desktop,
             resolver,
             chain,
             probe,
         }
     }
 
-    /// The full doctor: the four locked sections, each pass/fail with fix
-    /// hints. Check failures are findings, not errors — the report always
-    /// renders (a section that cannot operate says so in its own
-    /// findings); only the very first read failing propagates.
+    /// The full doctor: the locked sections (#57 adds the fifth), each
+    /// pass/fail with fix hints. Check failures are findings, not errors —
+    /// the report always renders (a section that cannot operate says so in
+    /// its own findings); only the very first read failing propagates.
     pub fn check(&self) -> Result<DoctorReport, StorageError> {
         let health = self.storage.tree_health()?;
         let tree = Self::tree_section(&health);
         let exes = Self::exe_section(&health);
         let runners = self.runner_section();
         let plans = self.plan_section(&health);
-        let sections = vec![tree, exes, runners, plans];
+        // The host-facing half (#57): dead launcher entries and the file
+        // association — derived state the other four sections never see.
+        // The desktop port's failures carry the same two shapes storage's
+        // do (I/O at a path / unrepresentable artifact), so they cross the
+        // seam as their storage twins with the message intact.
+        let integration = self
+            .desktop
+            .integration_health()
+            .map_err(|error| match error {
+                DesktopError::Io(what) => StorageError::Io(what),
+                DesktopError::Invalid(what) => StorageError::Invalid(what),
+            })?;
+        let apps = self.storage.list_apps()?;
+        let damaged = damaged_slug_set(&self.storage, &apps)?;
+        let desktops = Self::desktop_section(&integration, &damaged);
+        let sections = vec![tree, exes, runners, plans, desktops];
         let healthy = sections.iter().all(|section| section.healthy);
         Ok(DoctorReport { sections, healthy })
     }
@@ -1462,6 +1501,51 @@ impl<S: Storage, R: RunnerResolver> DoctorService<S, R> {
             fix,
         }
     }
+
+    /// Section five, desktop integration (#57): the host-facing half —
+    /// launcher entries whose Exec target died with a moved or deleted
+    /// binary, and the Open-with-Cellar association. Every fix hint points
+    /// at `cellar desktop sync` (the re-derivation that repairs them),
+    /// except where sync cannot repair: an entry whose app file is damaged
+    /// is spared by the sweep (#56), so its finding self-reports instead
+    /// of pointing at a fix that would not fix (locked decision 5). Icons
+    /// are never reported — the cache is disposable — and an untouched
+    /// host has nothing derived to be broken.
+    fn desktop_section(
+        integration: &DesktopIntegration,
+        damaged: &BTreeSet<String>,
+    ) -> DoctorSection {
+        let mut findings = Vec::new();
+        for (slug, _target) in &integration.dead_entries {
+            let fix = if damaged.contains(slug) {
+                format!(
+                    "kept but unrepaired — apps/{slug}.toml is damaged; \
+                     repair it and cellar desktop sync re-points the entry"
+                )
+            } else {
+                "run cellar desktop sync to re-point it".to_owned()
+            };
+            findings.push(DoctorFinding {
+                item: format!("cellar-{slug}.desktop"),
+                problem: "its Exec target no longer exists".to_owned(),
+                fix,
+            });
+        }
+        match &integration.association {
+            AssociationState::Untouched | AssociationState::Wired => {}
+            AssociationState::Missing => findings.push(DoctorFinding {
+                item: "open-with-cellar.desktop".to_owned(),
+                problem: "the Open-with-Cellar association is missing".to_owned(),
+                fix: "run cellar desktop sync to restore it".to_owned(),
+            }),
+            AssociationState::Dead(_target) => findings.push(DoctorFinding {
+                item: "open-with-cellar.desktop".to_owned(),
+                problem: "its Exec target no longer exists".to_owned(),
+                fix: "run cellar desktop sync to restore it".to_owned(),
+            }),
+        }
+        section("desktop integration", findings.is_empty(), findings)
+    }
 }
 
 /// One completed section (the shared leaf of the section builders).
@@ -1473,6 +1557,25 @@ fn section(name: &'static str, healthy: bool, findings: Vec<DoctorFinding>) -> D
     }
 }
 
+/// The hand-edit damage set (#56): every `apps/*.toml` stem whose file
+/// fails to parse — `list_app_slugs` counts broken files (the dedupe
+/// domain, ADR 0001), `list_apps` drops them, and the difference is
+/// exactly the damage doctor flags. Shared by the sweep that spares those
+/// slugs (#56) and the doctor section that must self-report their
+/// unreparability instead of pointing at a fix that would not fix
+/// (#57 decision 5). `apps` is the caller's already-read parse list.
+fn damaged_slug_set<S: Storage>(
+    storage: &S,
+    apps: &[AppEntry],
+) -> Result<BTreeSet<String>, StorageError> {
+    let parsed: BTreeSet<&str> = apps.iter().map(|app| app.slug.as_str()).collect();
+    Ok(storage
+        .list_app_slugs()?
+        .into_iter()
+        .filter(|slug| !parsed.contains(slug.as_str()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1481,14 +1584,14 @@ mod tests {
         empty_chain,
     };
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides, Settings};
     use cellar_core::errors::{DesktopError, ResolveError, StorageError};
-    use cellar_core::health::TreeHealth;
+    use cellar_core::health::{AssociationState, DesktopIntegration, TreeHealth};
     use cellar_core::manifest::{ManagedRecord, RunnerManifest};
     use cellar_core::ports::{__sealed, DesktopIntegrator, InstallProgress, RunnerResolver};
     use cellar_core::types::{
@@ -1873,7 +1976,7 @@ mod tests {
             .invalid_files
             .push(PathBuf::from("prefixes/broken/prefix.toml"));
         let mock = MockStorage::new(health);
-        let service = DoctorService::new(mock, StubResolver::ok());
+        let service = DoctorService::new(mock, StubDesktop::new(), StubResolver::ok());
         let report = service.check()?;
         let tree = &report.sections[0];
         assert!(!tree.healthy);
@@ -2926,6 +3029,48 @@ mod tests {
     }
 
     #[test]
+    fn sync_counts_a_changed_exec_target_as_a_repair() -> anyhow::Result<()> {
+        // AC (#57): when a rewrite changes an entry's Exec target — the
+        // binary moved or died and a new one re-derives the entry — the
+        // report counts it, so presentation can print the repaired
+        // receipt. Entries whose target is unchanged or absent count as
+        // nothing.
+        let desktop = StubDesktop::new().writing_exec_target(PathBuf::from("/new/place/cellar"));
+        // balatro's entry still points at the old place: a repair.
+        desktop.set_entry_exec_target("balatro", PathBuf::from("/old/bin dir/cellar"));
+        // warpinator's entry already points where this run writes: not.
+        let service = DesktopSync::new(MockStorage::new(healthy_tree()), desktop.clone());
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        service
+            .storage
+            .add_app(entry("warpinator", "/games/warpinator.exe"));
+        desktop.set_entry_exec_target("warpinator", PathBuf::from("/new/place/cellar"));
+        let report = service.sync()?;
+        assert_eq!(
+            report.repaired_entries, 1,
+            "only the stale-targeted entry counts as repaired"
+        );
+        assert_eq!(report.entries, 2, "both apps still re-derive");
+        Ok(())
+    }
+
+    #[test]
+    fn sync_counts_no_repair_when_targets_are_fresh_or_absent() -> anyhow::Result<()> {
+        // A first-ever derivation creates entries (no old target to
+        // change) and an up-to-date tree changes nothing (#57).
+        let desktop = StubDesktop::new().writing_exec_target(PathBuf::from("/new/place/cellar"));
+        let service = DesktopSync::new(MockStorage::new(healthy_tree()), desktop.clone());
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        let report = service.sync()?;
+        assert_eq!(report.repaired_entries, 0, "a fresh derive repairs nothing");
+        Ok(())
+    }
+
+    #[test]
     fn registration_wires_the_file_association_too() -> anyhow::Result<()> {
         // AC (#55): every successful registration also wires the
         // "Open with Cellar" association — the file-manager popup exists
@@ -2993,12 +3138,13 @@ mod tests {
     }
 
     #[test]
-    fn doctor_reports_a_healthy_tree_in_four_passing_sections() -> anyhow::Result<()> {
+    fn doctor_reports_a_healthy_tree_in_five_passing_sections() -> anyhow::Result<()> {
         // AC: sections — tree health / exe integrity / runner integrity /
-        // plan buildable — each pass/fail with a fix hint; a healthy
-        // system reports all four passing and overall healthy.
+        // plan buildable / desktop integration (#57 amends ADR 0004's
+        // four-section lock) — each pass/fail with a fix hint; a healthy
+        // system reports all five passing and overall healthy.
         let mock = MockStorage::new(healthy_tree());
-        let service = DoctorService::new(mock, StubResolver::ok());
+        let service = DoctorService::new(mock, StubDesktop::new(), StubResolver::ok());
         let report = service.check()?;
         assert!(report.healthy, "no findings at all");
         let names: Vec<&str> = report.sections.iter().map(|s| s.name).collect();
@@ -3008,7 +3154,8 @@ mod tests {
                 "tree health",
                 "exe integrity",
                 "runner integrity",
-                "plan buildable"
+                "plan buildable",
+                "desktop integration"
             ]
         );
         assert!(
@@ -3026,7 +3173,11 @@ mod tests {
         // never silently fixed (ADR 0001: the doctor never overwrites).
         let mut health = healthy_tree();
         health.invalid_files = vec![PathBuf::from("prefixes/default/prefix.toml")];
-        let service = DoctorService::new(MockStorage::new(health), StubResolver::ok());
+        let service = DoctorService::new(
+            MockStorage::new(health),
+            StubDesktop::new(),
+            StubResolver::ok(),
+        );
         let report = service.check()?;
         let tree = &report.sections[0];
         assert!(!tree.healthy);
@@ -3042,10 +3193,166 @@ mod tests {
     }
 
     #[test]
+    fn doctor_flags_dead_exec_targets_with_the_sync_fix() -> anyhow::Result<()> {
+        // AC (#57): moving/deleting the cellar binary → the
+        // desktop-integration section FAILs, naming each dead entry with
+        // the sync fix hint. A target that merely differs from the running
+        // binary is a legitimate multi-binary setup and never appears —
+        // staleness is existence-only (locked decision 2).
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let desktop = StubDesktop::new();
+        desktop.set_integration(DesktopIntegration {
+            dead_entries: vec![
+                ("balatro".to_owned(), PathBuf::from("/old/bin/cellar")),
+                ("icon32".to_owned(), PathBuf::from("/gone/cellar")),
+            ],
+            association: AssociationState::Wired,
+        });
+        let service = DoctorService::new(mock, desktop, StubResolver::ok());
+        let report = service.check()?;
+        let section = report.sections.last().expect("the fifth section");
+        assert_eq!(section.name, "desktop integration");
+        assert!(!section.healthy);
+        assert!(!report.healthy);
+        let items: Vec<&str> = section.findings.iter().map(|f| f.item.as_str()).collect();
+        assert_eq!(items, ["cellar-balatro.desktop", "cellar-icon32.desktop"]);
+        for finding in &section.findings {
+            assert!(
+                finding.problem.contains("no longer exists"),
+                "the problem names the death mode: {}",
+                finding.problem
+            );
+            assert!(
+                finding.fix.contains("cellar desktop sync"),
+                "a live app's fix is the sync pointer: {}",
+                finding.fix
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_self_reports_a_damaged_app_behind_a_dead_entry() -> anyhow::Result<()> {
+        // AC (#57 + #56 seam): an entry whose slug has no parsed app behind
+        // it cannot be repaired by sync (sync spares damaged files), so its
+        // finding self-reports instead of pointing at a fix that would not
+        // fix. An orphan slug with no file at all still gets the sync
+        // pointer — pruning it IS the repair.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.take_app_slugs(&["balatro", "icon32"]);
+        let desktop = StubDesktop::new();
+        desktop.set_integration(DesktopIntegration {
+            dead_entries: vec![
+                ("balatro".to_owned(), PathBuf::from("/gone/a")),
+                ("ghost".to_owned(), PathBuf::from("/gone/b")),
+                ("icon32".to_owned(), PathBuf::from("/gone/c")),
+            ],
+            association: AssociationState::Wired,
+        });
+        let service = DoctorService::new(mock, desktop, StubResolver::ok());
+        let report = service.check()?;
+        let section = report.sections.last().expect("the fifth section");
+        assert_eq!(section.findings.len(), 3);
+        let by_item: std::collections::HashMap<_, _> = section
+            .findings
+            .iter()
+            .map(|f| (f.item.as_str(), f))
+            .collect();
+        assert!(
+            by_item["cellar-icon32.desktop"]
+                .fix
+                .contains("kept but unrepaired — apps/icon32.toml is damaged"),
+            "the damaged-app entry self-reports: {:?}",
+            by_item["cellar-icon32.desktop"].fix
+        );
+        assert!(
+            by_item["cellar-balatro.desktop"]
+                .fix
+                .contains("cellar desktop sync"),
+            "a live app still gets the sync pointer"
+        );
+        assert!(
+            by_item["cellar-ghost.desktop"]
+                .fix
+                .contains("cellar desktop sync"),
+            "an orphaned entry is fixed by the sweep that prunes it"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_a_missing_or_dead_association() -> anyhow::Result<()> {
+        // AC (#57): missing/broken association is flagged; the fix hint is
+        // sync, which rewrites it unconditionally.
+        let cases = [
+            (AssociationState::Missing, "missing"),
+            (
+                AssociationState::Dead(PathBuf::from("/gone/cellar")),
+                "no longer exists",
+            ),
+        ];
+        for (state, problem_fragment) in cases {
+            let mock = MockStorage::new(healthy_tree());
+            let desktop = StubDesktop::new();
+            desktop.set_integration(DesktopIntegration {
+                dead_entries: Vec::new(),
+                association: state,
+            });
+            let service = DoctorService::new(mock, desktop, StubResolver::ok());
+            let report = service.check()?;
+            let section = report.sections.last().expect("the fifth section");
+            assert!(!section.healthy, "{problem_fragment} must flag");
+            let finding = &section.findings[0];
+            assert_eq!(finding.item, "open-with-cellar.desktop");
+            assert!(
+                finding.problem.contains(problem_fragment),
+                "the problem names the failure mode: {}",
+                finding.problem
+            );
+            assert!(finding.fix.contains("cellar desktop sync"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_passes_desktop_checks_on_an_untouched_host() -> anyhow::Result<()> {
+        // AC (#57): a tree with zero entries passes clean, and so does a
+        // host that was never integrated at all (no entries directory —
+        // there is no derived artifact to be broken). Missing icons are
+        // never findings: nothing in this section speaks of icons.
+        for association in [AssociationState::Untouched, AssociationState::Wired] {
+            let mock = MockStorage::new(healthy_tree());
+            let desktop = StubDesktop::new();
+            desktop.set_integration(DesktopIntegration {
+                dead_entries: Vec::new(),
+                association,
+            });
+            let service = DoctorService::new(mock, desktop, StubResolver::ok());
+            let report = service.check()?;
+            let section = report.sections.last().expect("the fifth section");
+            assert!(section.healthy, "clean cases pass: {:?}", section.findings);
+            assert!(
+                !section
+                    .findings
+                    .iter()
+                    .any(|f| f.problem.contains("icon") || f.fix.contains("icon")),
+                "icons are never reported — the cache is disposable"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn doctor_flags_missing_exes_with_a_re_registration_fix() -> anyhow::Result<()> {
         let mut health = healthy_tree();
         health.missing_exes = vec!["balatro".to_owned()];
-        let service = DoctorService::new(MockStorage::new(health), StubResolver::ok());
+        let service = DoctorService::new(
+            MockStorage::new(health),
+            StubDesktop::new(),
+            StubResolver::ok(),
+        );
         let report = service.check()?;
         let exes = &report.sections[1];
         assert!(!exes.healthy);
@@ -3072,6 +3379,7 @@ mod tests {
             .push(("proton".to_owned(), "GE-Proton11-5".to_owned()));
         let service = DoctorService::with_checks(
             mock,
+            StubDesktop::new(),
             StubResolver::ok(),
             empty_chain,
             |_record, _runtime_dir| {
@@ -3112,6 +3420,7 @@ mod tests {
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         let service = DoctorService::new(
             mock,
+            StubDesktop::new(),
             StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
             })),
@@ -3140,7 +3449,7 @@ mod tests {
         // the fix recreates it, the doctor never auto-recreates.
         let mock = MockStorage::new(healthy_tree());
         mock.add_app(entry("balatro", "/games/balatro.exe"));
-        let service = DoctorService::new(mock, StubResolver::ok());
+        let service = DoctorService::new(mock, StubDesktop::new(), StubResolver::ok());
         let report = service.check()?;
         let plans = &report.sections[3];
         assert!(!plans.healthy);
@@ -3163,7 +3472,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(("proton".to_owned(), "GE-Proton11-5".to_owned()));
-        let service = DoctorService::new(mock, StubResolver::ok());
+        let service = DoctorService::new(mock, StubDesktop::new(), StubResolver::ok());
         let report = service.check()?;
         let runners = &report.sections[2];
         assert!(!runners.healthy, "an unwired probe must not pass installs");
@@ -3189,6 +3498,7 @@ mod tests {
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         let service = DoctorService::new(
             mock,
+            StubDesktop::new(),
             StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
             })),
@@ -3265,11 +3575,42 @@ mod tests {
         prunes: Arc<Mutex<Vec<Vec<String>>>>,
         /// How many times the "Open with Cellar" association was wired.
         associations: Arc<AtomicUsize>,
+        /// The Exec targets this stub's entries record, by slug — what
+        /// `create_entry` overwrites and `entry_exec_target` reads (#57).
+        entry_targets: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+        /// The Exec target a create writes (the "running binary").
+        written_exe: PathBuf,
+        /// What `integration_health` reports — configured per scenario.
+        integration: Arc<Mutex<DesktopIntegration>>,
     }
 
     impl StubDesktop {
         fn new() -> Self {
             Self::default()
+        }
+
+        /// Pin what `create_entry` records as the Exec target — the
+        /// "running binary" of repair-count scenarios (#57).
+        fn writing_exec_target(mut self, exe: PathBuf) -> Self {
+            self.written_exe = exe;
+            self
+        }
+
+        /// Pre-seed an entry's recorded Exec target, as if an earlier era
+        /// had written it.
+        fn set_entry_exec_target(&self, slug: &str, target: PathBuf) {
+            self.entry_targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(slug.to_owned(), target);
+        }
+
+        /// Configure what doctor's fifth section will be told.
+        fn set_integration(&self, integration: DesktopIntegration) {
+            *self
+                .integration
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = integration;
         }
 
         fn created(&self) -> Vec<EntryRequest> {
@@ -3318,6 +3659,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((app.slug.clone(), previous_slug.map(str::to_owned)));
+            // The rewrite records the stub's own target, as the real
+            // adapter records its binary (#57).
+            self.entry_targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(app.slug.clone(), self.written_exe.clone());
             Ok(PathBuf::from(format!("cellar-{}.desktop", app.slug)))
         }
 
@@ -3349,6 +3696,27 @@ mod tests {
             self.associations
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+
+        fn entry_exec_target(&self, slug: &str) -> Result<Option<PathBuf>, DesktopError> {
+            Ok(self
+                .entry_targets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(slug)
+                .cloned())
+        }
+
+        fn exec_target(&self) -> &Path {
+            &self.written_exe
+        }
+
+        fn integration_health(&self) -> Result<DesktopIntegration, DesktopError> {
+            Ok(self
+                .integration
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
         }
     }
 

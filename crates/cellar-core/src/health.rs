@@ -51,6 +51,38 @@ impl TreeHealth {
     }
 }
 
+/// The desktop-integration side of the doctor's report (#57): what the
+/// launcher entries and the file association look like on this host —
+/// read-only facts produced by the desktop adapter, rendered by the
+/// doctor's fifth section. Icons are deliberately absent: the cache is
+/// disposable (blueprint §6) and never worth a finding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopIntegration {
+    /// Every owned launcher entry whose Exec target no longer exists:
+    /// `(slug, dead target)` pairs, sorted by slug. Staleness is
+    /// existence-only — a target that exists but differs from the running
+    /// binary is a legitimate multi-binary setup and is never reported.
+    pub dead_entries: Vec<(String, PathBuf)>,
+    /// The Open-with-Cellar association's state.
+    pub association: AssociationState,
+}
+
+/// The file association's state as doctor sees it (#57).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AssociationState {
+    /// No entries directory yet — the host was never integrated, so there
+    /// is no derived artifact to be broken (a fresh tree passes clean).
+    #[default]
+    Untouched,
+    /// Integration happened but the association file is absent, unreadable,
+    /// or carries no Exec line to check.
+    Missing,
+    /// The association file exists but its Exec target does not.
+    Dead(PathBuf),
+    /// Present with an existing target.
+    Wired,
+}
+
 #[cfg(test)]
 mod tests {
     use super::TreeHealth;

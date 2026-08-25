@@ -755,6 +755,17 @@ fn run_desktop_sync(
             report.entries, report.icons
         ),
     );
+    if report.repaired_entries > 0 {
+        // The moved-binary receipt (#57): sync silently re-points every
+        // dead entry; this count is how the user hears it happened.
+        narrate(
+            quiet,
+            format_args!(
+                "Repaired {} stale launcher entries",
+                report.repaired_entries
+            ),
+        );
+    }
     if report.removed_entries.is_empty() {
         narrate(quiet, format_args!("No stale entries to remove"));
     } else {
@@ -1039,20 +1050,26 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Command::Doctor(args) => run_doctor(&store, args.json, color),
+        Command::Doctor(args) => run_doctor(&store, &desktop, args.json, color),
     }
 }
 
 /// The doctor handler (blueprint §8): the sectioned report — tree health,
-/// exe integrity, runner integrity, plan buildable — each pass/fail with
-/// a fix hint, the health exit code (0 healthy / 1 problems) for scripted
-/// checks, and the `--json` machine shape (audited in the surface sweep
-/// #36). The composition root wires the registry's wrapper chain and
-/// managed-install probe, so the plan section mirrors what launch would
-/// actually execute.
-fn run_doctor(store: &TreeStore, json: bool, color: bool) -> anyhow::Result<ExitCode> {
+/// exe integrity, runner integrity, plan buildable, desktop integration
+/// (#57) — each pass/fail with a fix hint, the health exit code (0 healthy
+/// / 1 problems) for scripted checks, and the `--json` machine shape
+/// (audited in the surface sweep #36). The composition root wires the
+/// registry's wrapper chain, the managed-install probe, and the desktop
+/// adapter, so the report mirrors what is actually on this host.
+fn run_doctor(
+    store: &TreeStore,
+    desktop: &DesktopService,
+    json: bool,
+    color: bool,
+) -> anyhow::Result<ExitCode> {
     let service = DoctorService::with_checks(
         store.clone(),
+        desktop.clone(),
         resolvers_for(store),
         wrappers_for,
         probe_managed,
@@ -1931,7 +1948,9 @@ fn render_doctor_report(report: &DoctorReport, json: bool, color: bool) -> anyho
         } else {
             styled("FAIL", RED, color)
         };
-        writeln!(out, "{:<17} {status}", section.name)?;
+        // Wide enough for the longest locked section name ("desktop
+        // integration"); every name aligns in one column.
+        writeln!(out, "{:<19} {status}", section.name)?;
         for finding in &section.findings {
             writeln!(out, "  ✗ {} — {}.", finding.item, finding.problem)?;
             writeln!(out, "    fix: {}", finding.fix)?;
@@ -2554,7 +2573,7 @@ mod tests {
             ConfiguredRunner::Path(wine),
         ));
         store.save_prefix(&prefix)?;
-        let code = run_doctor(&store, false, false)?;
+        let code = run_doctor(&store, &test_desktop(&store), false, false)?;
         assert_eq!(code, ExitCode::SUCCESS, "a healthy tree exits 0");
         Ok(())
     }
@@ -2588,8 +2607,103 @@ mod tests {
             )?,
         );
         std::fs::remove_file(&exe)?;
-        let code = run_doctor(&store, false, false)?;
+        let code = run_doctor(&store, &test_desktop(&store), false, false)?;
         assert_eq!(code, ExitCode::FAILURE, "a missing exe exits 1");
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_dead_launcher_entries_and_sync_repairs_them() -> anyhow::Result<()> {
+        // AC (#57), the move-the-binary story end to end: entries written
+        // by a binary that later "moved" (its Exec target is gone) fail
+        // the desktop-integration section naming each entry with the sync
+        // fix hint; a sync from the new location re-points every entry and
+        // doctor goes green. The damaged-app seam: an entry whose app file
+        // is also damaged self-reports instead of the dead-ending hint.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-doctor-desktop-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.join("cellar"));
+        std::fs::create_dir_all(root.join("cellar"))?;
+        let exe = root.join("cellar/balatro.exe");
+        std::fs::write(&exe, "MZ")?;
+        let tool = root.join("cellar/icon32.exe");
+        std::fs::write(&tool, "MZ")?;
+        // The old binary's era: it wrote entries pointing at itself.
+        let moved = DesktopService::new(
+            store.data_root().join("desktop-test"),
+            PathBuf::from("/nonexistent/bin dir/cellar-gone"),
+        );
+        let args = |path: &Path| InstallArgs {
+            path: path.to_path_buf(),
+            prefix: None,
+            name: None,
+            kind: AppKind::Game,
+            artifact: Some(ArtifactKind::Standalone),
+            no_input: true,
+            keep: Vec::new(),
+            keep_all: false,
+            add: Vec::new(),
+        };
+        run_install(&store, &moved, &args(&exe), false)?;
+        run_install(&store, &moved, &args(&tool), false)?;
+        // One app file gets hand-edit damage on top (the #56 seam).
+        let toml_path = store.data_root().join("apps/icon32.toml");
+        let wrecked =
+            std::fs::read_to_string(&toml_path)?.replace("kind = \"game\"", "kind = \"GAMME\"");
+        std::fs::write(&toml_path, wrecked)?;
+
+        let code = run_doctor(&store, &moved, false, false)?;
+        assert_eq!(code, ExitCode::FAILURE, "a moved binary fails doctor");
+        // Capture the rendered report for its wording.
+        let report = DoctorService::with_checks(
+            store.clone(),
+            moved.clone(),
+            resolvers_for(&store),
+            wrappers_for,
+            probe_managed,
+        )
+        .check()?;
+        let rendered = render_doctor_report(&report, false, false)?;
+        assert!(
+            rendered.contains("desktop integration") && rendered.contains("FAIL"),
+            "the fifth section reports:\n{rendered}"
+        );
+        assert!(rendered.contains("cellar-balatro.desktop"));
+        assert!(rendered.contains("no longer exists"));
+        assert!(
+            rendered.contains("run cellar desktop sync to re-point it"),
+            "a live app's fix is the sync pointer:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("kept but unrepaired — apps/icon32.toml is damaged"),
+            "the damaged-app entry self-reports:\n{rendered}"
+        );
+
+        // The fix path: repair the damaged file (#56's contract), then
+        // sync from the new location re-points every entry and the
+        // desktop-integration verdict clears.
+        let fixed =
+            std::fs::read_to_string(&toml_path)?.replace("kind = \"GAMME\"", "kind = \"game\"");
+        std::fs::write(&toml_path, fixed)?;
+        let code = run_desktop_sync(&store, &test_desktop(&store), false)?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        let report = DoctorService::with_checks(
+            store.clone(),
+            test_desktop(&store),
+            resolvers_for(&store),
+            wrappers_for,
+            probe_managed,
+        )
+        .check()?;
+        let desktops = report.sections.last().expect("the fifth section");
+        assert!(
+            desktops.healthy && desktops.findings.is_empty(),
+            "sync repairs the integration: {:?}",
+            desktops.findings
+        );
         Ok(())
     }
 
@@ -2610,7 +2724,7 @@ mod tests {
             root.join("cellar/runtime/providers.toml"),
             "schema_version = 1\n\n[[runner]]\nprovider_id = \"proton\"\nversion = \"GE-Proton11-5\"\ninstall = \"proton/GE-Proton11-5\"\n",
         )?;
-        let code = run_doctor(&store, false, false)?;
+        let code = run_doctor(&store, &test_desktop(&store), false, false)?;
         assert_eq!(code, ExitCode::FAILURE, "a broken managed install exits 1");
         Ok(())
     }
@@ -3030,6 +3144,7 @@ mod tests {
         assert_eq!(listed[0].status.as_str(), "missing-exe");
         let health = DoctorService::new(
             store.clone(),
+            test_desktop(&store),
             ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
         )
         .check()?;

@@ -115,3 +115,130 @@ fn a_damaged_app_file_warns_and_its_entry_survives_even_under_quiet() {
         "the repaired app's entry re-derives"
     );
 }
+
+/// Point one of our launcher entries at a binary that no longer exists —
+/// the moved-or-deleted-binary state (#57) without needing to move the
+/// real test binary.
+fn sabotage_exec(entry_path: &Path, slug: &str, dead_target: &str) {
+    let wrecked: String = fs::read_to_string(entry_path)
+        .expect("entry readable")
+        .lines()
+        .map(|line| {
+            if line.starts_with("Exec=") {
+                format!("Exec=\"{dead_target}\" launch {slug}\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    fs::write(entry_path, wrecked).expect("entry rewritten");
+}
+
+#[test]
+fn a_moved_binary_is_flagged_by_doctor_and_repaired_by_sync() {
+    // AC (#57): after the binary moves, doctor FAILs on desktop
+    // integration naming every dead entry with the sync fix hint; sync
+    // from the new location prints the repaired count as ordinary
+    // quietable narration and doctor goes green.
+    let xdg = xdg_home("moved-binary");
+    let exe = xdg.join("balatro.exe");
+    let tool = xdg.join("icon32.exe");
+    fs::create_dir_all(&xdg).expect("home");
+    fs::write(&exe, "MZ").expect("exe");
+    fs::write(&tool, "MZ").expect("tool");
+    for path in [&exe, &tool] {
+        let out = spawn(
+            &[
+                "install",
+                path.to_str().expect("utf-8 path"),
+                "--artifact",
+                "standalone",
+                "--no-input",
+            ],
+            &xdg,
+        );
+        assert_eq!(out.status.code(), Some(0), "install succeeds");
+    }
+    for slug in ["balatro", "icon32"] {
+        sabotage_exec(
+            &xdg.join(format!("applications/cellar-{slug}.desktop")),
+            slug,
+            "/nonexistent/bin dir/cellar-gone",
+        );
+    }
+
+    // Doctor names the damage and its fix; the health exit is 1.
+    let out = spawn(&["doctor"], &xdg);
+    assert_eq!(out.status.code(), Some(1), "a moved binary fails doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("desktop integration"), "\n{stdout}");
+    assert!(stdout.contains("cellar-balatro.desktop"), "\n{stdout}");
+    assert!(stdout.contains("cellar-icon32.desktop"), "\n{stdout}");
+    assert!(
+        stdout.contains("no longer exists") && stdout.contains("run cellar desktop sync"),
+        "\n{stdout}"
+    );
+
+    // Sync repairs: the receipt line on stdout, ordinary narration.
+    let out = spawn(&["desktop", "sync"], &xdg);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Repaired 2 stale launcher entries"),
+        "\n{stdout}"
+    );
+    let out = spawn(&["doctor"], &xdg);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let section_line = stdout
+        .lines()
+        .find(|line| line.starts_with("desktop integration"))
+        .expect("the section renders");
+    assert!(
+        section_line.ends_with("ok"),
+        "the desktop verdict clears after sync ({section_line}):\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("cellar-balatro.desktop") && !stdout.contains("no longer exists"),
+        "the dead-entry findings are gone:\n{stdout}"
+    );
+
+    // The repaired count is narration: --quiet silences it entirely.
+    for slug in ["balatro", "icon32"] {
+        sabotage_exec(
+            &xdg.join(format!("applications/cellar-{slug}.desktop")),
+            slug,
+            "/nonexistent/bin dir/cellar-gone",
+        );
+    }
+    let out = spawn(&["desktop", "sync", "-q"], &xdg);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stdout.is_empty(),
+        "quiet silences the repaired receipt: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn doctor_passes_desktop_integration_on_a_never_integrated_host() {
+    // AC (#57): a fresh tree passes the fifth section clean — there is no
+    // derived artifact to be broken yet, even though tree health (rightly)
+    // fails on the missing root.
+    let xdg = xdg_home("untouched-host");
+    fs::create_dir_all(xdg.join("cellar")).expect("empty tree");
+    let out = spawn(&["doctor"], &xdg);
+    assert_eq!(out.status.code(), Some(1), "an empty tree is not healthy");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("desktop integration") && !stdout.contains("desktop integration\tFAIL"),
+        "\n{stdout}"
+    );
+    let section_line = stdout
+        .lines()
+        .find(|line| line.starts_with("desktop integration"))
+        .expect("the section renders");
+    assert!(
+        section_line.ends_with("ok"),
+        "the untouched host passes clean: {section_line}"
+    );
+}

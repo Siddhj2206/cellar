@@ -166,11 +166,22 @@ file-manager action on `.exe` files starts the same guided install flow as the C
 prunes stale entries left behind by renames or removals. It reads app state and never writes back
 into the tree. Icons live in the disposable cache; deleting any of `cache/` is always safe.
 
+Entries embed the path of the Cellar binary that wrote them. If you move or rebuild that binary,
+the entries keep pointing at the old location — `cellar desktop sync` from the new location repoints
+every entry and prints how many it repaired (`Repaired N stale launcher entries`), and
+`cellar doctor` flags the dead ones if you haven't run it yet. An app whose file is damaged (see
+Doctor) is left untouched until you repair it, so its entry is reported as kept but unrepaired.
+
 ## Doctor — `cellar doctor`
 
-Four sections, in order: **tree health**, **exe integrity**, **runner integrity**, **plan
-buildable**. Each finding names the item, describes the problem, and prints a fix hint. Doctor is
-read-only — it reports, never repairs, and never creates state.
+Five sections, in order: **tree health**, **exe integrity**, **runner integrity**, **plan
+buildable**, **desktop integration**. Each finding names the item, describes the problem, and prints
+a fix hint. Doctor is read-only — it reports, never repairs, and never creates state.
+
+The desktop-integration section checks what Cellar derived onto your host: launcher entries whose
+`Exec` target no longer exists (a moved or deleted binary) and the Open-with-Cellar association. Its
+fix hint is `cellar desktop sync`, which re-derives all of it in one run — a tree with no entries
+and no integration yet passes clean, and missing icons are never findings (the cache is disposable).
 
 The exit code is the verdict: `0` healthy, `1` problems. That makes `cellar doctor` usable as a
 scriptable health check.
