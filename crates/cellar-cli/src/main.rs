@@ -738,7 +738,10 @@ fn pretty_json<T: serde::Serialize>(value: &T) -> anyhow::Result<String> {
 /// icon from the tree (blueprint §6: the cache is disposable), prune the
 /// stale entry files a rename or uninstall left behind, and wire the
 /// Open-with-Cellar association — the re-derivation `cellar list` and
-/// `cellar doctor` rely on, one-way (tree state is only read).
+/// `cellar doctor` rely on, one-way (tree state is only read). Hand-edit
+/// damage never costs an entry (#56): a slug whose app file fails to
+/// parse gets a stderr diagnostic pointing at `cellar doctor` — a
+/// warning, not narration, so `--quiet` never silences it.
 fn run_desktop_sync(
     store: &TreeStore,
     desktop: &DesktopService,
@@ -766,6 +769,12 @@ fn run_desktop_sync(
         quiet,
         format_args!("Wired the Open-with-Cellar file association"),
     );
+    for slug in &report.damaged_slugs {
+        eprintln!(
+            "cellar: apps/{slug}.toml is unreadable (hand-edit damage) — \
+             its launcher entry was kept; run cellar doctor"
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4019,6 +4028,76 @@ mod tests {
         assert!(
             applications.join("open-with-cellar.desktop").exists(),
             "the Open-with-Cellar association is wired"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_sync_spares_the_entry_of_a_damaged_app_file() -> anyhow::Result<()> {
+        // AC (#56): a hand-edited `apps/<slug>.toml` that fails to parse
+        // never costs its launcher entry — the sweep leaves it
+        // byte-for-byte and the run stays green; repairing the file is
+        // the fix, and the next sync re-derives the entry normally.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-sync-damaged-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        let exe = home.join("cellar/balatro.exe");
+        std::fs::write(&exe, "MZ")?;
+        let tool = home.join("cellar/icon32.exe");
+        std::fs::write(&tool, "MZ")?;
+        let desktop = test_desktop(&store);
+        let args = |path: &Path| InstallArgs {
+            path: path.to_path_buf(),
+            prefix: None,
+            name: None,
+            kind: AppKind::Game,
+            artifact: Some(ArtifactKind::Standalone),
+            no_input: true,
+            keep: Vec::new(),
+            keep_all: false,
+            add: Vec::new(),
+        };
+        run_install(&store, &desktop, &args(&exe), false)?;
+        run_install(&store, &desktop, &args(&tool), false)?;
+        let applications = home.join("cellar/applications");
+        let damaged_entry = applications.join("cellar-icon32.desktop");
+        assert!(damaged_entry.exists());
+        let before = std::fs::read_to_string(&damaged_entry)?;
+        // The user's typo: one wrong kind value in a hand edit.
+        let toml_path = home.join("cellar/apps/icon32.toml");
+        let wrecked =
+            std::fs::read_to_string(&toml_path)?.replace("kind = \"game\"", "kind = \"GAMME\"");
+        assert!(wrecked.contains("GAMME"), "the hand edit broke the file");
+        std::fs::write(&toml_path, wrecked)?;
+        let code = run_desktop_sync(&store, &desktop, false)?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(
+            std::fs::read_to_string(&damaged_entry)?,
+            before,
+            "the damaged app's entry survives byte-for-byte"
+        );
+        assert!(
+            applications.join("cellar-balatro.desktop").exists(),
+            "undamaged apps still re-derive"
+        );
+        // A lost entry cannot come back while the file is damaged —
+        // there is nothing to re-derive from.
+        std::fs::remove_file(&damaged_entry)?;
+        run_desktop_sync(&store, &desktop, false)?;
+        assert!(!damaged_entry.exists(), "no parse, no rebuild");
+        // Repairing the TOML re-derives the entry on the next sync.
+        let fixed =
+            std::fs::read_to_string(&toml_path)?.replace("kind = \"GAMME\"", "kind = \"game\"");
+        std::fs::write(&toml_path, fixed)?;
+        run_desktop_sync(&store, &desktop, false)?;
+        let after = std::fs::read_to_string(&damaged_entry)?;
+        assert!(
+            after.contains("Name=icon32\n"),
+            "the repaired app's entry re-derives"
         );
         Ok(())
     }

@@ -103,6 +103,10 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     fn save_prefix(&self, prefix: &Prefix) -> Result<(), StorageError>;
     fn delete_prefix(&self, slug: &str) -> Result<(), StorageError>;
 
+    /// Every parsed app entry. An `apps/*.toml` that fails to parse is
+    /// skipped here yet still counted by [`Storage::list_app_slugs`] —
+    /// the difference between the two is exactly the hand-edit damage
+    /// doctor flags and a re-derivation sweep must spare (ADR 0001).
     fn list_apps(&self) -> Result<Vec<AppEntry>, StorageError>;
     fn load_app(&self, slug: &str) -> Result<AppEntry, StorageError>;
     fn save_app(&self, app: &AppEntry) -> Result<(), StorageError>;

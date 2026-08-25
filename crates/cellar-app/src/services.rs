@@ -754,13 +754,18 @@ pub struct DesktopSync<S: Storage, D: DesktopIntegrator> {
     desktop: D,
 }
 
-/// What a re-derivation did: the entry and icon counts plus the stale
-/// entry files removed.
+/// What a re-derivation did: the entry and icon counts, the stale entry
+/// files removed, and the damaged app slugs left alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopSyncReport {
     pub entries: usize,
     pub icons: usize,
     pub removed_entries: Vec<PathBuf>,
+    /// Slugs whose `apps/<slug>.toml` exists but fails to parse —
+    /// hand-edit damage (ADR 0001): their launcher entries are never
+    /// pruned or rebuilt (nothing derived is destroyed on a typo), and
+    /// presentation warns that doctor owns the fix.
+    pub damaged_slugs: Vec<String>,
 }
 
 impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
@@ -770,11 +775,28 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
     }
 
     /// Re-derive everything derived: each app's entry and icon, the stale
-    /// sweep, then the file association.
+    /// sweep, then the file association. The sweep is health-aware (#56):
+    /// an `apps/<slug>.toml` that fails to parse never costs its launcher
+    /// entry — the entry survives untouched and the slug is reported in
+    /// `damaged_slugs`. Damage still leaves the run green: exit codes
+    /// stay sync's own, the health verdict belongs to `cellar doctor`.
     pub fn sync(&self) -> Result<DesktopSyncReport, InstallError> {
         let apps = self.storage.list_apps()?;
+        // The damaged set (#56): every app-file stem without a parse.
+        // `list_app_slugs` deliberately counts broken files (the dedupe
+        // domain, ADR 0001); the difference against parsed apps is
+        // exactly the hand-edit damage doctor flags.
+        let parsed: BTreeSet<&str> = apps.iter().map(|app| app.slug.as_str()).collect();
+        let mut damaged_slugs: Vec<String> = self
+            .storage
+            .list_app_slugs()?
+            .into_iter()
+            .filter(|slug| !parsed.contains(slug.as_str()))
+            .collect();
+        // Deterministic report order regardless of directory listing.
+        damaged_slugs.sort();
         let mut icons = 0usize;
-        let mut keep = Vec::with_capacity(apps.len());
+        let mut keep = Vec::with_capacity(apps.len() + damaged_slugs.len());
         for app in &apps {
             keep.push(app.slug.as_str());
             // The icon's source may be gone (a deleted exe): the entry
@@ -792,12 +814,18 @@ impl<S: Storage, D: DesktopIntegrator> DesktopSync<S, D> {
             // removes any entry left under an old slug.
             self.desktop.create_entry(app, None, icon.as_deref())?;
         }
+        // A damaged app file is not a gone app (#56): its entry rides in
+        // the keep-list, so the sweep never touches it.
+        for slug in &damaged_slugs {
+            keep.push(slug);
+        }
         let removed_entries = self.desktop.prune_entries(&keep)?;
         self.desktop.set_file_association()?;
         Ok(DesktopSyncReport {
             entries: apps.len(),
             icons,
             removed_entries,
+            damaged_slugs,
         })
     }
 }
@@ -2851,10 +2879,48 @@ mod tests {
             [vec!["balatro".to_owned(), "warpinator".to_owned()]],
             "the stale sweep keeps exactly the tree's apps"
         );
+        assert!(
+            report.damaged_slugs.is_empty(),
+            "an undamaged tree reports no damage"
+        );
         assert_eq!(
             desktop.associations_wired(),
             1,
             "the sync wires the Open-with-Cellar association once"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_sync_spares_the_entry_of_a_damaged_app_file() -> anyhow::Result<()> {
+        // AC (#56): an `apps/<slug>.toml` that exists but fails to parse
+        // is hand-edit damage (ADR 0001) — its launcher entry survives
+        // the sweep untouched (it cannot be rebuilt without a parse),
+        // and the slug is reported so presentation can warn.
+        let desktop = StubDesktop::new();
+        let service = DesktopSync::new(MockStorage::new(healthy_tree()), desktop.clone());
+        service
+            .storage
+            .add_app(entry("balatro", "/games/balatro.exe"));
+        // The stem domain counts both files; only balatro's parses.
+        service.storage.take_app_slugs(&["balatro", "icon32"]);
+        let report = service.sync()?;
+        assert_eq!(
+            report.damaged_slugs,
+            ["icon32".to_owned()],
+            "the stem without a parse is reported as damaged"
+        );
+        assert_eq!(report.entries, 1, "only parsed apps re-derive");
+        let created: Vec<_> = desktop
+            .created()
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .collect();
+        assert_eq!(created, ["balatro".to_owned()]);
+        assert_eq!(
+            desktop.prunes(),
+            [vec!["balatro".to_owned(), "icon32".to_owned()]],
+            "the sweep keeps the damaged app's entry alongside the live ones"
         );
         Ok(())
     }
