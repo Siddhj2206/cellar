@@ -273,7 +273,10 @@ impl TreeStore {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(contents.as_bytes())?;
             file.sync_all()?;
-            fs::rename(&tmp, path)
+            fs::rename(&tmp, path)?;
+            // The rename's directory entry must reach the disk too, or a
+            // power cut reverts a recorded fact to absent (#62).
+            cellar_core::durability::sync_parent_dir(path)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
@@ -492,8 +495,10 @@ impl Storage for TreeStore {
             return Err(StorageError::NotFound(dir.display().to_string()));
         }
         // Ownership (ADR 0001): delete removes exactly this directory —
-        // never more.
-        fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, &e))
+        // never more. The removal is synced so deleted state cannot
+        // resurrect after a crash (#62).
+        fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, &e))?;
+        cellar_core::durability::sync_parent_dir(&dir).map_err(|e| io_err(&dir, &e))
     }
 
     fn list_apps(&self) -> Result<Vec<AppEntry>, StorageError> {
@@ -529,7 +534,9 @@ impl Storage for TreeStore {
         if !file.exists() {
             return Err(StorageError::NotFound(file.display().to_string()));
         }
-        fs::remove_file(&file).map_err(|e| io_err(&file, &e))
+        fs::remove_file(&file).map_err(|e| io_err(&file, &e))?;
+        // Deleted state cannot resurrect after a crash (#62).
+        cellar_core::durability::sync_parent_dir(&file).map_err(|e| io_err(&file, &e))
     }
 
     fn list_app_slugs(&self) -> Result<Vec<String>, StorageError> {

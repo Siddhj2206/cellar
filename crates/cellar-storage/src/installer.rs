@@ -240,8 +240,11 @@ pub(crate) fn install(
         }
 
         // The extracted root moves into its final name — the install dir
-        // appears atomically.
+        // appears atomically. Before the rename, one sweep makes every
+        // extracted file and directory durable (#62): one-time O(n) next
+        // to a multi-gigabyte download.
         let root_entry = single_root_dir(&tmp)?;
+        cellar_core::durability::sync_tree(&tmp).map_err(storage_io(&tmp))?;
         if let Err(error) = fs::rename(&root_entry, &install_dir) {
             let _ = fs::remove_dir_all(&tmp);
             return Err(match error.kind() {
@@ -255,6 +258,8 @@ pub(crate) fn install(
             });
         }
         let _ = fs::remove_dir_all(&tmp);
+        // The install-dir entry itself is durable before we record (#62).
+        cellar_core::durability::sync_parent_dir(&install_dir).map_err(storage_io(&install_dir))?;
         break;
     }
     if !probe_installed(manifest, &install_dir) {

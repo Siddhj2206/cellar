@@ -26,6 +26,7 @@ mod icon;
 
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -155,9 +156,16 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), DesktopError> {
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&tmp, contents)
-        .map_err(|error| DesktopError::Io(format!("{}: {error}", tmp.display())))?;
-    if let Err(error) = fs::rename(&tmp, path) {
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents)?;
+        // Launcher entries and the association are load-bearing (#55–57):
+        // the bytes and the rename both reach the disk (#62).
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        cellar_core::durability::sync_parent_dir(path)
+    })();
+    if let Err(error) = write {
         let _ = fs::remove_file(&tmp);
         return Err(DesktopError::Io(format!("{}: {error}", path.display())));
     }

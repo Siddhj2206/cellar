@@ -16,6 +16,7 @@
 //! - [`ports`] — the locked extension seam (ADR 0003): exactly five traits.
 //! - [`errors`] — pre-flight error families for the ports.
 
+pub mod durability;
 pub mod entities;
 pub mod errors;
 pub mod exec_lookup;
