@@ -119,40 +119,17 @@ fn resolved(reference: RunnerRef) -> ResolvedRunner {
     }
 }
 
-/// POSIX `execvp` command lookup for `wine`: the directories of `PATH` are
-/// searched in order (POSIX.1-2024); an empty component is the current
-/// directory; the first entry that is an executable regular file wins. The
-/// found path is canonicalized — PATH entries may be relative or symlinks,
-/// and the plan must carry the real binary.
+/// POSIX `execvp` command lookup for `wine`, over the shared predicate
+/// (#52): the directories of `PATH` are searched in order; an empty
+/// component is the current directory; the first entry that is an
+/// executable regular file wins, canonicalized — the plan carries the
+/// real binary.
 fn find_on_path(path: Option<&OsStr>) -> Option<PathBuf> {
-    let path = path?;
-    for dir in std::env::split_paths(path) {
-        let candidate = dir.join("wine");
-        if executable_file(&candidate) {
-            return Some(candidate.canonicalize().unwrap_or(candidate));
-        }
-    }
-    None
+    cellar_core::exec_lookup::find_on_path_in("wine", path)
 }
 
-/// `execvp`'s "found and executable" predicate: a regular file with the
-/// executable bit set.
 fn executable_file(path: &Path) -> bool {
-    path.is_file() && is_executable(path)
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool {
-    // Linux-first (ADR 0003: platform is a non-seam): a real port decides
-    // its own invocability predicate; until then any file qualifies.
-    true
+    cellar_core::exec_lookup::executable_file(path)
 }
 
 #[cfg(test)]
