@@ -25,9 +25,23 @@ const BMP_HEADER_SIZE: usize = 40;
 /// Peel the icon out of exe bytes: the best frame of the first group
 /// icon, as PNG bytes. Every malformed shape — not a PE, no resource
 /// directory, no icon group, undecodable frames — is `None`.
+/// The reference whole-buffer path: production reads ranges through
+/// `extract_icon_from_file`; this stays the test oracle and the
+/// in-memory caller's entry point.
+#[allow(dead_code)]
 pub(crate) fn extract_icon_png(exe: &[u8]) -> Option<Vec<u8>> {
-    let resource = pe_resource_directory(exe)?;
-    let group = resource_data(exe, resource, &[14, 1, 0])?;
+    let (offset, size) = pe_resource_directory(exe)?;
+    let section = exe.get(offset..offset.checked_add(size)?)?;
+    extract_icon_png_from_section(section)
+}
+
+/// The same pipeline over an isolated resource-section buffer (#64): the
+/// file-based entry reads exactly this range, so peak memory is
+/// O(resource section), never O(exe size). Section-relative addressing —
+/// the buffer starts at the resource directory's file offset.
+pub(crate) fn extract_icon_png_from_section(section: &[u8]) -> Option<Vec<u8>> {
+    let resource = (0, section.len());
+    let group = resource_data(section, resource, &[14, 1, 0])?;
     let frames = parse_group_icon(group)?;
     let mut best: Vec<usize> = (0..frames.len()).collect();
     best.sort_by_key(|&index| {
@@ -43,7 +57,7 @@ pub(crate) fn extract_icon_png(exe: &[u8]) -> Option<Vec<u8>> {
     });
     for index in best {
         let frame = &frames[index];
-        let payload = resource_data(exe, resource, &[3, u32::from(frame.id), 0])?;
+        let payload = resource_data(section, resource, &[3, u32::from(frame.id), 0])?;
         if payload.len() != frame.bytes as usize {
             continue;
         }
@@ -222,7 +236,7 @@ fn row_stride(width: usize, bits_per_pixel: u16) -> Option<usize> {
 
 /// The resource directory's `(rva, size)` from the thunk's data
 /// directory, mapped to a file range through the section table.
-fn pe_resource_directory(exe: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn pe_resource_directory(exe: &[u8]) -> Option<(usize, usize)> {
     if !exe.starts_with(b"MZ") {
         return None;
     }

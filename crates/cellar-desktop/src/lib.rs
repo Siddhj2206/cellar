@@ -138,6 +138,35 @@ fn refresh_mime_database(entries_dir: &Path) {
         .status();
 }
 
+/// Two-phase ranged icon read (#64): a bounded header window locates the
+/// resource-section byte range through the PE headers; only that range is
+/// then read into a right-sized buffer. Peak memory is O(resource
+/// section), never O(exe size) — a 400 MB exe costs kilobytes here. A
+/// range beyond the safety valve (256 MiB) or any short/truncated shape
+/// degrades to `None` (icon-less entry), never an allocation surprise.
+fn extract_icon_from_file(exe: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const HEADER_WINDOW: u64 = 1024 * 1024;
+    const SECTION_CAP: u64 = 256 * 1024 * 1024;
+
+    let mut file = fs::File::open(exe).ok()?;
+    let len = file.metadata().ok()?.len();
+    let window = usize::try_from(len.min(HEADER_WINDOW)).ok()?;
+    let mut header = vec![0u8; window];
+    file.read_exact(&mut header).ok()?;
+    let (offset, size) = icon::pe_resource_directory(&header)?;
+    let offset = u64::try_from(offset).ok()?;
+    let size = u64::try_from(size).ok()?;
+    if size == 0 || size > SECTION_CAP || offset > len || size > len - offset {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut section = vec![0u8; usize::try_from(size).ok()?];
+    file.read_exact(&mut section).ok()?;
+    icon::extract_icon_png_from_section(&section)
+}
+
 /// Atomic write in the target directory (temp file + rename): a reader
 /// never sees a torn entry, and the directory is created on demand. The
 /// temp name carries a sequence so concurrent writers in one process
@@ -217,11 +246,9 @@ impl DesktopIntegrator for DesktopService {
         if dest.exists() {
             return Ok(Some(dest));
         }
-        let bytes = fs::read(exe)
-            .map_err(|error| DesktopError::Io(format!("{}: {error}", exe.display())))?;
-        // A malformed exe or missing icon resource is not an error: the
-        // entry is created icon-less (the key is omitted).
-        let Some(png) = icon::extract_icon_png(&bytes) else {
+        let Some(png) = extract_icon_from_file(exe) else {
+            // A malformed exe or missing icon resource is not an error:
+            // the entry is created icon-less (the key is omitted).
             return Ok(None);
         };
         write_atomic(&dest, &png)?;
@@ -739,5 +766,49 @@ mod tests {
         service
             .remove_entry(&unregistered)
             .expect("second removal is fine");
+    }
+    /// The process's peak resident set, in KiB (/proc/self/status).
+    #[cfg(unix)]
+    fn vm_hwm_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmHWM:")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|value| value.parse().ok())
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_sparse_400mb_exe_extracts_with_bounded_peak_memory() {
+        // AC (#64): the two-phase ranged read never touches the whole
+        // file — a sparse 400 MB exe extracts the same icon as its dense
+        // twin while the process's resident high-water mark stays far
+        // below the file size (a single whole-file read alone would add
+        // ~400 MB to it).
+        let exe = icon::tests::fixture_exe_with_icon();
+        let dir = root("sparse-icon");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.exe");
+        fs::write(&path, &exe).unwrap();
+        let sparse_len = exe.len() as u64 + 400 * 1024 * 1024;
+        let handle = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        handle.set_len(sparse_len).unwrap();
+        drop(handle);
+
+        let before = vm_hwm_kb();
+        let png = extract_icon_from_file(&path).expect("icon from the sparse twin");
+        let after = vm_hwm_kb();
+
+        assert_eq!(png, icon::extract_icon_png(&exe).unwrap(), "identical PNG");
+        let growth = after.saturating_sub(before);
+        assert!(
+            growth < 200_000,
+            "peak RSS grew {growth} KiB while reading a 400 MB file"
+        );
     }
 }
