@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod ports;
 pub mod slug;
 pub mod types;
+pub mod xdg;
 
 pub use entities::{AppEntry, AppKind, Candidate, Overrides, Prefix, PrefixDefaults, Settings};
 pub use errors::{DesktopError, ResolveError, StorageError, UnresolvedCause};

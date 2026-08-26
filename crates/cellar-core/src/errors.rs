@@ -79,6 +79,9 @@ impl std::error::Error for ResolveError {}
 /// Failures of the storage port (file-tree CRUD, discovery, installer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
+    /// The environment misconfiguration (e.g. a relative `XDG_DATA_HOME`,
+    /// #61) — presentation maps this to its usage-error exit code.
+    Config(String),
     /// Underlying filesystem failure, with the offending path.
     Io(String),
     /// A file exists but is not valid. Hand-edited files degrade to a
@@ -102,6 +105,7 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(what) => write!(f, "{what}"),
             Self::Io(path) => write!(f, "I/O failure at {path}"),
             Self::Invalid(path) => write!(f, "invalid file at {path}"),
             Self::NotFound(path) => write!(f, "not found: {path}"),

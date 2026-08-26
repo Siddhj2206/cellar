@@ -64,17 +64,12 @@ impl TreeStore {
     /// `$HOME/.local/share/cellar` when `XDG_DATA_HOME` is unset or empty
     /// (ADR 0001).
     pub fn from_env() -> Result<Self, StorageError> {
-        let base = match std::env::var("XDG_DATA_HOME") {
-            Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => match std::env::var("HOME") {
-                Ok(home) if !home.is_empty() => PathBuf::from(home).join(".local/share"),
-                _ => {
-                    return Err(StorageError::Io(
-                        "neither XDG_DATA_HOME nor HOME is set".to_owned(),
-                    ));
-                }
-            },
-        };
+        // The validated resolution chokepoint (#61): tilde expansion plus
+        // the absolute-path rule live in cellar-core, shared with the
+        // provider crates — a misconfiguration dies here, before any
+        // second tree can appear under $PWD.
+        let base = cellar_core::xdg::data_home()
+            .map_err(|error| StorageError::Config(error.to_string()))?;
         Ok(Self::new(base.join("cellar")))
     }
 

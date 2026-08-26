@@ -145,12 +145,12 @@ pub fn steam_protons() -> Vec<SteamProton> {
 /// installs) derived from the environment — host state the proton
 /// provider reads read-only.
 pub fn steam_roots() -> Vec<std::path::PathBuf> {
-    let data = match std::env::var("XDG_DATA_HOME") {
-        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => std::env::var_os("HOME").map_or_else(
-            || std::path::PathBuf::from("."),
-            |home| std::path::PathBuf::from(home).join(".local").join("share"),
-        ),
+    // The validated core resolution (#61): no $PWD-relative fallback.
+    // When the environment is misconfigured the scan roots are simply
+    // absent — the CLI's own store construction has already died with
+    // exit 2 by the time anything reaches here.
+    let Ok(data) = cellar_core::xdg::data_home() else {
+        return Vec::new();
     };
     let mut roots = vec![data.join("Steam").join("compatibilitytools.d")];
     if let Some(home) = std::env::var_os("HOME") {

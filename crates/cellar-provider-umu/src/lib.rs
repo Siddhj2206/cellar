@@ -21,7 +21,6 @@ use cellar_core::types::{
     RunnerRef, RunnerSpec,
 };
 
-use std::env;
 use std::path::{Path, PathBuf};
 
 /// Managed umu provider.
@@ -311,13 +310,11 @@ fn is_executable(_path: &Path) -> bool {
 }
 
 fn data_home() -> PathBuf {
-    match env::var("XDG_DATA_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => env::var_os("HOME").map_or_else(
-            || PathBuf::from("."),
-            |home| PathBuf::from(home).join(".local").join("share"),
-        ),
-    }
+    // The validated core resolution (#61): a misconfigured environment
+    // cannot point discovery at $PWD — the CLI's store construction dies
+    // first with exit 2; here an unusable root degrades to an absolute,
+    // guaranteed-empty scan root instead of a relative lie.
+    cellar_core::xdg::data_home().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 impl ManagedRunner for UmuProvider {

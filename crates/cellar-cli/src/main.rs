@@ -73,6 +73,7 @@ use cellar_app::{
     ArtifactKind, DesktopSync, DoctorReport, DoctorService, InstallOutcome, InstallResult,
     InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService, RunnerService,
 };
+use cellar_core::StorageError;
 use cellar_core::entities::GraphicsSelection;
 use cellar_core::ports::{__sealed, InstallProgress, RunnerResolver, Storage};
 use cellar_core::{
@@ -656,10 +657,10 @@ impl<W: std::io::Write> ProgressRenderer<W> {
                 // repaint tick. A dangling download line is closed first
                 // so the note starts on a fresh line.
                 self.finish();
-                eprintln!(
-                    "cellar: retrying in {:.1}s (attempt {attempt}/{attempts}): {reason}",
-                    *delay_ms as f32 / 1000.0
-                );
+                // Fixed-point seconds without a lossy float cast: the
+                // backoffs are whole seconds, so tenths are always .0.
+                let secs = format!("{}.0", delay_ms / 1000);
+                eprintln!("cellar: retrying in {secs}s (attempt {attempt}/{attempts}): {reason}");
             }
         }
     }
@@ -966,7 +967,16 @@ fn run_runner_list(store: &TreeStore, json: bool, color: bool) -> anyhow::Result
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let store = TreeStore::from_env()?;
+    let store = match TreeStore::from_env() {
+        Ok(store) => store,
+        // A usage-shaped environment error (#61): exit 2 like clap, the
+        // message already names the variable and the fix.
+        Err(StorageError::Config(message)) => {
+            eprintln!("cellar: {message}");
+            return Ok(ExitCode::from(2));
+        }
+        Err(error) => return Err(error.into()),
+    };
     // The composition root builds the desktop adapter once: over the
     // tree root (the entries live beside it, the icons under its
     // disposable cache) and this binary — the Exec target of every
