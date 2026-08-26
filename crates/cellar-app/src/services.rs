@@ -1029,8 +1029,18 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
             .load_prefix(&prefix_slug)
             .map_err(|err| match err {
                 StorageError::NotFound(_) | StorageError::Invalid(_) => {
-                    LaunchError::PrefixMissing {
-                        slug: prefix_slug.clone(),
+                    // The discriminator is dir existence, not the error
+                    // variant: NotFound covers both a gone dir and a gone
+                    // prefix.toml, and only the first is repairable by
+                    // `prefix create` (#51).
+                    if self.storage.prefix_dir(&prefix_slug).exists() {
+                        LaunchError::PrefixDamaged {
+                            slug: prefix_slug.clone(),
+                        }
+                    } else {
+                        LaunchError::PrefixMissing {
+                            slug: prefix_slug.clone(),
+                        }
                     }
                 }
                 other => LaunchError::Storage(other),
@@ -1301,9 +1311,10 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
                 problem: "prefix directory without a prefix.toml (debris or an interrupted \
                           create)"
                     .to_owned(),
-                fix: "recreate the prefix with `cellar prefix create <name>`, or remove the \
-                      directory by hand"
-                    .to_owned(),
+                // The dir exists — it occupies the slug, so `prefix
+                // create` would dedupe to `<name>-2` and repair nothing
+                // (#51): name the file instead.
+                fix: format!("restore or remove `{}/prefix.toml` by hand", dir.display()),
             });
         }
         // The tree section's own predicate — deliberately not
@@ -1420,13 +1431,26 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
             let prefix = match self.storage.load_prefix(&prefix_slug) {
                 Ok(prefix) => prefix,
                 Err(StorageError::NotFound(_) | StorageError::Invalid(_)) => {
+                    // Dir existence discriminates the two repairs (#51):
+                    // a gone dir is `prefix create`'s to claim; an existing
+                    // dir occupies the slug in the dedupe domain.
+                    let (problem, fix) = if self.storage.prefix_dir(&prefix_slug).exists() {
+                        (
+                            format!(
+                                "its bound prefix {prefix_slug:?} is damaged (hand-edit damage)"
+                            ),
+                            format!("fix or remove `prefixes/{prefix_slug}/prefix.toml` by hand"),
+                        )
+                    } else {
+                        (
+                            format!("its bound prefix {prefix_slug:?} is missing"),
+                            format!("recreate it with `cellar prefix create {prefix_slug}`"),
+                        )
+                    };
                     findings.push(DoctorFinding {
                         item: entry.slug.clone(),
-                        problem: format!(
-                            "its bound prefix {prefix_slug:?} is missing or unreadable \
-                             (hand-edit damage)"
-                        ),
-                        fix: format!("recreate it with `cellar prefix create {prefix_slug}`"),
+                        problem,
+                        fix,
                     });
                     continue;
                 }
@@ -1461,6 +1485,9 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
         let fix = match error {
             LaunchError::PrefixMissing { slug } => {
                 format!("recreate it with `cellar prefix create {slug}`")
+            }
+            LaunchError::PrefixDamaged { slug } => {
+                format!("fix or remove `prefixes/{slug}/prefix.toml` by hand")
             }
             LaunchError::ExeMissing { slug, .. } => {
                 format!(
@@ -3571,6 +3598,36 @@ mod tests {
     }
 
     #[test]
+    fn doctor_flags_a_damaged_bound_prefix_with_the_files_name() -> anyhow::Result<()> {
+        // The bound prefix DIR exists but reads broken: `prefix create`
+        // would dedupe to `<slug>-2` and repair nothing (#51) — the
+        // finding names the exact file instead.
+        let dir =
+            std::env::temp_dir().join(format!("cellar-doctor-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("prefixes/default"))?;
+        let mock = MockStorage::new(healthy_tree()).with_prefix_base(dir.join("prefixes"));
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(mock, StubDesktop::new(), StubResolver::ok());
+        let report = service.check()?;
+        let plans = &report.sections[3];
+        assert!(!plans.healthy);
+        let finding = &plans.findings[0];
+        assert!(
+            finding.fix.contains("prefixes/default/prefix.toml") && finding.fix.contains("by hand"),
+            "the fix names the file: {}",
+            finding.fix
+        );
+        assert!(
+            !finding.fix.contains("prefix create"),
+            "create is a dead end for an existing dir: {}",
+            finding.fix
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn doctor_without_a_wired_probe_fails_closed() -> anyhow::Result<()> {
         // The probe default is a loud failure, never a silent pass: an
         // unwired composition root gets a finding naming the wiring bug
@@ -4018,6 +4075,32 @@ mod tests {
             err.to_string().contains("register it"),
             "the message carries the registration hint"
         );
+    }
+
+    #[test]
+    fn launch_damaged_prefix_names_the_file_not_create() -> anyhow::Result<()> {
+        // The prefix directory exists but its prefix.toml is gone:
+        // `prefix create` would dedupe away and repair nothing (#51) —
+        // the disposition names the exact file instead.
+        let dir =
+            std::env::temp_dir().join(format!("cellar-launch-damaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("prefixes/default"))?;
+        let mock = MockStorage::new(healthy_tree()).with_prefix_base(dir.join("prefixes"));
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = LaunchApp::new(mock, StubResolver::ok());
+        let err = service.plan("balatro", &[]).expect_err("prefix.toml gone");
+        assert_eq!(
+            err,
+            LaunchError::PrefixDamaged {
+                slug: "default".to_owned()
+            }
+        );
+        let text = err.to_string();
+        assert!(text.contains("prefixes/default/prefix.toml"), "{text}");
+        assert!(!text.contains("prefix create"), "dead end: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     /// A resolved wine runner at an explicit path — spawn tests point it at

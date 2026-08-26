@@ -21,10 +21,14 @@ use std::path::PathBuf;
 pub enum LaunchError {
     /// No entry is registered under this slug.
     AppNotFound { slug: String },
-    /// The entry's bound prefix is missing or unreadable (hand-edit damage)
-    /// — recreate it. Cellar never auto-recreates: hand-edited state is
-    /// never clobbered (ADR 0001).
+    /// The bound prefix directory is gone — recreate it. Cellar never
+    /// auto-recreates: hand-edited state is never clobbered (ADR 0001).
     PrefixMissing { slug: String },
+    /// The bound prefix directory exists but `prefix.toml` is missing or
+    /// unreadable (hand-edit damage): `prefix create` cannot repair it —
+    /// the dir occupies the slug in the dedupe domain — so the exact file
+    /// is named for a hand fix or removal (#51, ADR 0001).
+    PrefixDamaged { slug: String },
     /// Runner resolution failed — unknown spec / order exhausted →
     /// `SuggestInstall`, install missing → reinstall (the disposition text
     /// lives in `ResolveError`'s messages).
@@ -54,8 +58,13 @@ impl fmt::Display for LaunchError {
             ),
             Self::PrefixMissing { slug } => write!(
                 f,
-                "the prefix '{slug}' this app binds to is missing or unreadable — \
+                "the prefix '{slug}' this app binds to is missing — \
                  recreate it with `cellar prefix create {slug}`"
+            ),
+            Self::PrefixDamaged { slug } => write!(
+                f,
+                "the prefix '{slug}' this app binds to is damaged (its prefix.toml is \
+                 missing or unreadable) — fix or remove `prefixes/{slug}/prefix.toml` by hand"
             ),
             Self::Resolve(err) => write!(f, "{err}"),
             Self::ExeMissing { slug, exe } => write!(
