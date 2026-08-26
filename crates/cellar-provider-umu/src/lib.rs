@@ -11,7 +11,7 @@
 //! waitforexitandrun` chain (research #18) — nothing in a Cellar plan
 //! fabricates that expansion.
 
-use cellar_core::errors::ResolveError;
+use cellar_core::errors::{ResolveError, UnresolvedCause};
 use cellar_core::manifest::{
     ArchiveLayout, ChecksumScheme, InstallKind, ReleaseSource, RunnerManifest,
 };
@@ -107,6 +107,9 @@ impl UmuProvider {
         if spec.family != RunnerFamily::Umu {
             return Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Umu,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::Managed,
+                },
             });
         }
         if let Some(configured) = &spec.configured {
@@ -143,6 +146,9 @@ impl UmuProvider {
         }
         Err(ResolveError::Unresolvable {
             family: RunnerFamily::Umu,
+            cause: UnresolvedCause::NoneFound {
+                mode: ProviderMode::Managed,
+            },
         })
     }
 }
@@ -503,7 +509,10 @@ mod tests {
         assert_eq!(
             provider.resolve(&RunnerSpec::new(RunnerFamily::Umu)),
             Err(ResolveError::Unresolvable {
-                family: RunnerFamily::Umu
+                family: RunnerFamily::Umu,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::Managed,
+                },
             })
         );
     }

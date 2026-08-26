@@ -75,8 +75,8 @@ use cellar_app::{
 };
 use cellar_core::ports::{__sealed, InstallProgress, RunnerResolver, Storage};
 use cellar_core::{
-    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ResolveError, ResolvedRunner, RunnerFamily,
-    RunnerInstall, RunnerRef, RunnerSpec,
+    AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ProviderMode, ResolveError, ResolvedRunner,
+    RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec, UnresolvedCause,
 };
 use cellar_desktop::DesktopService;
 use cellar_providers::{all_managed, all_resolvers, probe_managed, steam_protons, wrappers_for};
@@ -1873,8 +1873,14 @@ impl RunnerResolver for ResolverSet {
     }
 
     fn resolve(&self, spec: &RunnerSpec) -> Result<ResolvedRunner, ResolveError> {
+        // No resolver services the family at all — a registry/family skew.
+        // DiscoverOnly keeps the hint command-less: with no provider there
+        // is no honest `runner install` to suggest.
         let mut last_error = ResolveError::Unresolvable {
             family: spec.family,
+            cause: UnresolvedCause::NoneFound {
+                mode: ProviderMode::DiscoverOnly,
+            },
         };
         let mut serviced = None;
         for resolver in &self.resolvers {
@@ -3222,12 +3228,18 @@ mod tests {
                 family: RunnerFamily::Proton,
                 outcome: Err(ResolveError::Unresolvable {
                     family: RunnerFamily::Proton,
+                    cause: UnresolvedCause::NoneFound {
+                        mode: ProviderMode::Managed,
+                    },
                 }),
             }),
             Box::new(StubResolver {
                 family: RunnerFamily::Wine,
                 outcome: Err(ResolveError::Unresolvable {
                     family: RunnerFamily::Wine,
+                    cause: UnresolvedCause::NoneFound {
+                        mode: ProviderMode::DiscoverOnly,
+                    },
                 }),
             }),
         ]);
@@ -3237,7 +3249,10 @@ mod tests {
         assert_eq!(
             err,
             ResolveError::Unresolvable {
-                family: RunnerFamily::Wine
+                family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             },
             "the serviced family's error wins"
         );
@@ -3254,6 +3269,9 @@ mod tests {
                 family: RunnerFamily::Proton,
                 outcome: Err(ResolveError::Unresolvable {
                     family: RunnerFamily::Proton,
+                    cause: UnresolvedCause::NoneFound {
+                        mode: ProviderMode::Managed,
+                    },
                 }),
             }),
             Box::new(StubResolver {

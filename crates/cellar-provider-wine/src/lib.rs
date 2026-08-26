@@ -13,7 +13,7 @@
 //! exec-ready. No probing (`wine --version` would spawn; this slice's
 //! dry-run is spawn-free — versions land with the execute slice #29).
 
-use cellar_core::errors::ResolveError;
+use cellar_core::errors::{ResolveError, UnresolvedCause};
 use cellar_core::ports::{__sealed, RunnerResolver};
 use cellar_core::types::{
     ConfiguredRunner, ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall, RunnerRef,
@@ -54,23 +54,32 @@ impl WineProvider {
             // family of the failure names what a SuggestInstall must find).
             return Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             });
         }
         // Stage 1 — a configured path wins (resolution prefers a configured
         // path over PATH). A path that is not an executable file falls
         // through to the next stage — the locked order (research #18) is a
-        // sequence, not fail-fast; a stale configured path is the doctor's
-        // runner-integrity section's finding (#35), where it can be named.
+        // sequence, not fail-fast; a stale configured path remains the
+        // doctor's runner-integrity concern (#35), and when PATH also finds
+        // nothing the miss is remembered as the failure's cause so the fix
+        // hint names the stale path instead of a host install.
+        let mut stale_configured = None;
         if let Some(configured) = &spec.configured {
             match configured {
                 ConfiguredRunner::Path(path) if executable_file(path) => {
                     return Ok(resolved(wine_ref(path)));
                 }
-                ConfiguredRunner::Path(_) => {}
+                ConfiguredRunner::Path(path) => stale_configured = Some(path.clone()),
                 // A version pin asks for a managed install; wine has none.
                 ConfiguredRunner::Version(_) => {
                     return Err(ResolveError::Unresolvable {
                         family: RunnerFamily::Wine,
+                        cause: UnresolvedCause::NoneFound {
+                            mode: ProviderMode::DiscoverOnly,
+                        },
                     });
                 }
             }
@@ -81,6 +90,12 @@ impl WineProvider {
             Some(path) => Ok(resolved(wine_ref(&path))),
             None => Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
+                cause: match stale_configured {
+                    Some(path) => UnresolvedCause::StaleConfigured { path },
+                    None => UnresolvedCause::NoneFound {
+                        mode: ProviderMode::DiscoverOnly,
+                    },
+                },
             }),
         }
     }
@@ -145,7 +160,7 @@ fn is_executable(_path: &Path) -> bool {
 mod tests {
     use super::{WineProvider, executable_file, find_on_path};
 
-    use cellar_core::errors::ResolveError;
+    use cellar_core::errors::{ResolveError, UnresolvedCause};
     use cellar_core::ports::RunnerResolver;
     use cellar_core::types::{
         ConfiguredRunner, ProviderMode, RunnerFamily, RunnerInstall, RunnerSpec,
@@ -290,6 +305,29 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_configured_path_names_itself_when_path_also_misses() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let configured = dir.join("wine");
+        std::fs::write(&configured, "not executable").unwrap();
+        let spec = RunnerSpec::with_configured(
+            RunnerFamily::Wine,
+            ConfiguredRunner::Path(configured.clone()),
+        );
+        let err =
+            WineProvider::resolve_inner(&spec, Some(std::ffi::OsStr::new("/nonexistent-dir")))
+                .expect_err("no wine anywhere");
+        assert_eq!(
+            err,
+            ResolveError::Unresolvable {
+                family: RunnerFamily::Wine,
+                cause: UnresolvedCause::StaleConfigured { path: configured },
+            },
+            "the stale path is named exactly — the doctor's hint points at it"
+        );
+    }
+
+    #[test]
     fn a_version_pin_is_unresolvable_for_discover_only_wine() {
         let spec = RunnerSpec::with_configured(
             RunnerFamily::Wine,
@@ -299,7 +337,10 @@ mod tests {
         assert_eq!(
             err,
             ResolveError::Unresolvable {
-                family: RunnerFamily::Wine
+                family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             }
         );
     }

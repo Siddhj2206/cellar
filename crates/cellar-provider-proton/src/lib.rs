@@ -11,7 +11,7 @@
 //! seam — so resolution stays deterministic and testable without touching
 //! the process environment.
 
-use cellar_core::errors::ResolveError;
+use cellar_core::errors::{ResolveError, UnresolvedCause};
 use cellar_core::manifest::{
     ArchiveLayout, ChecksumScheme, InstallKind, ReleaseSource, RunnerManifest,
 };
@@ -151,6 +151,9 @@ impl ProtonProvider {
         if spec.family != RunnerFamily::Proton {
             return Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Proton,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::Managed,
+                },
             });
         }
         if let Some(configured) = &spec.configured {
@@ -188,6 +191,9 @@ impl ProtonProvider {
         }
         Err(ResolveError::Unresolvable {
             family: RunnerFamily::Proton,
+            cause: UnresolvedCause::NoneFound {
+                mode: ProviderMode::Managed,
+            },
         })
     }
 }
@@ -541,7 +547,10 @@ mod tests {
         assert_eq!(
             provider.resolve(&RunnerSpec::new(RunnerFamily::Proton)),
             Err(ResolveError::Unresolvable {
-                family: RunnerFamily::Proton
+                family: RunnerFamily::Proton,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::Managed,
+                },
             })
         );
     }

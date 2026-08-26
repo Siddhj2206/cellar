@@ -28,6 +28,16 @@ impl RunnerFamily {
             Self::Umu => "umu",
         }
     }
+
+    /// The prefix.toml spelling (`family = "Wine"`, docs/usage.md) —
+    /// configure-a-path hints quote it verbatim.
+    pub const fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Proton => "Proton",
+            Self::Wine => "Wine",
+            Self::Umu => "Umu",
+        }
+    }
 }
 
 /// A request to resolve a runner: which family, plus any explicit

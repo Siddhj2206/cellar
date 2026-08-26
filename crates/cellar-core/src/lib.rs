@@ -25,7 +25,7 @@ pub mod slug;
 pub mod types;
 
 pub use entities::{AppEntry, AppKind, Candidate, Overrides, Prefix, PrefixDefaults, Settings};
-pub use errors::{DesktopError, ResolveError, StorageError};
+pub use errors::{DesktopError, ResolveError, StorageError, UnresolvedCause};
 pub use health::TreeHealth;
 pub use manifest::{
     ArchiveLayout, ChecksumScheme, InstallKind, LATEST_PIN, ManagedInventory, ManagedRecord,

@@ -6,8 +6,26 @@
 //! slice (#29).
 
 use std::fmt;
+use std::path::PathBuf;
 
-use crate::types::RunnerFamily;
+use crate::types::{ProviderMode, RunnerFamily};
+
+/// Why a resolution order found nothing — stamped by the provider that
+/// services the spec's family, so fix hints derive from the provider's mode
+/// (trait membership), never from family-string formatting at a render
+/// site: managed families install through Cellar (`runner install`),
+/// discover-only families come from the host (the system package manager,
+/// or a configured path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnresolvedCause {
+    /// The order found nothing anywhere — no valid configured path, no
+    /// managed install, nothing on PATH. The servicing provider's mode
+    /// names what an install looks like.
+    NoneFound { mode: ProviderMode },
+    /// A configured path was present but not an executable file before the
+    /// order fell through — stale configuration, named exactly.
+    StaleConfigured { path: PathBuf },
+}
 
 /// Failure resolving a runner spec (pre-flight; dispositions per blueprint
 /// §7: order exhausted → doctor: `SuggestInstall`; corrupt install →
@@ -17,8 +35,12 @@ pub enum ResolveError {
     /// No provider can serve the spec — the family's resolution order
     /// (configured → managed → PATH, research #18) is exhausted, or no
     /// provider services the family. The failure's family names what a
-    /// `SuggestInstall` must install.
-    Unresolvable { family: RunnerFamily },
+    /// `SuggestInstall` must install; its cause carries why, driving the
+    /// doctor's mode-derived fix hint.
+    Unresolvable {
+        family: RunnerFamily,
+        cause: UnresolvedCause,
+    },
     /// The provider exists but its install is missing or corrupt
     /// (doctor: reinstall the runner).
     NotInstalled { family: RunnerFamily },
@@ -30,7 +52,7 @@ impl ResolveError {
     /// error over another family's "not me" answer (#28).
     pub const fn family(&self) -> RunnerFamily {
         match self {
-            Self::Unresolvable { family } | Self::NotInstalled { family } => *family,
+            Self::Unresolvable { family, .. } | Self::NotInstalled { family } => *family,
         }
     }
 }
@@ -38,7 +60,7 @@ impl ResolveError {
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unresolvable { family } => write!(
+            Self::Unresolvable { family, .. } => write!(
                 f,
                 "no {} runner could be resolved — install it or configure a path",
                 family.as_str()

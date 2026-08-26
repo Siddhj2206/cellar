@@ -26,14 +26,14 @@
 
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
-use cellar_core::errors::{DesktopError, ResolveError, StorageError};
+use cellar_core::errors::{DesktopError, ResolveError, StorageError, UnresolvedCause};
 use cellar_core::health::{AssociationState, DesktopIntegration, TreeHealth};
 use cellar_core::manifest::{ManagedRecord, RunnerManifest};
 use cellar_core::ports::{
     DesktopIntegrator, InstallProgress, RunnerResolver, Storage, WrapperContributor,
 };
 use cellar_core::slug;
-use cellar_core::types::{LaunchPlan, ResolvedRunner, RunnerFamily, RunnerSpec};
+use cellar_core::types::{LaunchPlan, ProviderMode, ResolvedRunner, RunnerFamily, RunnerSpec};
 use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
 
 use std::collections::BTreeSet;
@@ -1473,13 +1473,36 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
                     family.as_str()
                 )
             }
-            LaunchError::Resolve(ResolveError::Unresolvable { family }) => {
-                format!(
-                    "install a {} runner (`cellar runner install {} <version>`) \
-                     or configure a path",
-                    family.as_str(),
-                    family.as_str()
-                )
+            LaunchError::Resolve(ResolveError::Unresolvable { family, cause }) => {
+                match cause {
+                    UnresolvedCause::StaleConfigured { path } => format!(
+                        "the configured {} path at `{}` is not executable — \
+                         fix or remove it",
+                        family.as_str(),
+                        path.display()
+                    ),
+                    UnresolvedCause::NoneFound {
+                        mode: ProviderMode::Managed,
+                    } => format!(
+                        "install a {} runner (`cellar runner install {} <version>`) \
+                         or configure a path",
+                        family.as_str(),
+                        family.as_str()
+                    ),
+                    // Discover-only families have no `runner install` — the
+                    // verb derives from provider mode (trait membership), so
+                    // a future discover-only family cannot reintroduce the
+                    // impossible-command hint (#42).
+                    UnresolvedCause::NoneFound {
+                        mode: ProviderMode::DiscoverOnly,
+                    } => format!(
+                        "install {} via your system package manager, or configure \
+                         a path: `runner = {{ family = \"{}\", configured = {{ \
+                         Path = … }} }}`",
+                        family.as_str(),
+                        family.as_config_str()
+                    ),
+                }
             }
             LaunchError::PlanUnavailable { family } => {
                 format!(
@@ -1590,7 +1613,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides, Settings};
-    use cellar_core::errors::{DesktopError, ResolveError, StorageError};
+    use cellar_core::errors::{DesktopError, ResolveError, StorageError, UnresolvedCause};
     use cellar_core::health::{AssociationState, DesktopIntegration, TreeHealth};
     use cellar_core::manifest::{ManagedRecord, RunnerManifest};
     use cellar_core::ports::{__sealed, DesktopIntegrator, InstallProgress, RunnerResolver};
@@ -2640,6 +2663,9 @@ mod tests {
             });
             let resolver = StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             }));
             let service = InstallService::new(mock, resolver, StubDesktop::new());
             let _ = service
@@ -3409,9 +3435,10 @@ mod tests {
     }
 
     #[test]
-    fn doctor_maps_unresolvable_plans_to_suggest_install() -> anyhow::Result<()> {
-        // The §7 disposition: an exhausted resolution order → doctor:
-        // SuggestInstall — the finding names the family and the command.
+    fn doctor_wine_unresolvable_hints_at_the_host_not_runner_install() -> anyhow::Result<()> {
+        // Wine is discover-only — no `runner install` exists for it (#42).
+        // The hint derives from provider mode: a host install or a
+        // configured path, never an impossible command.
         let mock = MockStorage::new(healthy_tree());
         mock.add_prefix(Prefix {
             slug: "default".to_owned(),
@@ -3423,6 +3450,9 @@ mod tests {
             StubDesktop::new(),
             StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             })),
         );
         let report = service.check()?;
@@ -3436,8 +3466,86 @@ mod tests {
             finding.problem
         );
         assert!(
-            finding.fix.contains("install a wine runner"),
-            "the fix is the SuggestInstall disposition: {}",
+            finding.fix.contains("system package manager"),
+            "the fix points at a host install: {}",
+            finding.fix
+        );
+        assert!(
+            finding.fix.contains("family = \"Wine\""),
+            "the fix shows how to configure a path: {}",
+            finding.fix
+        );
+        assert!(
+            !finding.fix.contains("runner install"),
+            "the impossible command must be gone: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_managed_family_hint_keeps_the_install_command() -> anyhow::Result<()> {
+        // Proton is managed — its exhausted order still suggests the real
+        // install command (no regression from the mode-derived hint, #42).
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(
+            mock,
+            StubDesktop::new(),
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Proton,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::Managed,
+                },
+            })),
+        );
+        let report = service.check()?;
+        let finding = &report.sections[3].findings[0];
+        assert!(
+            finding
+                .fix
+                .contains("cellar runner install proton <version>"),
+            "the managed verb survives: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_stale_configured_wine_names_the_path() -> anyhow::Result<()> {
+        // A present-but-broken configured path that fell through to a PATH
+        // miss names itself — a fix hint must actually fix (#42; #51's rule).
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(
+            mock,
+            StubDesktop::new(),
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Wine,
+                cause: UnresolvedCause::StaleConfigured {
+                    path: PathBuf::from("/opt/old-wine/bin/wine"),
+                },
+            })),
+        );
+        let report = service.check()?;
+        let finding = &report.sections[3].findings[0];
+        assert!(
+            finding.fix.contains("/opt/old-wine/bin/wine")
+                && finding.fix.contains("fix or remove it"),
+            "the hint names the stale path: {}",
+            finding.fix
+        );
+        assert!(
+            !finding.fix.contains("system package manager"),
+            "the configuration is the fix, not a host install: {}",
             finding.fix
         );
         Ok(())
@@ -3501,6 +3609,9 @@ mod tests {
             StubDesktop::new(),
             StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             })),
         );
         let report = service.check()?;
@@ -3827,13 +3938,19 @@ mod tests {
             mock,
             StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             })),
         );
         let err = service.plan("balatro", &[]).expect_err("no wine available");
         assert_eq!(
             err,
             LaunchError::Resolve(ResolveError::Unresolvable {
-                family: RunnerFamily::Wine
+                family: RunnerFamily::Wine,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::DiscoverOnly,
+                },
             }),
             "resolution exhausted maps to the resolve family"
         );
@@ -4012,6 +4129,9 @@ mod tests {
             mock,
             StubResolver::new(Err(ResolveError::Unresolvable {
                 family: RunnerFamily::Proton,
+                cause: UnresolvedCause::NoneFound {
+                    mode: ProviderMode::Managed,
+                },
             })),
         );
         let err = service.plan("balatro", &[]).expect_err("runner first");
