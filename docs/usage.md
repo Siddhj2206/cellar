@@ -10,7 +10,7 @@ The three ideas worth knowing up front:
   every app inside it.
 - **App entry** — one registered `.exe` you can launch by slug. Identity is the exe's absolute
   path; re-installing it updates the same entry.
-- **Runner** — what actually runs the exe: GE-Proton and umu-launcher (installed *by* Cellar), or
+- **Runner** — what actually runs the exe: GE-Proton and umu-launcher (installed _by_ Cellar), or
   system wine / Steam Proton (discovered from your system, never modified).
 
 Full vocabulary lives in [`CONTEXT.md`](../CONTEXT.md). This guide covers daily use; scripting
@@ -33,6 +33,7 @@ and install something:
 cellar runner install proton GE-Proton11-5    # or just `latest` / no version for the newest release
 cellar install ~/Downloads/game_setup.exe
 ```
+
 ## Installing apps — `cellar install <path>`
 
 One flow handles all three artifact kinds:
@@ -50,13 +51,13 @@ Pass `--artifact standalone|installer|archive` to skip the question.
 Interactive prompts appear only when stdin is a terminal and `--no-input` is absent. Every prompt
 has a flag equivalent:
 
-| Decision | Prompt | Flags |
-| --- | --- | --- |
-| Which prefix | Pick an existing one (numbered), type a new name, or empty for `default` | `--prefix <name>` |
-| Artifact kind | Asked once, filename-hinted | `--artifact <kind>` |
-| Display name | From the exe file name by default | `--name "<display name>"` |
-| Kind metadata | game or tool | `--kind game\|tool` |
-| Keep which discovered exes | Numbered keep/hide review + manual adds | `--keep <n>` (repeatable), `--keep-all`, `--add <path>` (repeatable) |
+| Decision                   | Prompt                                                                   | Flags                                                                |
+| -------------------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| Which prefix               | Pick an existing one (numbered), type a new name, or empty for `default` | `--prefix <name>`                                                    |
+| Artifact kind              | Asked once, filename-hinted                                              | `--artifact <kind>`                                                  |
+| Display name               | From the exe file name by default                                        | `--name "<display name>"`                                            |
+| Kind metadata              | game or tool                                                             | `--kind game\|tool`                                                  |
+| Keep which discovered exes | Numbered keep/hide review + manual adds                                  | `--keep <n>` (repeatable), `--keep-all`, `--add <path>` (repeatable) |
 
 After an installer or archive runs, Cellar decodes the Start Menu/Desktop shortcuts created inside
 the prefix and offers their targets as candidates. Nothing registers without confirmation — no

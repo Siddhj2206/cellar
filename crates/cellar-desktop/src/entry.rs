@@ -52,6 +52,8 @@ impl DesktopEntry<'_> {
         let _ = writeln!(out, "Categories={};", self.category);
         let _ = writeln!(out, "Comment=Launch {} through Cellar", self.name);
         let _ = writeln!(out, "Terminal=false");
+        // Busy-cursor feedback while the plan resolves (#63).
+        let _ = writeln!(out, "StartupNotify=true");
         out
     }
 }
@@ -141,7 +143,8 @@ impl AssociationEntry<'_> {
              NoDisplay=true\n\
              MimeType=application/vnd.microsoft.portable-executable;\n\
              Comment=Install this Windows executable through Cellar\n\
-             Terminal=false\n",
+             Terminal=false\n\
+             StartupNotify=true\n",
             quote_exec_arg(self.executable),
         )
     }
@@ -179,7 +182,8 @@ mod tests {
              Icon=/home/me/.local/share/cellar/cache/icons/x.png\n\
              Categories=Game;\n\
              Comment=Launch balatro through Cellar\n\
-             Terminal=false\n"
+             Terminal=false\n\
+             StartupNotify=true\n"
         );
     }
 

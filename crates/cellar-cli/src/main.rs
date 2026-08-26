@@ -528,6 +528,60 @@ fn narrate(quiet: bool, message: std::fmt::Arguments<'_>) {
     }
 }
 
+/// One desktop notification carrying a launch failure to the user who
+/// clicked a launcher entry (#63): stderr is not a terminal there, so the
+/// CLI's own error text would vanish. Best-effort by contract — an absent
+/// `notify-send` or daemon is a silent no-op, and the attempt never
+/// alters the launch result. Foreground launches (stderr IS a terminal)
+/// never notify.
+fn notify_launch_failure(message: &str) {
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let _ = std::process::Command::new("notify-send")
+        .args(["Cellar launch failed", message])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// The #63 honesty pass: one stdout narration line per registered entry
+/// whose launch plan cannot currently build (suppressed by `--quiet` like
+/// every narration; no prompting, no auto-install — that stays #38's).
+fn narrate_unbuildable_plans(
+    store: &TreeStore,
+    quiet: bool,
+    entries: &[InstallResult],
+    verb: &str,
+) {
+    let app = LaunchApp::with_chain(store.clone(), resolvers_for(store), wrappers_for);
+    for result in entries {
+        let slug = &result.entry.slug;
+        if let Err(error) = app.plan(slug, &[]) {
+            narrate(
+                quiet,
+                format_args!("entry '{slug}' {verb} — won't launch yet: {error}"),
+            );
+        }
+    }
+}
+
+/// The sync variant of the honesty pass (#63): every registered entry is
+/// checked after a re-derivation.
+fn narrate_sync_honesty(store: &TreeStore, quiet: bool) -> anyhow::Result<()> {
+    let app = LaunchApp::with_chain(store.clone(), resolvers_for(store), wrappers_for);
+    for entry in store.list_apps()? {
+        if let Err(error) = app.plan(&entry.slug, &[]) {
+            narrate(
+                quiet,
+                format_args!("entry '{}' won't launch yet: {error}", entry.slug),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The stderr variant of [`narrate`]: announcements on stderr (the
 /// filename-hint decision) are narration too — silenced by `--quiet`, while
 /// real errors always print.
@@ -798,6 +852,9 @@ fn run_desktop_sync(
         quiet,
         format_args!("Wired the Open-with-Cellar file association"),
     );
+    // The #63 honesty pass: say which re-derived entries cannot launch
+    // right now, instead of leaving the click to fail silently.
+    narrate_sync_honesty(store, quiet)?;
     for slug in &report.damaged_slugs {
         eprintln!(
             "cellar: apps/{slug}.toml is unreadable (hand-edit damage) — \
@@ -1007,6 +1064,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 print!("{}", render_plan(&plan, args.json)?);
                 return Ok(ExitCode::SUCCESS);
             }
+            // A launcher click runs this exact code with stderr detached
+            // (#63): any pre-spawn failure must also reach the desktop as
+            // a notification, or it vanishes without a trace.
             // Execute phase (blueprint §7): spawn the frozen plan; the
             // wait-vs-detach policy is presentation's (CLI foregrounds,
             // --detach releases the process from the terminal).
@@ -1015,7 +1075,15 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             } else {
                 LaunchMode::Foreground
             };
-            let process = service.spawn(&args.app, &args.args, mode)?;
+            let process = match service.spawn(&args.app, &args.args, mode) {
+                Ok(process) => process,
+                // Pre-spawn failures (resolve/check/plan/spawn) reach the
+                // desktop notification when headless (#63).
+                Err(error) => {
+                    notify_launch_failure(&error.to_string());
+                    return Err(error.into());
+                }
+            };
             if args.detach {
                 // The pid and log path are the deliverable of --detach —
                 // never narration, so they print under --quiet too.
@@ -1223,6 +1291,9 @@ fn run_install(
                 quiet,
                 format_args!("Run it with: cellar launch {}", result.entry.slug),
             );
+            // The #63 honesty pass covers the direct-registration branch
+            // too — standalone installs skip the review flow.
+            narrate_unbuildable_plans(store, quiet, std::slice::from_ref(result), "created");
         }
         ArtifactKind::Installer => {
             narrate(
@@ -1236,7 +1307,7 @@ fn run_install(
             if let Some(log) = &outcome.log_path {
                 narrate(quiet, format_args!("output: {}", log.display()));
             }
-            review_and_register(&service, &outcome, args, interactive, quiet)?;
+            review_and_register(store, &service, &outcome, args, interactive, quiet)?;
         }
         ArtifactKind::Archive => {
             narrate(
@@ -1247,7 +1318,7 @@ fn run_install(
                     outcome.prefix_slug
                 ),
             );
-            review_and_register(&service, &outcome, args, interactive, quiet)?;
+            review_and_register(store, &service, &outcome, args, interactive, quiet)?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -1261,6 +1332,7 @@ fn run_install(
 /// 4). Nothing registers without confirmation: with no flags, an
 /// unreviewed list registers zero entries.
 fn review_and_register(
+    store: &TreeStore,
     service: &InstallService<TreeStore, ResolverSet, DesktopService>,
     outcome: &InstallOutcome,
     args: &InstallArgs,
@@ -1294,6 +1366,9 @@ fn review_and_register(
     // trimmed here — no blank line between the summary and the prompt.
     let summary = registration_summary(&registrations, &outcome.prefix_slug);
     narrate(quiet, format_args!("{}", summary.trim_end()));
+    // The #63 write-time honesty pass: an entry whose launch plan cannot
+    // build right now says so — ordinary narration, no prompting.
+    narrate_unbuildable_plans(store, quiet, &registrations, "created");
     Ok(())
 }
 
