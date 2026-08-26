@@ -7,10 +7,12 @@
 //! per-launch log the caller chose under `cache/launch-logs` (blueprint §7,
 //! §6): [`LaunchMode::Foreground`] pipes the child's stdout/stderr and
 //! [`SpawnedProcess::wait`] drains them into the log while mirroring them to
-//! our own streams (the CLI's "may forward it"); [`LaunchMode::Detached`]
-//! hands the log to the child directly and returns a handle that needs no
-//! `wait` — the presentation decides wait-vs-detach (§7).
-//!
+//! our own streams (the CLI's "may forward it") — a drain bounded by a grace
+//! window past the child's exit, so a grandchild that inherited a pipe
+//! cannot hang the launch after the game is done (#50);
+//! [`LaunchMode::Detached`] hands the log to the child directly and returns
+//! a handle that needs no `wait` — the presentation decides wait-vs-detach
+//! (§7).
 //! Failures map to the blueprint §7 Spawn family: the OS error is reported
 //! as-is, [`LaunchError::Spawn`]. The Runtime family (the exit code) is
 //! propagated raw by the presentation, never mapped here.
@@ -21,7 +23,9 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -41,6 +45,25 @@ pub enum LaunchMode {
     /// foreground process group (Ctrl+C no longer reaches it).
     Detached,
 }
+
+/// How the foreground drain ended: both pipes reached EOF (the common
+/// launch), or the grace expired with a pipe still held open by a process
+/// that outlived the game (#50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    Complete,
+    Truncated,
+}
+
+/// The post-exit grace window for in-flight output (#50): bounded so a
+/// lingering child can never hang the launch, long enough for a live
+/// writer's final flushes.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// The stderr diagnostic when the grace expired with a pipe still held —
+/// a launch that drained cleanly prints nothing (#50).
+const TRUNCATION_NOTE: &str =
+    "cellar: game exited; output truncated — a child process is still holding the output pipe";
 
 /// A spawned launch (blueprint §7 execute phase): pid, per-launch log path,
 /// and [`SpawnedProcess::wait`]. Dropping the handle never kills the child —
@@ -73,30 +96,54 @@ impl SpawnedProcess {
     /// launches additionally drain the child's piped output into the log
     /// while mirroring it to our stdout/stderr, so a game that prints
     /// heavily never blocks on a full pipe.
-    pub fn wait(mut self) -> Result<ExitStatus, LaunchError> {
+    pub fn wait(self) -> Result<ExitStatus, LaunchError> {
+        let (status, outcome) = self.wait_draining()?;
+        if outcome == DrainOutcome::Truncated {
+            // Survives `-q`: a diagnostic about lost capture, not
+            // narration (#50).
+            let _ = writeln!(io::stderr(), "{TRUNCATION_NOTE}");
+        }
+        Ok(status)
+    }
+
+    /// [`SpawnedProcess::wait`] with the drain outcome exposed — the seam
+    /// the truncation note is glued onto, observable in tests.
+    fn wait_draining(mut self) -> Result<(ExitStatus, DrainOutcome), LaunchError> {
         let mut child = self.child;
         let Some(log) = self.log.take() else {
             // Detached: the child owns its log; just await (tests reap).
-            return child.wait().map_err(|e| spawn_err(&self.program, &e));
+            let status = child.wait().map_err(|e| spawn_err(&self.program, &e))?;
+            return Ok((status, DrainOutcome::Complete));
         };
         let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
         else {
-            return child.wait().map_err(|e| spawn_err(&self.program, &e));
+            let status = child.wait().map_err(|e| spawn_err(&self.program, &e))?;
+            return Ok((status, DrainOutcome::Complete));
         };
-        // Foreground: the child's stdout/stderr are pipes; drain each to
-        // EOF into the log while mirroring to the matching stream. Scoped
-        // threads borrow the pipes and the log; the scope joins them once
-        // the child has exited.
+        // Foreground: the child's stdout/stderr are pipes. Each drain runs
+        // detached on its own thread and reports EOF over a channel — the
+        // scope-less shape is the point (#50): joining the drains waits for
+        // pipe EOF, and a grandchild that inherited the pipe owns that EOF,
+        // not the game. After the child exits, the drains share one grace
+        // window; whatever misses it is abandoned (its late reads can only
+        // ever append to the log, and process exit reaps the stray), and
+        // the expiry surfaces as a truncation.
         let stdout_log = log.try_clone().map_err(|e| spawn_err(&self.program, &e))?;
-        thread::scope(|scope| {
-            scope.spawn(move || copy_out(&mut stdout, stdout_log, io::stdout().lock()));
-            scope.spawn(move || copy_out(&mut stderr, log, io::stderr().lock()));
-            // The scope joins the drain threads after the child exits — the
-            // common case; a grandchild inheriting a pipe keeps the drain
-            // alive, the same bounded wait std's `wait_with_output` offers.
-            child.wait()
-        })
-        .map_err(|e| spawn_err(&self.program, &e))
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let out_tx = drained_tx.clone();
+        let err_tx = drained_tx.clone();
+        drop(drained_tx);
+        thread::spawn(move || {
+            let _ = copy_out(&mut stdout, stdout_log, io::stdout().lock());
+            let _ = out_tx.send(());
+        });
+        thread::spawn(move || {
+            let _ = copy_out(&mut stderr, log, io::stderr().lock());
+            let _ = err_tx.send(());
+        });
+        let status = child.wait().map_err(|e| spawn_err(&self.program, &e))?;
+        let outcome = drain_grace(&drained_rx);
+        Ok((status, outcome))
     }
 }
 
@@ -184,6 +231,21 @@ fn copy_out<R: Read, L: Write, M: Write>(
     }
 }
 
+/// Collect the drains' EOF signals within one shared grace window: every
+/// signal inside the window keeps waiting for the next; the first timeout
+/// is a truncation (#50).
+fn drain_grace(drained: &mpsc::Receiver<()>) -> DrainOutcome {
+    let deadline = Instant::now() + DRAIN_GRACE;
+    for _ in 0..2 {
+        match drained.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(()) => {}
+            Err(RecvTimeoutError::Timeout) => return DrainOutcome::Truncated,
+            Err(RecvTimeoutError::Disconnected) => return DrainOutcome::Complete,
+        }
+    }
+    DrainOutcome::Complete
+}
+
 /// The Spawn-family mapping: the OS error verbatim, named with the program
 /// that failed.
 fn spawn_err(program: &str, error: &io::Error) -> LaunchError {
@@ -248,13 +310,83 @@ fn stub_plan(script: &Path, cwd: &Path, extra_args: &[&str]) -> LaunchPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchMode, SpawnedProcess, spawn, stub_plan, temp_script};
+    use super::{
+        DrainOutcome, LaunchError, LaunchMode, SpawnedProcess, spawn, stub_plan, temp_script,
+    };
 
     use cellar_core::types::LaunchPlan;
-
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use std::process::Command;
+    use std::sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+    use std::thread;
+    use std::time::Duration;
+
+    /// Serializes every test that keeps a pipe-holding descendant alive
+    /// (and the clean-drain test, whose grace window their holders would
+    /// starve): while such a descendant lives, this sandbox can freeze the
+    /// whole test binary's wall clock, so one holder at a time, and never
+    /// under a concurrent grace window.
+    static PIPE_HOLDER_SERIES: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Poll for log content: the drain threads resume on the sandbox's
+    /// schedule, not ours — capture lands shortly after, and the assert
+    /// must not race it.
+    fn wait_log_contains(path: &Path, needle: &str) -> String {
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = log_text(path);
+            if text.contains(needle) {
+                return text;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        text
+    }
+
+    /// Kill the pipe holder a test spawned (its script recorded the pid) and
+    /// give the reaper a moment: in this sandbox a surviving descendant keeps
+    /// wall-clock time frozen for this whole test binary, which would bleed
+    /// spurious grace-window expiry into any concurrently running test.
+    fn kill_holder(dir: &Path) {
+        let pid_file = dir.join("holder.pid");
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let _ = Command::new("kill").arg("-9").arg(pid.trim()).status();
+            thread::sleep(Duration::from_millis(50));
+        }
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// The series lock above plus this reaper bound a holder's whole life
+    /// inside its own test.
+    fn holder_series_lock() -> std::sync::MutexGuard<'static, ()> {
+        PIPE_HOLDER_SERIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Spawn with a bounded retry on `ETXTBSY`: under this sandbox's /tmp
+    /// an exec can race the just-closed write handle of `temp_script` (the
+    /// classic "Text file busy" copy-up), purely environmental — the stub
+    /// is complete and closed before any spawn call is even made.
+    fn spawn_stub(plan: &LaunchPlan, log: &Path, mode: LaunchMode) -> SpawnedProcess {
+        let mut attempts = 0;
+        loop {
+            match spawn(plan, log, mode) {
+                Err(LaunchError::Spawn { error, .. })
+                    if attempts < 40 && error.contains("Text file busy") =>
+                {
+                    attempts += 1;
+                    thread::sleep(Duration::from_millis(25));
+                }
+                other => return other.unwrap_or_else(|e| panic!("spawn: {e}")),
+            }
+        }
+    }
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -287,8 +419,7 @@ mod tests {
         );
         let plan = stub_plan(&script, &dir, &["--fullscreen"]);
         let log = log_path(&dir);
-        let process =
-            spawn(&plan, &log, LaunchMode::Foreground).unwrap_or_else(|e| panic!("spawn: {e}"));
+        let process = spawn_stub(&plan, &log, LaunchMode::Foreground);
         let status = process.wait().unwrap_or_else(|e| panic!("wait: {e}"));
         assert_eq!(
             status.code(),
@@ -319,10 +450,103 @@ mod tests {
         let (dir, script) = temp_script("clean", "exit 0\n");
         let plan = stub_plan(&script, &dir, &[]);
         let log = log_path(&dir);
-        let status = spawn(&plan, &log, LaunchMode::Foreground)
-            .and_then(SpawnedProcess::wait)
+        let status = spawn_stub(&plan, &log, LaunchMode::Foreground)
+            .wait()
             .unwrap_or_else(|e| panic!("launch: {e}"));
         assert_eq!(status.code(), Some(0));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn foreground_returns_promptly_when_a_grandchild_holds_the_pipe() {
+        // The exe backgrounds a sleeper that outlives it (which inherits
+        // both pipes) and exits — real Windows games leave launcher helpers
+        // and crash handlers behind constantly (#50). The wait is bounded
+        // by the child plus the grace window, never by the sleeper. (The
+        // holder is one second, not thirty: long enough to outrun the
+        // 500ms grace, short enough not to tax the test sandbox, which
+        // keeps reaping a process's descendants before finishing it.)
+        let _series = holder_series_lock();
+        let (dir, script) = temp_script(
+            "lingering",
+            "echo before-exit\nsh -c 'echo $$ > holder.pid; sleep 1' &\nexit 0\n",
+        );
+        let plan = stub_plan(&script, &dir, &[]);
+        let log = log_path(&dir);
+        let started = std::time::Instant::now();
+        let process = spawn_stub(&plan, &log, LaunchMode::Foreground);
+        let (status, outcome) = process
+            .wait_draining()
+            .unwrap_or_else(|e| panic!("wait: {e}"));
+        let elapsed = started.elapsed();
+        assert_eq!(status.code(), Some(0));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a lingering child must not hold the launch hostage: {elapsed:?}"
+        );
+        assert_eq!(outcome, DrainOutcome::Truncated);
+        let text = wait_log_contains(&log, "before-exit");
+        assert!(
+            text.contains("before-exit"),
+            "output recorded before the exit is captured"
+        );
+        // The holder must not outlive the test: a surviving descendant
+        // freezes wall-clock time for this whole test binary here.
+        kill_holder(&dir);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn output_flushing_within_the_grace_window_is_still_captured() {
+        // One orphan flushes a line shortly after the parent exited, then a
+        // second orphan keeps the pipe open: the grace captures the flush
+        // and still reports the truncation (#50).
+        let _series = holder_series_lock();
+        let (dir, script) = temp_script(
+            "grace-flush",
+            "echo parent-line\nsh -c 'sleep 0.2; echo late-flush' &\n\
+             sh -c 'echo $$ > holder.pid; sleep 1' &\nexit 0\n",
+        );
+        let plan = stub_plan(&script, &dir, &[]);
+        let log = log_path(&dir);
+        let started = std::time::Instant::now();
+        let process = spawn_stub(&plan, &log, LaunchMode::Foreground);
+        let (_, outcome) = process
+            .wait_draining()
+            .unwrap_or_else(|e| panic!("wait: {e}"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait stayed bounded"
+        );
+        assert_eq!(outcome, DrainOutcome::Truncated);
+        let text = wait_log_contains(&log, "late-flush");
+        assert!(text.contains("parent-line"), "pre-exit output:\n{text}");
+        assert!(
+            text.contains("late-flush"),
+            "a flush inside the grace window is captured:\n{text}"
+        );
+        kill_holder(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_clean_drain_reports_complete() {
+        // The identical app without a lingering child drains to EOF and
+        // reports Complete — exactly the old unbounded shape (#50).
+        let _series = holder_series_lock();
+        let (dir, script) = temp_script("drain-clean", "echo out\necho err >&2\nexit 0\n");
+        let plan = stub_plan(&script, &dir, &[]);
+        let log = log_path(&dir);
+        let process = spawn_stub(&plan, &log, LaunchMode::Foreground);
+        let (status, outcome) = process
+            .wait_draining()
+            .unwrap_or_else(|e| panic!("wait: {e}"));
+        assert_eq!(status.code(), Some(0));
+        assert_eq!(outcome, DrainOutcome::Complete);
+        let text = log_text(&log);
+        assert!(
+            text.contains("out") && text.contains("err"),
+            "drained:\n{text}"
+        );
     }
 
     #[test]
@@ -331,8 +555,7 @@ mod tests {
         let (dir, script) = temp_script("detached", "echo started\nsleep 2\necho done\n");
         let plan = stub_plan(&script, &dir, &[]);
         let log = log_path(&dir);
-        let process =
-            spawn(&plan, &log, LaunchMode::Detached).unwrap_or_else(|e| panic!("spawn: {e}"));
+        let process = spawn_stub(&plan, &log, LaunchMode::Detached);
         // The handle returns while the child lives (#29 acceptance: `--detach`
         // returns with the process still running) — /proc is the Linux pid
         // liveness probe; no libc/unsafe needed.

@@ -84,7 +84,10 @@ cellar launch balatro -- -fullscreen   # arguments after -- go to the app
 ```
 
 Output is captured to a per-launch log under `cache/launch-logs/` and mirrored to the terminal in
-foreground mode. A game killed by a signal exits `1` with the signal reported on stderr.
+foreground mode. The foreground capture waits up to 500 ms after the game exits for output still in
+flight; a leftover child process holding the output pipe (launcher helpers do this) ends the wait —
+cellar prints `game exited; output truncated` on stderr and returns the game's exit code. A game
+killed by a signal exits `1` with the signal reported on stderr.
 
 The plan is resolved in a fixed order — app override → prefix default → kind default — and a failed
 Proton selection never silently falls back to wine. `--dry-run` shows exactly what would run,
