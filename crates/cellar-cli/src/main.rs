@@ -645,6 +645,22 @@ impl<W: std::io::Write> ProgressRenderer<W> {
             }
             InstallProgress::Verify => self.phase("Verifying SHA-512…"),
             InstallProgress::Extract => self.phase("Extracting…"),
+            InstallProgress::Retrying {
+                attempt,
+                attempts,
+                delay_ms,
+                reason,
+            } => {
+                // A transfer diagnostic (#58), not narration: printed
+                // even under --quiet, and never throttled away like a
+                // repaint tick. A dangling download line is closed first
+                // so the note starts on a fresh line.
+                self.finish();
+                eprintln!(
+                    "cellar: retrying in {:.1}s (attempt {attempt}/{attempts}): {reason}",
+                    *delay_ms as f32 / 1000.0
+                );
+            }
         }
     }
 

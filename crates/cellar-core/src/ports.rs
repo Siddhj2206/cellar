@@ -32,6 +32,16 @@ pub enum InstallProgress {
     /// otherwise arrive per copied chunk, offsets monotonically rising to
     /// `total`.
     Download { offset: u64, total: Option<u64> },
+    /// A transient fetch failure earned another attempt (#58): the
+    /// download resumes from the partial file after `delay_ms`. A
+    /// transfer diagnostic, never narration — presentations print it even
+    /// under quiet flags.
+    Retrying {
+        attempt: u32,
+        attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    },
     /// Checksum verification started (SHA-512 over the whole artifact).
     Verify,
     /// Extraction into the runtime directory started.

@@ -39,7 +39,9 @@ use cellar_core::errors::StorageError;
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// The inventory file: `runtime/providers.toml` (blueprint §6 — the
 /// authoritative, re-installable record of managed installs).
@@ -60,6 +62,53 @@ const SUPPORTED_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
 /// Monotonic counter for per-install temp names within a process.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The idle-read timeout of the shared agent (#58): bytes-stopped-moving
+/// fails the request; slow-but-moving survives. ureq's default connect
+/// timeout (30s) stays; there is deliberately no overall request deadline
+/// — a 400 MB artifact on slow DSL legitimately exceeds any fixed budget.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Total HTTP attempts for the resumable download path (#58): the first
+/// try plus two retries.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// The one shared HTTP agent (#58), lazily built and reused by every
+/// fetch — artifact stream, checksum fetch, latest-tag lookup. Proxy env
+/// vars (`http_proxy`/`https_proxy`/`all_proxy`/`no_proxy`) are honored
+/// through ureq's `proxy-from-env` feature.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| ureq::AgentBuilder::new().timeout_read(READ_TIMEOUT).build())
+}
+
+/// A test-only agent with an injected read timeout: the stall test proves
+/// the timeout mechanism at millisecond scale instead of waiting out the
+/// production minute (#58).
+#[cfg(test)]
+fn agent_with_read_timeout(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_read(timeout).build()
+}
+
+/// One HTTP attempt's outcome beyond success (#58): fatal failures
+/// propagate immediately; transient ones earn another attempt.
+#[derive(Debug)]
+enum FetchFailure {
+    Fatal(StorageError),
+    Transient(String),
+}
+
+/// The retry backoff for attempt `n` (1-based): 1s/2s/4s plus a sub-250ms
+/// jitter so simultaneous installers don't re-stampede the server.
+fn backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 1000u64 << (attempt - 1);
+    let jitter_ms = u64::from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |now| now.subsec_nanos() % 250),
+    );
+    Duration::from_millis(base_ms + jitter_ms)
+}
 
 /// Install one managed runner version: fetch → verify → extract → record.
 ///
@@ -128,7 +177,7 @@ pub(crate) fn install(
         // one phase to the user (#37).
         progress(InstallProgress::Verify);
         let checksum_url = substitute(template, &version, arch);
-        let checksum = fetch_checksum(&checksum_url, &downloads, &artifact_name)?;
+        let checksum = fetch_checksum(&checksum_url, &downloads, &artifact_name, progress)?;
         // The declared checksum is mandatory: a mismatch discards the
         // download and aborts — nothing is extracted, nothing recorded
         // (AC: corrupt downloads fail closed).
@@ -246,7 +295,11 @@ fn resolve_pin(manifest: &RunnerManifest, version: &str) -> Result<String, Stora
 /// observed live), while the releases page carries no such budget. A
 /// response that stayed put resolved nothing and refuses loudly.
 fn fetch_latest_tag(url: &str) -> Result<String, StorageError> {
-    let response = ureq::get(url)
+    // The shared agent (#58): the same read timeout and proxy env as
+    // every fetch. Single-shot — no `.part` to resume; a loud timeout
+    // failure is the contract.
+    let response = agent()
+        .get(url)
         .set("User-Agent", "cellar")
         .call()
         .map_err(|error| StorageError::Artifact(format!("release feed {url}: {error}")))?;
@@ -397,7 +450,9 @@ impl ArtifactSource {
     /// progress: one event up front (the resume offset — where this
     /// attempt starts), then one per copied chunk. For `https` a `Range`
     /// request is sent when resuming; a server that ignores it (200)
-    /// restarts the file from zero — never a corrupted tail append.
+    /// restarts the file from zero — never a corrupted tail append. HTTP
+    /// attempts retry transient failures (#58); every path ends with
+    /// `sync_all` — bytes reach the disk before the part is promoted.
     fn stream_from(
         &self,
         from: u64,
@@ -429,57 +484,158 @@ impl ArtifactSource {
                     .map_err(|error| StorageError::Io(format!("copy: {error}")))?;
             }
             Self::Http(url) => {
-                let mut request = ureq::get(url);
-                if from > 0 {
-                    request = request.set("Range", &format!("bytes={from}-"));
-                }
-                let response = request
-                    .call()
-                    .map_err(|error| StorageError::Artifact(format!("fetch {url}: {error}")))?;
-                // The server ignored the range (200), or the resume
-                // offset exceeds the current content (416 — a stale
-                // oversized `.part`): restart from zero, never append
-                // a corrupted tail.
-                let mut effective_from = from;
-                match response.status() {
-                    200 | 416 => effective_from = 0,
-                    206 => {}
-                    status => {
-                        return Err(StorageError::Artifact(format!(
-                            "fetch {url}: unexpected status {status}"
-                        )));
+                // The retry loop (#58): transient failures (connection
+                // reset, read timeout, 5xx, 429) earn another attempt,
+                // resuming from whatever landed in the `.part` before the
+                // failure. Other 4xx are fatal — a 404 will not fix
+                // itself. The stderr line survives `-q` like every
+                // diagnostic: a dropped connection is something the user
+                // is watching happen.
+                let mut resume_from = from;
+                for attempt in 1..=DOWNLOAD_ATTEMPTS {
+                    match ArtifactSource::http_attempt(url, resume_from, out, progress, agent()) {
+                        Ok(()) => {
+                            // The part is promoted and hashed next — the
+                            // bytes must be on disk first, on every path.
+                            out.sync_all()
+                                .map_err(|error| StorageError::Io(format!("sync: {error}")))?;
+                            return Ok(());
+                        }
+                        Err(FetchFailure::Fatal(error)) => return Err(error),
+                        Err(FetchFailure::Transient(reason)) => {
+                            if attempt == DOWNLOAD_ATTEMPTS {
+                                return Err(StorageError::Artifact(format!(
+                                    "fetch {url}: {reason} — gave up after \
+                                     {DOWNLOAD_ATTEMPTS} attempts"
+                                )));
+                            }
+                            let delay = backoff_delay(attempt);
+                            // The retry rides the #37 callback — the
+                            // pipeline never prints; the presentation
+                            // decides what a screen sees (#58).
+                            progress(InstallProgress::Retrying {
+                                attempt: attempt + 1,
+                                attempts: DOWNLOAD_ATTEMPTS,
+                                delay_ms: delay.as_millis() as u64,
+                                reason: reason.clone(),
+                            });
+                            std::thread::sleep(delay);
+                            resume_from = out
+                                .metadata()
+                                .map_err(|error| StorageError::Io(format!("part size: {error}")))?
+                                .len();
+                        }
                     }
                 }
-                // A range response's Content-Length names only the served
-                // remainder; the artifact total is that plus the resume
-                // offset. No length header (chunked) → no total to report.
-                let total = response
-                    .header("Content-Length")
-                    .and_then(|length| length.parse().ok())
-                    .map(|length: u64| effective_from + length);
-                if effective_from == 0 {
-                    out.set_len(0)
-                        .map_err(|error| StorageError::Io(format!("truncate: {error}")))?;
-                    out.seek(SeekFrom::Start(0))
-                        .map_err(|error| StorageError::Io(format!("seek: {error}")))?;
-                }
-                progress(InstallProgress::Download {
-                    offset: effective_from,
-                    total,
-                });
-                let mut reader = response.into_reader();
-                let mut counted = CountingRead {
-                    inner: &mut reader,
-                    offset: effective_from,
-                    total,
-                    progress,
-                };
-                io::copy(&mut counted, out)
-                    .map_err(|error| StorageError::Io(format!("copy: {error}")))?;
+                unreachable!("the retry loop returns on its last attempt")
             }
         }
+        // Every path ends here: bytes reach the disk before the caller
+        // promotes the part to the artifact and hashes it.
         out.sync_all()
-            .map_err(|error| StorageError::Io(format!("sync: {error}")))
+            .map_err(|error| StorageError::Io(format!("sync: {error}")))?;
+        Ok(())
+    }
+
+    /// One HTTP attempt of [`ArtifactSource::stream_from`]: request with
+    /// the resume `Range`, map statuses and transport errors to
+    /// fatal-vs-transient (#58), and copy the body into `out`.
+    fn http_attempt(
+        url: &str,
+        from: u64,
+        out: &mut fs::File,
+        progress: &mut dyn FnMut(InstallProgress),
+        agent: &ureq::Agent,
+    ) -> Result<(), FetchFailure> {
+        let mut request = agent.get(url);
+        if from > 0 {
+            request = request.set("Range", &format!("bytes={from}-"));
+        }
+        let response = match request.call() {
+            Ok(response) => response,
+            // A stale oversized `.part` (416) restarts from zero below —
+            // it needs the response body channel, so it is not an error.
+            Err(ureq::Error::Status(status, response)) => {
+                if status == 429 || status >= 500 {
+                    return Err(FetchFailure::Transient(format!(
+                        "unexpected status {status}"
+                    )));
+                }
+                if status == 416 {
+                    response
+                } else {
+                    return Err(FetchFailure::Fatal(StorageError::Artifact(format!(
+                        "fetch {url}: unexpected status {status}"
+                    ))));
+                }
+            }
+            Err(other) => {
+                return Err(FetchFailure::Transient(format!("fetch {url}: {other}")));
+            }
+        };
+        // The server ignored the range (200), or the resume offset
+        // exceeds the current content (416): restart from zero, never
+        // append a corrupted tail.
+        let mut effective_from = from;
+        match response.status() {
+            200 | 416 => effective_from = 0,
+            206 => {}
+            status => {
+                return Err(FetchFailure::Fatal(StorageError::Artifact(format!(
+                    "fetch {url}: unexpected status {status}"
+                ))));
+            }
+        }
+        // A range response's Content-Length names only the served
+        // remainder; the artifact total is that plus the resume offset.
+        // No length header (chunked) → no total to report.
+        let total = response
+            .header("Content-Length")
+            .and_then(|length| length.parse().ok())
+            .map(|length: u64| effective_from + length);
+        if effective_from == 0 {
+            out.set_len(0).map_err(|error| {
+                FetchFailure::Fatal(StorageError::Io(format!("truncate: {error}")))
+            })?;
+            out.seek(SeekFrom::Start(0))
+                .map_err(|error| FetchFailure::Fatal(StorageError::Io(format!("seek: {error}"))))?;
+        }
+        progress(InstallProgress::Download {
+            offset: effective_from,
+            total,
+        });
+        let mut reader = response.into_reader();
+        let mut counted = CountingRead {
+            inner: &mut reader,
+            offset: effective_from,
+            total,
+            progress,
+        };
+        io::copy(&mut counted, out).map_err(|error| {
+            // A body that stops arriving — reset, EOF, timeout, or a
+            // truncated chunked stream — is the network misbehaving, not
+            // the disk (#58). ureq wraps its protocol errors in opaque
+            // kinds, so the message joins the classification.
+            let text = error.to_string().to_lowercase();
+            let transient_by_kind = matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::InvalidData
+            );
+            let transient_by_text = ["chunk", "timed out", "connection", "reset", "eof"]
+                .iter()
+                .any(|needle| text.contains(needle));
+            if transient_by_kind || transient_by_text {
+                FetchFailure::Transient(format!("connection lost mid-body: {error}"))
+            } else {
+                FetchFailure::Fatal(StorageError::Io(format!("copy: {error}")))
+            }
+        })?;
+        Ok(())
     }
 }
 
@@ -542,20 +698,23 @@ fn download_resumable(
 /// our artifact, and return its hex digest. A checksum the manifest
 /// declares but cannot be fetched is a hard failure — verification is
 /// mandatory when the manifest names a checksum source (AC: corrupt
-/// downloads fail closed).
+/// downloads fail closed). Retry diagnostics ride the progress callback;
+/// byte ticks do not (#37, #58).
 fn fetch_checksum(
     url: &str,
     downloads: &Path,
     artifact_name: &str,
+    progress: &mut dyn FnMut(InstallProgress),
 ) -> Result<String, StorageError> {
     let source = ArtifactSource::parse(url)
         .ok_or_else(|| StorageError::Artifact(format!("unusable checksum URL: {url}")))?;
     let file = downloads.join(format!("{artifact_name}.sha512sum"));
     let mut out = fs::File::create(&file).map_err(storage_io(&file))?;
-    // The checksum side-load is not artifact download progress: its bytes
-    // are reported through a no-op callback (#37 — the CLI's download
-    // line tracks the artifact only).
-    source.stream_from(0, &mut out, &mut |_| {})?;
+    let mut filtered = |event: InstallProgress| match event {
+        InstallProgress::Download { .. } => {}
+        other => progress(other),
+    };
+    source.stream_from(0, &mut out, &mut filtered)?;
     let text = fs::read_to_string(&file).map_err(storage_io(&file))?;
     for line in text.lines() {
         // `sha512sum` output: `<hex>  <name>` (two spaces) or `<hex> *<name>`.
@@ -938,6 +1097,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -1811,6 +1971,245 @@ mod tests {
     /// releases-latest page hands out the newest tag.
     fn feed_tag(tag: &str) -> Arc<Vec<u8>> {
         Arc::new(tag.as_bytes().to_vec())
+    }
+
+    // -----------------------------------------------------------------
+    // The #58 retry/timeout fixtures: a scripted server, hermetic against
+    // the real network — one raw response per connection, popped in
+    // order; a truncated response is a connection lost mid-body.
+    // -----------------------------------------------------------------
+    /// A scripted HTTP server: each connection pops the next raw response
+    /// and every request's `Range` header is recorded. Dropping the
+    /// response short is how a "connection lost mid-body" is staged.
+    fn serve_scripted(
+        responses: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        seen_ranges: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut queue = responses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if queue.is_empty() {
+                    continue;
+                }
+                let response = queue.remove(0);
+                drop(queue);
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).expect("request line");
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let line = line.trim_end().to_owned();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("Range: ") {
+                        range = Some(value.to_owned());
+                    }
+                }
+                seen_ranges
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(range);
+                stream.write_all(&response).expect("scripted response");
+                stream.flush().expect("flush");
+                // The socket drops here — a truncated body is exactly a
+                // connection lost mid-transfer.
+            }
+        });
+        (port, server)
+    }
+
+    fn range_response(body: &[u8]) -> Vec<u8> {
+        let mut raw = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    fn status_response(status: u16) -> Vec<u8> {
+        format!("HTTP/1.1 {status} nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn a_connection_cut_mid_body_retries_and_resumes_from_the_part() {
+        // AC (#58): attempt 1 delivers 10 of 64 promised bytes then the
+        // socket drops; the retry resumes from the `.part` — the second
+        // request carries `Range: bytes=10-` and a 206 completes the
+        // artifact exactly.
+        let total: Vec<u8> = (0..64u8).collect();
+        // Attempt 1: chunked body cut before the terminating zero chunk —
+        // the decoder errors mid-stream (a connection lost mid-body).
+        // Attempt 2: the resume request served as a complete range.
+        let mut truncated =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        truncated.extend_from_slice(b"a\r\n");
+        truncated.extend_from_slice(&total[..10]);
+        truncated.extend_from_slice(b"\r\n");
+        let responses = Arc::new(std::sync::Mutex::new(vec![
+            truncated,
+            range_response(&total[10..]),
+        ]));
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), ranges.clone());
+        let root = root("retry-resume");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.tar.gz");
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect("the retry completes the download");
+        assert_eq!(fs::read(&artifact).unwrap(), total, "bytes exact");
+        let ranges = ranges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(ranges.len(), 2, "exactly one retry: {ranges:?}");
+        assert_eq!(ranges[0], None, "the first try starts from zero");
+        assert_eq!(
+            ranges[1].as_deref(),
+            Some("bytes=10-"),
+            "the retry resumes from the part"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_fatal_status_fails_immediately_without_retry() {
+        // AC (#58): other 4xx never earn an attempt — a 404 will not fix
+        // itself.
+        let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), ranges.clone());
+        let root = root("retry-404");
+        fs::create_dir_all(&root).unwrap();
+        let error = download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &root.join("artifact.tar.gz"),
+            &mut |_| {},
+        )
+        .expect_err("404 is fatal");
+        assert!(error.to_string().contains("404"), "{error}");
+        assert_eq!(
+            ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "no retry for a fatal status"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn retries_stop_after_three_attempts_with_backoff() {
+        // AC (#58): transient failures (5xx here) are retried up to three
+        // attempts total, backing off 1s then 2s between them — the bound
+        // and the backoff are both observable in the wall clock.
+        let responses = Arc::new(std::sync::Mutex::new(vec![
+            status_response(500);
+            DOWNLOAD_ATTEMPTS as usize
+        ]));
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), ranges.clone());
+        let root = root("retry-bound");
+        fs::create_dir_all(&root).unwrap();
+        let started = Instant::now();
+        let error = download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &root.join("artifact.tar.gz"),
+            &mut |_| {},
+        )
+        .expect_err("a persistent 500 gives up");
+        assert!(
+            error.to_string().contains("gave up after 3 attempts"),
+            "{error}"
+        );
+        assert_eq!(
+            ranges
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            DOWNLOAD_ATTEMPTS as usize,
+            "three attempts, no more"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(3),
+            "the 1s + 2s backoffs actually slept: {:?}",
+            started.elapsed()
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_stalling_server_times_out_instead_of_hanging_forever() {
+        // AC (#58): headers promise a mebibyte that never arrives — the
+        // idle-read timeout ends the hang. The production timeout is 60s;
+        // this exercises the same attempt code at millisecond scale via
+        // the injected-timeout agent, against a server that holds the
+        // socket open (no EOF to shortcut the timeout).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line.trim_end().is_empty() {
+                    break;
+                }
+                line.clear();
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                .expect("headers");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_secs(5));
+            // No body ever comes; the socket stays open well past the
+            // test's timeout window.
+        });
+        let url = format!("http://127.0.0.1:{port}/artifact");
+        let _source = ArtifactSource::Http(url.clone());
+        let stall_root = root("stall");
+        fs::create_dir_all(&stall_root).unwrap();
+        let out_path = stall_root.join("artifact.part");
+        let mut out = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out_path)
+            .unwrap();
+        let agent = agent_with_read_timeout(Duration::from_millis(250));
+        let started = Instant::now();
+        let outcome = ArtifactSource::http_attempt(&url, 0, &mut out, &mut |_| {}, &agent);
+        let elapsed = started.elapsed();
+        match outcome {
+            Err(FetchFailure::Transient(reason)) => assert!(
+                reason.contains("mid-body") || reason.contains("timed out"),
+                "the stall reads as a transient failure: {reason}"
+            ),
+            other => panic!("expected a transient timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the timeout fired well before the server's hold expired: {elapsed:?}"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
     }
 
     #[test]

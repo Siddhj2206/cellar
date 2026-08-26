@@ -151,6 +151,13 @@ Downloads show phase progress — `Downloading GE-Proton11-5  143.2 MB / 402.1 M
 stdout keeps yielding clean data, piping stderr prints no progress at all, and `--quiet` silences it;
 the final `Installed … at …` line stays on stdout as usual.
 
+Downloads ride one shared HTTP client: a stalled transfer (bytes stopped moving) fails after a
+60-second idle timeout, transient failures — dropped connections, timeouts, `5xx`/`429` — are
+retried automatically up to three attempts (1s/2s backoff, resuming from the partial download),
+and a stderr line announces each retry even under `--quiet`. Proxy users are supported the
+standard way: `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy` environment variables are
+honored; unset, Cellar connects directly.
+
 `cellar runner list` merges two worlds: managed installs from the inventory, and discover-only host
 state — system wine and `umu-run` on `PATH`, plus Steam's Proton builds — shown strictly read-only.
 Cellar never modifies anything it discovers.
