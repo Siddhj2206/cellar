@@ -170,53 +170,93 @@ pub(crate) fn install(
     let artifact = downloads.join(&artifact_name);
     let source = ArtifactSource::parse(&artifact_url)
         .ok_or_else(|| StorageError::Artifact(format!("unusable source URL: {artifact_url}")))?;
-    download_resumable(&source, &artifact, progress)?;
-    if let Some(template) = &manifest.source.checksum_url_template {
-        // The verify phase opens before the digest is even fetched: the
-        // tiny `.sha512sum` request and the whole-artifact hash pass are
-        // one phase to the user (#37).
-        progress(InstallProgress::Verify);
-        let checksum_url = substitute(template, &version, arch);
-        let checksum = fetch_checksum(&checksum_url, &downloads, &artifact_name, progress)?;
-        // The declared checksum is mandatory: a mismatch discards the
-        // download and aborts — nothing is extracted, nothing recorded
-        // (AC: corrupt downloads fail closed).
-        verify_sha512(&artifact, &checksum)?;
-    }
-    // No checksum URL: upstream publishes no digest (umu's zipapp —
-    // research #18), so the artifact installs unverified; a truncated
-    // download still fails at extraction (fail closed).
 
-    // Extract into a private temp dir, then move the single root into its
-    // final name — the install dir appears atomically.
-    progress(InstallProgress::Extract);
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = root.join("runtime").join(format!(
-        ".install-{}-{}-{seq}",
-        manifest.provider_id,
-        std::process::id()
-    ));
-    fs::create_dir_all(&tmp).map_err(storage_io(&tmp))?;
-    let extract_result = extract_tarball(&artifact, &tmp);
-    if let Err(error) = extract_result {
+    // Fetch → verify → extract, with one bounded second chance (#59): a
+    // RESUMED download mixing two remote generations fails verification
+    // or extraction — that is a stale cache, not corruption. The partial
+    // is discarded and the whole segment reruns fresh, exactly once;
+    // stderr names it truthfully. A fresh download failing means genuine
+    // corruption and keeps today's vocabulary.
+    let mut restarted = false;
+    loop {
+        let resumed = download_resumable(&source, &artifact, progress)?;
+        if let Some(template) = &manifest.source.checksum_url_template {
+            // The verify phase opens before the digest is even fetched: the
+            // tiny `.sha512sum` request and the whole-artifact hash pass are
+            // one phase to the user (#37).
+            progress(InstallProgress::Verify);
+            let checksum_url = substitute(template, &version, arch);
+            let checksum = fetch_checksum(&checksum_url, &downloads, &artifact_name, progress)?;
+            // The declared checksum is mandatory: a mismatch discards the
+            // download and aborts — nothing is extracted, nothing recorded
+            // (AC: corrupt downloads fail closed).
+            if let Err(error) = verify_sha512(&artifact, &checksum) {
+                if resumed && !restarted {
+                    restarted = true;
+                    eprintln!(
+                        "cellar: cached partial no longer matches the remote artifact — \
+                         restarting download"
+                    );
+                    discard_download(&artifact);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+        // No checksum URL: upstream publishes no digest (umu's zipapp —
+        // research #18), so the artifact installs unverified; a truncated
+        // download still fails at extraction (fail closed).
+
+        // Extract into a private temp dir, then move the single root into
+        // its final name — the install dir appears atomically.
+        progress(InstallProgress::Extract);
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = root.join("runtime").join(format!(
+            ".install-{}-{}-{seq}",
+            manifest.provider_id,
+            std::process::id()
+        ));
+        fs::create_dir_all(&tmp).map_err(storage_io(&tmp))?;
+        match extract_tarball(&artifact, &tmp) {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = fs::remove_dir_all(&tmp);
+                if resumed && !restarted {
+                    // A resumed unverified artifact (umu has no checksum)
+                    // that will not unpack is a stale mix (#59): one clean
+                    // fresh attempt, and no binary garbage in any error —
+                    // this restart happens before the structural error
+                    // surfaces.
+                    restarted = true;
+                    eprintln!(
+                        "cellar: cached partial no longer matches the remote artifact — \
+                         restarting download"
+                    );
+                    discard_download(&artifact);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+
+        // The extracted root moves into its final name — the install dir
+        // appears atomically.
+        let root_entry = single_root_dir(&tmp)?;
+        if let Err(error) = fs::rename(&root_entry, &install_dir) {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err(match error.kind() {
+                // A concurrent install claimed the dir: it is installed.
+                io::ErrorKind::AlreadyExists if install_dir.exists() => return Ok(install_dir),
+                _ => StorageError::Io(format!(
+                    "rename {} → {}: {error}",
+                    root_entry.display(),
+                    install_dir.display()
+                )),
+            });
+        }
         let _ = fs::remove_dir_all(&tmp);
-        return Err(error);
+        break;
     }
-    let root_entry = single_root_dir(&tmp)?;
-    debug_assert!(root_entry.is_dir());
-    if let Err(error) = fs::rename(&root_entry, &install_dir) {
-        let _ = fs::remove_dir_all(&tmp);
-        return Err(match error.kind() {
-            // A concurrent install claimed the dir: it is installed.
-            io::ErrorKind::AlreadyExists if install_dir.exists() => return Ok(install_dir),
-            _ => StorageError::Io(format!(
-                "rename {} → {}: {error}",
-                root_entry.display(),
-                install_dir.display()
-            )),
-        });
-    }
-    let _ = fs::remove_dir_all(&tmp);
     if !probe_installed(manifest, &install_dir) {
         let _ = fs::remove_dir_all(&install_dir);
         return Err(StorageError::Artifact(format!(
@@ -233,7 +273,6 @@ pub(crate) fn install(
 
     Ok(install_dir)
 }
-
 /// Upsert one install's record into the authoritative inventory
 /// (`runtime/providers.toml`), reading-modifying-writing under the
 /// inventory's own lock — concurrent installs of *different* providers
@@ -453,12 +492,17 @@ impl ArtifactSource {
     /// restarts the file from zero — never a corrupted tail append. HTTP
     /// attempts retry transient failures (#58); every path ends with
     /// `sync_all` — bytes reach the disk before the part is promoted.
+    ///
+    /// `validator` rides `If-Range` on resuming requests and the response's
+    /// own freshness validator (`ETag`, else `Last-Modified`) comes back (#59):
+    /// `None` from a non-HTTP source.
     fn stream_from(
         &self,
         from: u64,
         out: &mut fs::File,
         progress: &mut dyn FnMut(InstallProgress),
-    ) -> Result<(), StorageError> {
+        validator: Option<&str>,
+    ) -> Result<Option<String>, StorageError> {
         match self {
             Self::File(path) => {
                 let mut input = fs::File::open(path)
@@ -482,24 +526,32 @@ impl ArtifactSource {
                 };
                 io::copy(&mut counted, out)
                     .map_err(|error| StorageError::Io(format!("copy: {error}")))?;
+                // A file side-load carries no freshness validator (#59).
+                Ok(None)
             }
             Self::Http(url) => {
                 // The retry loop (#58): transient failures (connection
-                // reset, read timeout, 5xx, 429) earn another attempt,
-                // resuming from whatever landed in the `.part` before the
-                // failure. Other 4xx are fatal — a 404 will not fix
-                // itself. The stderr line survives `-q` like every
-                // diagnostic: a dropped connection is something the user
-                // is watching happen.
+                // reset, read timeout, truncated chunked stream, 5xx, 429)
+                // earn another attempt, resuming from whatever landed in
+                // the `.part` before the failure. Other 4xx are fatal. The
+                // retry event rides the #37 callback — the pipeline never
+                // prints; presentation decides what a screen sees.
                 let mut resume_from = from;
                 for attempt in 1..=DOWNLOAD_ATTEMPTS {
-                    match ArtifactSource::http_attempt(url, resume_from, out, progress, agent()) {
-                        Ok(()) => {
+                    match ArtifactSource::http_attempt(
+                        url,
+                        resume_from,
+                        out,
+                        progress,
+                        agent(),
+                        validator,
+                    ) {
+                        Ok(fresh_validator) => {
                             // The part is promoted and hashed next — the
                             // bytes must be on disk first, on every path.
                             out.sync_all()
                                 .map_err(|error| StorageError::Io(format!("sync: {error}")))?;
-                            return Ok(());
+                            return Ok(fresh_validator);
                         }
                         Err(FetchFailure::Fatal(error)) => return Err(error),
                         Err(FetchFailure::Transient(reason)) => {
@@ -510,13 +562,10 @@ impl ArtifactSource {
                                 )));
                             }
                             let delay = backoff_delay(attempt);
-                            // The retry rides the #37 callback — the
-                            // pipeline never prints; the presentation
-                            // decides what a screen sees (#58).
                             progress(InstallProgress::Retrying {
                                 attempt: attempt + 1,
                                 attempts: DOWNLOAD_ATTEMPTS,
-                                delay_ms: delay.as_millis() as u64,
+                                delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                                 reason: reason.clone(),
                             });
                             std::thread::sleep(delay);
@@ -530,26 +579,32 @@ impl ArtifactSource {
                 unreachable!("the retry loop returns on its last attempt")
             }
         }
-        // Every path ends here: bytes reach the disk before the caller
-        // promotes the part to the artifact and hashes it.
-        out.sync_all()
-            .map_err(|error| StorageError::Io(format!("sync: {error}")))?;
-        Ok(())
     }
 
     /// One HTTP attempt of [`ArtifactSource::stream_from`]: request with
-    /// the resume `Range`, map statuses and transport errors to
-    /// fatal-vs-transient (#58), and copy the body into `out`.
+    /// the resume `Range` (and `If-Range` when a validator is known,
+    /// #59), map statuses and transport errors to fatal-vs-transient
+    /// (#58), copy the body into `out`, and report the response's own
+    /// freshness validator.
+    #[allow(clippy::too_many_arguments)]
     fn http_attempt(
         url: &str,
         from: u64,
         out: &mut fs::File,
         progress: &mut dyn FnMut(InstallProgress),
         agent: &ureq::Agent,
-    ) -> Result<(), FetchFailure> {
+        validator: Option<&str>,
+    ) -> Result<Option<String>, FetchFailure> {
         let mut request = agent.get(url);
         if from > 0 {
             request = request.set("Range", &format!("bytes={from}-"));
+            // If-Range (#59): resume only when the remote is still the
+            // generation the partial bytes came from; a changed artifact
+            // answers 200 and we restart from zero instead of appending
+            // two generations into one file.
+            if let Some(value) = validator {
+                request = request.set("If-Range", value);
+            }
         }
         let response = match request.call() {
             Ok(response) => response,
@@ -604,6 +659,12 @@ impl ArtifactSource {
             offset: effective_from,
             total,
         });
+        // Freshness validator for the sidecar (#59): ETag first, else
+        // Last-Modified — exactly what If-Range accepts.
+        let fresh_validator = response
+            .header("ETag")
+            .or_else(|| response.header("Last-Modified"))
+            .map(str::to_owned);
         let mut reader = response.into_reader();
         let mut counted = CountingRead {
             inner: &mut reader,
@@ -611,31 +672,35 @@ impl ArtifactSource {
             total,
             progress,
         };
-        io::copy(&mut counted, out).map_err(|error| {
+        io::copy(&mut counted, out).map_err(|error| match error.kind() {
             // A body that stops arriving — reset, EOF, timeout, or a
             // truncated chunked stream — is the network misbehaving, not
             // the disk (#58). ureq wraps its protocol errors in opaque
             // kinds, so the message joins the classification.
-            let text = error.to_string().to_lowercase();
-            let transient_by_kind = matches!(
-                error.kind(),
-                io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::TimedOut
-                    | io::ErrorKind::WouldBlock
-                    | io::ErrorKind::InvalidData
-            );
-            let transient_by_text = ["chunk", "timed out", "connection", "reset", "eof"]
-                .iter()
-                .any(|needle| text.contains(needle));
-            if transient_by_kind || transient_by_text {
+            io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::InvalidData => {
                 FetchFailure::Transient(format!("connection lost mid-body: {error}"))
-            } else {
-                FetchFailure::Fatal(StorageError::Io(format!("copy: {error}")))
+            }
+            _ => {
+                // ureq wraps its protocol errors (truncated chunked
+                // streams included) in opaque kinds, so the message joins
+                // the classification (#58, #59).
+                let text = error.to_string().to_lowercase();
+                let transient_by_text = ["chunk", "timed out", "connection", "reset", "eof"]
+                    .iter()
+                    .any(|needle| text.contains(needle));
+                if transient_by_text {
+                    FetchFailure::Transient(format!("connection lost mid-body: {error}"))
+                } else {
+                    FetchFailure::Fatal(StorageError::Io(format!("copy: {error}")))
+                }
             }
         })?;
-        Ok(())
+        Ok(fresh_validator)
     }
 }
 
@@ -662,36 +727,96 @@ impl<R: io::Read> io::Read for CountingRead<'_, R> {
     }
 }
 
+/// The freshness sidecar of a `.part` (`foo.tar.part.meta`): the
+/// validator — `ETag`, else `Last-Modified` — of the response the partial
+/// bytes came from (#59). Missing or empty means "no validator":
+/// pre-fix leftovers included, and no resume happens without one.
+fn part_meta_path(part: &Path) -> PathBuf {
+    let mut os = part.as_os_str().to_os_string();
+    os.push(".meta");
+    PathBuf::from(os)
+}
+
+fn read_validator(meta: &Path) -> Option<String> {
+    fs::read_to_string(meta)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Drop the partial download and its freshness sidecar — the paired
+/// discard for a stale or corrupt transfer (#59).
+fn discard_part_and_meta(part: &Path) {
+    let _ = fs::remove_file(part);
+    let _ = fs::remove_file(part_meta_path(part));
+}
+
+/// Drop a completed-or-partial artifact download with its part and
+/// sidecar — the prelude of a #59 fresh restart.
+fn discard_download(artifact: &Path) {
+    let _ = fs::remove_file(artifact);
+    discard_part_and_meta(&artifact.with_extension("part"));
+}
+
 /// The resumable download: continue from the `.part` file's current size
-/// (a prior interrupted run), or start fresh. The part becomes the
+/// when its sidecar validator is known (the request rides `If-Range`),
+/// or start fresh — no validator, no resume (#59). The part becomes the
 /// artifact file only after verification (the caller renames it post-
 /// checksum — a corrupt download is deleted, never cached as complete).
+///
+/// Returns whether this call RESUMED a partial (`from > 0`): a resumed
+/// download that later fails verification earns one automatic fresh
+/// restart, not a "corrupt download" verdict (#59).
 fn download_resumable(
     source: &ArtifactSource,
     artifact: &Path,
     progress: &mut dyn FnMut(InstallProgress),
-) -> Result<(), StorageError> {
+) -> Result<bool, StorageError> {
     if artifact.is_file() {
         // A previously completed and verified artifact in the disposable
         // cache — reuse it (the cache is disposable: remove it to fetch
         // again). No download happens, so no Download events fire; verify
         // and extract still report.
-        return Ok(());
+        // Cached-complete reuse: not a resume — no restart eligibility.
+        return Ok(false);
     }
     let part = artifact.with_extension("part");
+    let meta = part_meta_path(&part);
+    let validator = read_validator(&meta);
     let mut out = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&part)
         .map_err(storage_io(&part))?;
-    let from = out.metadata().map_err(storage_io(&part))?.len();
-    source
-        .stream_from(from, &mut out, progress)
+    let mut from = out.metadata().map_err(storage_io(&part))?.len();
+    // No validator → no resume (#59): Content-Length is not a validator,
+    // and a pre-fix leftover `.part` has no sidecar — both start fresh,
+    // which also creates the sidecar this download will use.
+    if from > 0 && validator.is_none() {
+        out.set_len(0).map_err(storage_io(&part))?;
+        out.seek(SeekFrom::Start(0)).map_err(storage_io(&part))?;
+        from = 0;
+    }
+    let resumed = from > 0;
+    let fresh_validator = source
+        .stream_from(from, &mut out, progress, validator.as_deref())
         .map_err(|error| {
             StorageError::Artifact(format!("download to {}: {error}", part.display()))
         })?;
-    // The download completed: promote the part for verification.
-    fs::rename(&part, artifact).map_err(storage_io(artifact))
+    match fresh_validator {
+        Some(value) => {
+            let _ = fs::write(&meta, value);
+        }
+        // A source without validators cannot keep a sidecar honest.
+        None => {
+            let _ = fs::remove_file(&meta);
+        }
+    }
+    // The download completed: promote the part for verification and drop
+    // the now-meaningless sidecar (#59 lifecycle).
+    fs::rename(&part, artifact).map_err(storage_io(artifact))?;
+    let _ = fs::remove_file(&meta);
+    Ok(resumed)
 }
 
 /// Fetch the published checksum file (`.sha512sum`), find the line naming
@@ -714,7 +839,7 @@ fn fetch_checksum(
         InstallProgress::Download { .. } => {}
         other => progress(other),
     };
-    source.stream_from(0, &mut out, &mut filtered)?;
+    let _ = source.stream_from(0, &mut out, &mut filtered, None)?;
     let text = fs::read_to_string(&file).map_err(storage_io(&file))?;
     for line in text.lines() {
         // `sha512sum` output: `<hex>  <name>` (two spaces) or `<hex> *<name>`.
@@ -1148,6 +1273,7 @@ mod tests {
                 InstallProgress::Download { .. } => 'D',
                 InstallProgress::Verify => 'V',
                 InstallProgress::Extract => 'E',
+                InstallProgress::Retrying { .. } => 'R',
             })
             .collect()
     }
@@ -1457,6 +1583,10 @@ mod tests {
         fs::create_dir_all(part.parent().expect("downloads dir")).expect("cache dir");
         let whole = fs::read(&tarball).expect("fixture bytes");
         fs::write(&part, &whole[..7]).expect("partial download");
+        // The freshness sidecar (#59): without it the pipeline must not
+        // resume — the seed includes one so the offset-7 contract holds.
+        let meta = PathBuf::from(format!("{}.meta", part.display()));
+        fs::write(&meta, "\"etag-resume\"").expect("sidecar");
 
         let install_dir = install_quiet(&root, &proton_manifest(&fixtures, version), version)
             .expect("install resumes");
@@ -1791,6 +1921,10 @@ mod tests {
             .join(format!("{version}-{}.tar.part", arch()));
         fs::create_dir_all(part.parent().expect("downloads dir")).expect("cache dir");
         fs::write(&part, &whole[..7]).expect("partial download");
+        // The freshness sidecar (#59): no validator, no resume — seeding
+        // it keeps the offset-7 contract meaningful.
+        let meta = PathBuf::from(format!("{}.meta", part.display()));
+        fs::write(&meta, "etag-resume").expect("sidecar");
 
         let manifest = proton_manifest(&fixtures, version);
         let (events, mut report) = collector();
@@ -1983,7 +2117,7 @@ mod tests {
     /// response short is how a "connection lost mid-body" is staged.
     fn serve_scripted(
         responses: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-        seen_ranges: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        seen_requests: Arc<std::sync::Mutex<Vec<String>>>,
     ) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let port = listener.local_addr().expect("addr").port();
@@ -2003,6 +2137,7 @@ mod tests {
                 let mut request_line = String::new();
                 reader.read_line(&mut request_line).expect("request line");
                 let mut range = None;
+                let mut if_range = None;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -2015,11 +2150,14 @@ mod tests {
                     if let Some(value) = line.strip_prefix("Range: ") {
                         range = Some(value.to_owned());
                     }
+                    if let Some(value) = line.strip_prefix("If-Range: ") {
+                        if_range = Some(value.to_owned());
+                    }
                 }
-                seen_ranges
+                seen_requests
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(range);
+                    .push(format!("range={range:?}; if_range={if_range:?}"));
                 stream.write_all(&response).expect("scripted response");
                 stream.flush().expect("flush");
                 // The socket drops here — a truncated body is exactly a
@@ -2027,6 +2165,16 @@ mod tests {
             }
         });
         (port, server)
+    }
+
+    fn body_response(body: &[u8]) -> Vec<u8> {
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        raw
     }
 
     fn range_response(body: &[u8]) -> Vec<u8> {
@@ -2063,8 +2211,8 @@ mod tests {
             truncated,
             range_response(&total[10..]),
         ]));
-        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (port, server) = serve_scripted(responses.clone(), ranges.clone());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
         let root = root("retry-resume");
         fs::create_dir_all(&root).unwrap();
         let artifact = root.join("artifact.tar.gz");
@@ -2075,16 +2223,20 @@ mod tests {
         )
         .expect("the retry completes the download");
         assert_eq!(fs::read(&artifact).unwrap(), total, "bytes exact");
-        let ranges = ranges
+        let requests = requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert_eq!(ranges.len(), 2, "exactly one retry: {ranges:?}");
-        assert_eq!(ranges[0], None, "the first try starts from zero");
-        assert_eq!(
-            ranges[1].as_deref(),
-            Some("bytes=10-"),
-            "the retry resumes from the part"
+        assert_eq!(requests.len(), 2, "exactly one retry: {requests:?}");
+        assert!(
+            requests[0].contains("range=None"),
+            "the first try starts from zero: {:?}",
+            requests[0]
+        );
+        assert!(
+            requests[1].contains("range=Some(\"bytes=10-\")"),
+            "the retry resumes from the part: {:?}",
+            requests[1]
         );
         drop(server); // the accept loop runs until process exit — joining would block forever
     }
@@ -2094,8 +2246,8 @@ mod tests {
         // AC (#58): other 4xx never earn an attempt — a 404 will not fix
         // itself.
         let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
-        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (port, server) = serve_scripted(responses.clone(), ranges.clone());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
         let root = root("retry-404");
         fs::create_dir_all(&root).unwrap();
         let error = download_resumable(
@@ -2106,7 +2258,7 @@ mod tests {
         .expect_err("404 is fatal");
         assert!(error.to_string().contains("404"), "{error}");
         assert_eq!(
-            ranges
+            requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
@@ -2125,8 +2277,8 @@ mod tests {
             status_response(500);
             DOWNLOAD_ATTEMPTS as usize
         ]));
-        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (port, server) = serve_scripted(responses.clone(), ranges.clone());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
         let root = root("retry-bound");
         fs::create_dir_all(&root).unwrap();
         let started = Instant::now();
@@ -2141,7 +2293,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(
-            ranges
+            requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
@@ -2196,7 +2348,7 @@ mod tests {
             .unwrap();
         let agent = agent_with_read_timeout(Duration::from_millis(250));
         let started = Instant::now();
-        let outcome = ArtifactSource::http_attempt(&url, 0, &mut out, &mut |_| {}, &agent);
+        let outcome = ArtifactSource::http_attempt(&url, 0, &mut out, &mut |_| {}, &agent, None);
         let elapsed = started.elapsed();
         match outcome {
             Err(FetchFailure::Transient(reason)) => assert!(
@@ -2355,5 +2507,86 @@ mod tests {
         );
         assert!(inventory(&root).expect("inventory").is_empty());
         let _ = server;
+    }
+    #[test]
+    fn a_generation_swap_restarts_from_zero_and_rewrites_the_sidecar() {
+        // AC (#59): the remote moved on (If-Range mismatch → 200). The
+        // partial is abandoned, the fresh body lands whole, and the
+        // sidecar carries the new generation.
+        let v1: Vec<u8> = vec![0xAA; 10];
+        let v2: Vec<u8> = vec![0xBB; 64];
+        let mut swap =
+            b"HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Length: 64\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        swap.extend_from_slice(&v2);
+        let responses = Arc::new(std::sync::Mutex::new(vec![swap]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("swap");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.bin");
+        // Seed: v1 partial + its sidecar validator.
+        let stale_part = artifact.with_extension("part");
+        fs::write(&stale_part, &v1).unwrap();
+        let meta = part_meta_path(&stale_part);
+        fs::write(&meta, "v1").unwrap();
+
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect("the swap download completes");
+
+        assert_eq!(fs::read(&artifact).unwrap(), v2, "pure v2, no mix");
+        // The resume attempt rode If-Range with the stale generation.
+        let first = &requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0];
+        assert!(
+            first.contains("if_range=Some(\"v1\")") && first.contains("range=Some(\"bytes=10-\")"),
+            "the validator rode the wire: {first}"
+        );
+        // Lifecycle (#59): the promoted artifact leaves no sidecar behind.
+        assert!(!meta.exists(), "the sidecar is dropped on promotion");
+        drop(server);
+    }
+
+    #[test]
+    fn no_sidecar_means_a_fresh_download_that_creates_one() {
+        // AC (#59): a pre-fix `.part` without a sidecar is not trusted —
+        // the download starts from zero and creates the sidecar.
+        let body: Vec<u8> = vec![7; 32];
+        let responses = Arc::new(std::sync::Mutex::new(vec![body_response(&body)]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("no-meta");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.bin");
+        let leftover_part = artifact.with_extension("part");
+        fs::write(&leftover_part, b"leftover").unwrap();
+
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect("fresh download");
+
+        assert!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+                .contains("range=None"),
+            "no Range header without a validator"
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), body);
+        // An ETag-less source cannot keep a sidecar honest — none is
+        // created (#59).
+        assert!(
+            !part_meta_path(&leftover_part).exists(),
+            "no validator means no sidecar"
+        );
+        drop(server);
     }
 }
