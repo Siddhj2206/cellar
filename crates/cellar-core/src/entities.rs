@@ -48,13 +48,45 @@ pub struct PrefixDefaults {
     /// file).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    /// Graphics backend setting (schema lands with the storage slice).
+    /// Graphics backend setting — parsed against the recognized vocabulary
+    /// by [`PrefixDefaults::graphics_selection`] (the single authority,
+    /// #52). Free-form `String` so an unknown hand-edited value degrades
+    /// to warn-and-continue, never to an invalid file (ADR 0001).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphics: Option<String>,
     /// Windows version compatibility setting (schema lands with the storage
     /// slice).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub windows_version: Option<String>,
+}
+
+/// The parsed `graphics` prefix default (#52) — the vocabulary lives in
+/// exactly one place: [`PrefixDefaults::graphics_selection`]. Today
+/// exactly `gamescope`. The documented future shape is an untagged union —
+/// this legacy bare string or `{ kind = "gamescope", args = ["--flag"] }`
+/// (docs/research/gamescope.md); nothing parses args yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphicsSelection {
+    /// Wrap the launch in gamescope.
+    Gamescope,
+    /// Not a recognized value: the launch proceeds unwrapped with a
+    /// warning (#52) — a prefix launching fine today must not start
+    /// failing over a typo. Carries the raw value for the message.
+    Unrecognized(String),
+}
+
+impl PrefixDefaults {
+    /// Parse [`PrefixDefaults::graphics`] against the recognized
+    /// vocabulary — the only place that knows it (#52).
+    pub fn graphics_selection(&self) -> Option<GraphicsSelection> {
+        self.graphics.as_deref().map(|value| {
+            if value == "gamescope" {
+                GraphicsSelection::Gamescope
+            } else {
+                GraphicsSelection::Unrecognized(value.to_owned())
+            }
+        })
+    }
 }
 
 /// Metadata on an `AppEntry` — Game or Tool. The presets hook (Game →
@@ -170,5 +202,32 @@ mod tests {
         // prefix default → this floor (#28); the floor itself never moves.
         assert_eq!(AppKind::Game.default_family(), RunnerFamily::Proton);
         assert_eq!(AppKind::Tool.default_family(), RunnerFamily::Wine);
+    }
+
+    #[test]
+    fn graphics_parses_through_the_single_vocabulary() {
+        use super::{GraphicsSelection, PrefixDefaults};
+
+        // The legacy bare string stays the schema (#52); `gamescope` is
+        // today's entire recognized vocabulary, anything else is
+        // unrecognized — never a parse error (ADR 0001) — and absence is
+        // no selection.
+        let configured = PrefixDefaults {
+            graphics: Some("gamescope".to_owned()),
+            ..PrefixDefaults::default()
+        };
+        assert_eq!(
+            configured.graphics_selection(),
+            Some(GraphicsSelection::Gamescope)
+        );
+        let typo = PrefixDefaults {
+            graphics: Some("gamescop".to_owned()),
+            ..PrefixDefaults::default()
+        };
+        assert_eq!(
+            typo.graphics_selection(),
+            Some(GraphicsSelection::Unrecognized("gamescop".to_owned()))
+        );
+        assert_eq!(PrefixDefaults::default().graphics_selection(), None);
     }
 }

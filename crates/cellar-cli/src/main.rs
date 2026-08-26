@@ -73,6 +73,7 @@ use cellar_app::{
     ArtifactKind, DesktopSync, DoctorReport, DoctorService, InstallOutcome, InstallResult,
     InstallService, LaunchApp, LaunchMode, ListedEntry, PrefixService, RunnerService,
 };
+use cellar_core::entities::GraphicsSelection;
 use cellar_core::ports::{__sealed, InstallProgress, RunnerResolver, Storage};
 use cellar_core::{
     AppEntry, AppKind, Candidate, LaunchPlan, Prefix, ProviderMode, ResolveError, ResolvedRunner,
@@ -1698,12 +1699,19 @@ fn render_prefix_list(prefixes: &[Prefix], json: bool, color: bool) -> anyhow::R
     let rows: Vec<[String; 4]> = prefixes
         .iter()
         .map(|p| {
-            let graphics = p.defaults.graphics.as_deref().unwrap_or("–");
+            // The single graphics vocabulary (entities, #52): unknown
+            // values are marked, never silently shown as configured —
+            // the launch runs unwrapped. JSON keeps the raw string.
+            let graphics = match p.defaults.graphics_selection() {
+                None => "–".to_owned(),
+                Some(GraphicsSelection::Gamescope) => "gamescope".to_owned(),
+                Some(GraphicsSelection::Unrecognized(raw)) => format!("{raw} (unrecognized)"),
+            };
             let windows = p.defaults.windows_version.as_deref().unwrap_or("–");
             [
                 p.slug.clone(),
                 runner_label(p.defaults.runner.as_ref()),
-                graphics.to_owned(),
+                graphics,
                 windows.to_owned(),
             ]
         })
@@ -1979,7 +1987,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cellar_app::{
-        EntryStatus, InstallOutcome, InstallResult, InstallService, ListedEntry, PrefixService,
+        EntryStatus, InstallOutcome, InstallResult, InstallService, LaunchError, ListedEntry,
+        PrefixService,
     };
     use cellar_core::{
         AppEntry, AppKind, Overrides, Prefix, PrefixDefaults, RunnerFamily, RunnerInstall,
@@ -4385,13 +4394,24 @@ mod tests {
         prefix.defaults.graphics = Some("gamescope".to_owned());
         store.save_prefix(&prefix)?;
         let app = LaunchApp::with_chain(store.clone(), resolvers_for(&store), wrappers_for);
-        let plan = app.plan("game", &[])?;
-        assert_eq!(
-            plan.wrappers,
-            [cellar_core::Layer::Display, cellar_core::Layer::Container]
-        );
-        assert_eq!(plan.argv.first().map(String::as_str), Some("gamescope"));
-        assert!(plan.argv[1].ends_with("umu-run"));
+        // The probe is the real PATH (#52): on a host with gamescope the
+        // plan wraps; without it, the plan fails pre-spawn with the
+        // install hint instead of dying raw at exec. Either way the
+        // Display layer's premise is honored — never a silent unwrap.
+        let gamescope_on_path = cellar_core::find_on_path("gamescope").is_some();
+        match app.plan("game", &[]) {
+            Ok(plan) if gamescope_on_path => {
+                assert_eq!(
+                    plan.wrappers,
+                    [cellar_core::Layer::Display, cellar_core::Layer::Container]
+                );
+                assert_eq!(plan.argv.first().map(String::as_str), Some("gamescope"));
+                assert!(plan.argv[1].ends_with("umu-run"));
+            }
+            Err(LaunchError::WrapperMissing { program })
+                if !gamescope_on_path && program == "gamescope" => {}
+            other => panic!("unexpected outcome for gamescope={gamescope_on_path}: {other:?}"),
+        }
         Ok(())
     }
 

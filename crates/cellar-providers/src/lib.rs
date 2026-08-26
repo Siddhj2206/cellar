@@ -14,10 +14,11 @@
 //! `cellar-core`, whose trait types (`dyn RunnerResolver` & co.) are the
 //! registry's return vocabulary (ADR 0002 amendment, 2026-08).
 
-use cellar_core::entities::Prefix;
+use cellar_core::entities::{GraphicsSelection, Prefix};
+use cellar_core::exec_lookup::PathLookup;
 use cellar_core::manifest::ManagedRecord;
 use cellar_core::ports::{ManagedRunner, RunnerResolver, WrapperContributor};
-use cellar_core::types::{ResolvedRunner, RunnerFamily};
+use cellar_core::types::{MissingWrapper, ResolvedRunner, RunnerFamily};
 use cellar_provider_gamescope::GamescopeProvider;
 use cellar_provider_proton::{ProtonProvider, SteamProton};
 use cellar_provider_umu::{UmuProvider, UmuWrapper};
@@ -69,17 +70,31 @@ pub fn wrappers_for(
     prefix: &Prefix,
     prefix_dir: &Path,
     game_id: &str,
-) -> Vec<Box<dyn WrapperContributor>> {
+    lookup: PathLookup,
+) -> Result<Vec<Box<dyn WrapperContributor>>, MissingWrapper> {
     let mut wrappers: Vec<Box<dyn WrapperContributor>> = Vec::new();
-    if prefix.defaults.graphics.as_deref() == Some("gamescope") {
-        wrappers.push(Box::new(GamescopeProvider));
+    // One parse point for `graphics` (#52): entities owns the vocabulary.
+    // An unknown value warns-and-continues unwrapped — the warning is the
+    // launch surface's (cellar-app); the registry only declines to wrap.
+    match prefix.defaults.graphics_selection() {
+        Some(GraphicsSelection::Gamescope) => {
+            // The presence probe lives at activation (#52): a plan naming
+            // `gamescope` argv[0] the host lacks would doctor false-pass
+            // and die raw at exec. Failing here fails the plan stage,
+            // which the doctor's plan section runs too.
+            lookup("gamescope").ok_or(MissingWrapper {
+                program: "gamescope",
+            })?;
+            wrappers.push(Box::new(GamescopeProvider));
+        }
+        Some(GraphicsSelection::Unrecognized(_)) | None => {}
     }
     if let (RunnerFamily::Proton, Some(umu)) = (resolved.reference.family, umu_run) {
         wrappers.push(Box::new(UmuWrapper::new(
             umu, resolved, prefix_dir, game_id,
         )));
     }
-    wrappers
+    Ok(wrappers)
 }
 
 /// The integrity probe for one recorded managed install: the same marker
@@ -154,12 +169,20 @@ pub fn steam_roots() -> Vec<std::path::PathBuf> {
 mod tests {
     use super::*;
 
-    use cellar_core::entities::{Prefix, PrefixDefaults};
-    use cellar_core::types::{Layer, ProviderMode, RunnerFamily, RunnerInstall, RunnerRef};
+    use cellar_core::entities::PrefixDefaults;
+    use cellar_core::types::{
+        Layer, MissingWrapper, ProviderMode, RunnerFamily, RunnerInstall, RunnerRef,
+    };
     use cellar_provider_umu::install_path;
 
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Hermetic presence: gamescope "exists", nothing else does — the
+    /// activation tests never touch the real PATH.
+    fn fake_lookup(program: &str) -> Option<std::path::PathBuf> {
+        (program == "gamescope").then(|| PathBuf::from("/usr/bin/gamescope"))
+    }
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -256,7 +279,9 @@ mod tests {
             &prefix,
             Path::new("/root/prefixes/default"),
             "umu-balatro",
-        );
+            fake_lookup,
+        )
+        .unwrap_or_else(|e| panic!("wrapper chain: {e:?}"));
         let mut layers: Vec<_> = wrappers.iter().map(|w| w.layer()).collect();
         layers.sort();
         assert_eq!(layers, [Layer::Display, Layer::Container]);
@@ -287,7 +312,8 @@ mod tests {
                 },
             },
         };
-        let wrappers = wrappers_for(&wine, None, &prefix, Path::new("/p"), "umu-x");
+        let wrappers = wrappers_for(&wine, None, &prefix, Path::new("/p"), "umu-x", fake_lookup)
+            .unwrap_or_else(|e| panic!("wrapper chain: {e:?}"));
         assert!(
             wrappers.is_empty(),
             "no wrappers for an unconfigured wine plan"
@@ -314,8 +340,70 @@ mod tests {
                 },
             },
         };
-        let wrappers = wrappers_for(&wine, None, &prefix, Path::new("/p"), "umu-x");
+        let wrappers = wrappers_for(&wine, None, &prefix, Path::new("/p"), "umu-x", fake_lookup)
+            .unwrap_or_else(|e| panic!("wrapper chain: {e:?}"));
         assert_eq!(wrappers.len(), 1);
         assert_eq!(wrappers[0].layer(), Layer::Display);
+    }
+
+    #[test]
+    fn gamescope_missing_from_path_fails_the_activation() {
+        // The presence probe at activation (#52): a plan naming gamescope
+        // argv[0] the host lacks must fail here — where the doctor's plan
+        // section sees it — never raw at exec.
+        let prefix = Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                graphics: Some("gamescope".to_owned()),
+                ..PrefixDefaults::default()
+            },
+        };
+        let wine = ResolvedRunner {
+            mode: ProviderMode::DiscoverOnly,
+            reference: RunnerRef {
+                provider_id: "wine".to_owned(),
+                family: RunnerFamily::Wine,
+                install: RunnerInstall::Discovered {
+                    path: PathBuf::from("/usr/bin/wine"),
+                    version: None,
+                },
+            },
+        };
+        assert_eq!(
+            wrappers_for(&wine, None, &prefix, Path::new("/p"), "umu-x", |_p| None).unwrap_err(),
+            MissingWrapper {
+                program: "gamescope"
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_graphics_value_never_wraps() {
+        // Warn-and-continue (#52): the registry declines to wrap; the
+        // warning is the launch surface's.
+        let prefix = Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                graphics: Some("gamescop".to_owned()),
+                ..PrefixDefaults::default()
+            },
+        };
+        let wine = ResolvedRunner {
+            mode: ProviderMode::DiscoverOnly,
+            reference: RunnerRef {
+                provider_id: "wine".to_owned(),
+                family: RunnerFamily::Wine,
+                install: RunnerInstall::Discovered {
+                    path: PathBuf::from("/usr/bin/wine"),
+                    version: None,
+                },
+            },
+        };
+        let wrappers = wrappers_for(&wine, None, &prefix, Path::new("/p"), "umu-x", fake_lookup)
+            .unwrap_or_else(|e| panic!("wrapper chain: {e:?}"));
+        assert!(
+            wrappers.is_empty(),
+            "an unrecognized value must not silently wrap"
+        );
     }
 }

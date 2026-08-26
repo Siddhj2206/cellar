@@ -29,6 +29,11 @@ pub enum LaunchError {
     /// the dir occupies the slug in the dedupe domain — so the exact file
     /// is named for a hand fix or removal (#51, ADR 0001).
     PrefixDamaged { slug: String },
+    /// A wrapper layer this launch activates — e.g. gamescope at the
+    /// Display layer (#52) — whose program the host lacks. Failed at the
+    /// plan stage so the doctor sees it too; the Spawn family's as-is OS
+    /// error remains the backstop for a plan→spawn race.
+    WrapperMissing { program: String },
     /// Runner resolution failed — unknown spec / order exhausted →
     /// `SuggestInstall`, install missing → reinstall (the disposition text
     /// lives in `ResolveError`'s messages).
@@ -66,7 +71,11 @@ impl fmt::Display for LaunchError {
                 "the prefix '{slug}' this app binds to is damaged (its prefix.toml is \
                  missing or unreadable) — fix or remove `prefixes/{slug}/prefix.toml` by hand"
             ),
-            Self::Resolve(err) => write!(f, "{err}"),
+            Self::WrapperMissing { program } => write!(
+                f,
+                "the '{program}' wrapper this launch needs is missing — \
+                 install it via your system package manager"
+            ),
             Self::ExeMissing { slug, exe } => write!(
                 f,
                 "the registered exe of '{slug}' is gone ({} — the file is missing \
@@ -74,6 +83,7 @@ impl fmt::Display for LaunchError {
                  the entry",
                 exe.display()
             ),
+            Self::Resolve(err) => write!(f, "{err}"),
             Self::PlanUnavailable { family } => write!(
                 f,
                 "cannot plan a {} launch yet — the wrapper chain for this family \

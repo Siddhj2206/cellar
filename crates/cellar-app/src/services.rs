@@ -25,7 +25,7 @@
 //! hint, read-only.
 
 use cellar_core::Prefix;
-use cellar_core::entities::{AppEntry, AppKind, Candidate, Overrides};
+use cellar_core::entities::{AppEntry, AppKind, Candidate, GraphicsSelection, Overrides};
 use cellar_core::errors::{DesktopError, ResolveError, StorageError, UnresolvedCause};
 use cellar_core::health::{AssociationState, DesktopIntegration, TreeHealth};
 use cellar_core::manifest::{ManagedRecord, RunnerManifest};
@@ -33,7 +33,9 @@ use cellar_core::ports::{
     DesktopIntegrator, InstallProgress, RunnerResolver, Storage, WrapperContributor,
 };
 use cellar_core::slug;
-use cellar_core::types::{LaunchPlan, ProviderMode, ResolvedRunner, RunnerFamily, RunnerSpec};
+use cellar_core::types::{
+    LaunchPlan, MissingWrapper, ProviderMode, ResolvedRunner, RunnerFamily, RunnerSpec,
+};
 use cellar_launch::{LaunchError, LaunchMode, SpawnedProcess, build_plan, select_spec};
 
 use std::collections::BTreeSet;
@@ -857,7 +859,8 @@ pub type ChainBuilder = fn(
     prefix: &Prefix,
     prefix_dir: &Path,
     game_id: &str,
-) -> Vec<Box<dyn WrapperContributor>>;
+    lookup: cellar_core::exec_lookup::PathLookup,
+) -> Result<Vec<Box<dyn WrapperContributor>>, MissingWrapper>;
 
 /// The empty chain — the default every service constructs with;
 /// presentations wire the registry's rule explicitly.
@@ -867,8 +870,9 @@ pub fn empty_chain(
     _prefix: &Prefix,
     _prefix_dir: &Path,
     _game_id: &str,
-) -> Vec<Box<dyn WrapperContributor>> {
-    Vec::new()
+    _lookup: cellar_core::exec_lookup::PathLookup,
+) -> Result<Vec<Box<dyn WrapperContributor>>, MissingWrapper> {
+    Ok(Vec::new())
 }
 
 /// The frozen plan for one entry over already-loaded state — the pipeline
@@ -923,7 +927,22 @@ fn plan_for<S: Storage, R: RunnerResolver>(
         prefix,
         &prefix_dir,
         &format!("umu-{}", entry.slug),
-    );
+        cellar_core::exec_lookup::find_on_path,
+    )
+    .map_err(|missing| LaunchError::WrapperMissing {
+        program: missing.program.to_owned(),
+    })?;
+    // Unknown `graphics` (#52): warn-and-continue unwrapped. A prefix
+    // launching fine today must not start failing over a typo — but the
+    // user's belief that a wrapper is active gets named. The doctor flags
+    // it as a plan-vs-intent difference; `prefix list` marks the value.
+    if let Some(GraphicsSelection::Unrecognized(value)) = prefix.defaults.graphics_selection() {
+        eprintln!(
+            "cellar: unknown graphics value {value:?} in `prefixes/{}/prefix.toml` — \
+             valid values: gamescope; launching without it",
+            prefix.slug
+        );
+    }
     let wrappers: Vec<&dyn WrapperContributor> = wrappers.iter().map(AsRef::as_ref).collect();
     build_plan(entry, prefix, &runner, &prefix_dir, &wrappers, args)
 }
@@ -1463,6 +1482,21 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
                     continue;
                 }
             };
+            // Unknown `graphics` (#52): the plan silently differs from
+            // what the user believes they configured — flagged here, and
+            // warned at launch.
+            if let Some(GraphicsSelection::Unrecognized(value)) =
+                prefix.defaults.graphics_selection()
+            {
+                findings.push(DoctorFinding {
+                    item: entry.slug.clone(),
+                    problem: format!("its bound prefix sets an unknown graphics value {value:?}"),
+                    fix: format!(
+                        "valid values: gamescope — edit `prefixes/{prefix_slug}/prefix.toml`"
+                    ),
+                });
+                continue;
+            }
             if let Err(error) = plan_for(
                 &self.storage,
                 &self.resolver,
@@ -1488,6 +1522,9 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
             }
             LaunchError::PrefixDamaged { slug } => {
                 format!("fix or remove `prefixes/{slug}/prefix.toml` by hand")
+            }
+            LaunchError::WrapperMissing { program } => {
+                format!("install {program} via your system package manager")
             }
             LaunchError::ExeMissing { slug, .. } => {
                 format!(
@@ -3625,6 +3662,59 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn doctor_flags_an_unknown_graphics_value() -> anyhow::Result<()> {
+        // `graphics = "gamescop"` (#52): the plan silently differs from
+        // what the user configured — flagged with the valid values and
+        // the file named.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                graphics: Some("gamescop".to_owned()),
+                ..PrefixDefaults::default()
+            },
+        });
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(mock, StubDesktop::new(), StubResolver::ok());
+        let report = service.check()?;
+        let plans = &report.sections[3];
+        assert!(!plans.healthy);
+        let finding = &plans.findings[0];
+        assert!(
+            finding.problem.contains("gamescop"),
+            "the problem names the value: {}",
+            finding.problem
+        );
+        assert!(
+            finding.fix.contains("valid values: gamescope")
+                && finding.fix.contains("prefixes/default/prefix.toml"),
+            "the fix names values and file: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_wrapper_missing_points_at_a_package_install() {
+        // The activation probe's disposition (#52): the fix installs the
+        // named program — never a dead-end command.
+        let finding = DoctorService::<MockStorage, StubDesktop, StubResolver>::plan_finding(
+            &entry("balatro", "/games/balatro.exe"),
+            &LaunchError::WrapperMissing {
+                program: "gamescope".to_owned(),
+            },
+        );
+        assert!(
+            finding
+                .fix
+                .contains("install gamescope via your system package manager"),
+            "{}",
+            finding.fix
+        );
+        assert!(finding.problem.contains("gamescope"), "{}", finding.problem);
     }
 
     #[test]

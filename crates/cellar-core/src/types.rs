@@ -153,3 +153,12 @@ pub struct LaunchPlan {
     /// `RuntimeEnv`).
     pub wrappers: Vec<Layer>,
 }
+
+/// A wrapper the activation rule selected whose program the host lacks
+/// (#52): the launch fails at the plan stage — where the doctor sees it —
+/// instead of dying raw in exec. Names the program a system-package
+/// install provides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingWrapper {
+    pub program: &'static str,
+}

@@ -18,6 +18,7 @@
 
 pub mod entities;
 pub mod errors;
+pub mod exec_lookup;
 pub mod health;
 pub mod manifest;
 pub mod ports;
@@ -26,6 +27,7 @@ pub mod types;
 
 pub use entities::{AppEntry, AppKind, Candidate, Overrides, Prefix, PrefixDefaults, Settings};
 pub use errors::{DesktopError, ResolveError, StorageError, UnresolvedCause};
+pub use exec_lookup::{PathLookup, executable_file, find_on_path, find_on_path_in};
 pub use health::TreeHealth;
 pub use manifest::{
     ArchiveLayout, ChecksumScheme, InstallKind, LATEST_PIN, ManagedInventory, ManagedRecord,
@@ -33,8 +35,8 @@ pub use manifest::{
 };
 pub use slug::{MAX_LEN, dedupe_slug, is_valid_slug, slugify};
 pub use types::{
-    ConfiguredRunner, LaunchPlan, Layer, ProviderMode, ResolvedRunner, RunnerFamily, RunnerInstall,
-    RunnerRef, RunnerSpec,
+    ConfiguredRunner, LaunchPlan, Layer, MissingWrapper, ProviderMode, ResolvedRunner,
+    RunnerFamily, RunnerInstall, RunnerRef, RunnerSpec,
 };
 
 #[cfg(test)]
