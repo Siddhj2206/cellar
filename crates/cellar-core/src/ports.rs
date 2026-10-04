@@ -119,7 +119,32 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// doctor flags and a re-derivation sweep must spare (ADR 0001).
     fn list_apps(&self) -> Result<Vec<AppEntry>, StorageError>;
     fn load_app(&self, slug: &str) -> Result<AppEntry, StorageError>;
+
+    /// The plain upsert: create or replace `apps/<slug>.toml`, atomically.
+    /// Correct for an update to a slug that is *already* the entry's own
+    /// file. For a name that is *new* — a fresh registration, or a rename
+    /// that moves the entry to a new file name — use
+    /// [`Storage::claim_app`]: this method cannot tell "replacing my own
+    /// file" from "clobbering someone else's", so it overwrites either.
     fn save_app(&self, app: &AppEntry) -> Result<(), StorageError>;
+
+    /// Claim `app.slug`'s file exclusively and write the entry into it.
+    ///
+    /// The claim *is* the file creation (`create_new`), so it fails with
+    /// [`StorageError::Exists`] the moment a concurrent registration took
+    /// the name — the same primitive [`Storage::create_prefix`] already
+    /// uses for its directory, and the reason 8 concurrent registrations
+    /// of one display name used to collapse onto a single file with no
+    /// error anywhere (#60). The caller re-dedupes against
+    /// [`Storage::list_app_slugs`] and retries; a claim never overwrites.
+    ///
+    /// The write follows the claim, so a crash in between can leave an
+    /// empty entry file. That degrades to the state the tree already
+    /// models for hand-edit damage — a skipped entry doctor flags, and a
+    /// slug that stays off-limits to a fresh registration (ADR 0001) —
+    /// never to a lost entry.
+    fn claim_app(&self, app: &AppEntry) -> Result<(), StorageError>;
+
     fn delete_app(&self, slug: &str) -> Result<(), StorageError>;
 
     /// The app-slug dedupe domain: every `apps/*.toml` file stem, valid or
