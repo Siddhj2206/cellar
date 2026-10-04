@@ -22,7 +22,7 @@ _Avoid_: category, type, genre
 A Cellar-managed Windows environment (a Wine prefix) that holds the defaults for every AppEntry inside it: runner, environment, graphics, Windows version. One prefix contains many AppEntries.
 _Avoid_: bottle, environment, container
 
-Which of those defaults the launch pipeline actually reads is a separate question from which ones the prefix stores. `runner` and `graphics` are consulted at launch; `windows_version` is **stored, displayed, and not yet read** — no launch plan changes because it is set (#54).
+Which of those defaults the launch pipeline actually reads is a separate question from which ones the prefix stores. `runner`, `environment`, and `graphics` are all consulted when a plan is built; `windows_version` is **stored, displayed, and not yet read** — no launch plan changes because it is set (#54).
 
 **Override**:
 A per-AppEntry setting that replaces one of its prefix's defaults — including the AppEntry's own prefix binding, whose default is the prefix that registered it.
@@ -37,7 +37,7 @@ The executable-finding step of an InstallSession: the prefix's Start Menu and De
 _Avoid_: scan, rescan, finder
 
 **Uninstall**:
-Removing an AppEntry: Cellar deletes the entry, its overrides, and its derived launcher integration. Cellar deletes no app files itself — the app's own files stay until the user removes them. Two halves of the fuller flow are **design intent, not current behavior**: running the app's Windows [Uninstaller](#uninstaller) when one is registered, and offering to delete the prefix when its last AppEntry goes (#44).
+Removing an AppEntry: Cellar deletes the entry and its per-app overrides, and removes the app's launcher entry and cached icon. It deliberately spares the global "Open with Cellar" association — that belongs to the host, not to one app. Cellar deletes no app files itself — the app's own files stay until the user removes them. Two halves of the fuller flow are **design intent, not current behavior**: running the app's Windows uninstaller (glossary: Uninstaller) when one is registered in the prefix, and offering to delete the prefix when its last AppEntry goes (#44).
 _Avoid_: unregister, remove, delete
 
 **Doctor**:
@@ -49,7 +49,7 @@ A runner Cellar provisions itself — GE-Proton / umu-Proton and umu — from a 
 _Avoid_: bundled runner, downloaded runner
 
 **Uninstaller**:
-The Windows-side removal program for an app, recorded in the prefix's registry (Add/Remove Programs). Cellar invokes it through the runner's `uninstaller --list/--remove`; a missing Uninstaller entry is what degrades Uninstall to entry removal.
+The Windows-side removal program for an app, recorded in the prefix's registry (Add/Remove Programs). **Design intent, not current behavior**: Cellar does not invoke one yet — Uninstall removes the entry and its launcher integration whatever the prefix's registry says (#44).
 _Avoid_: uninstall program, remover
 
 **CLI contract**:

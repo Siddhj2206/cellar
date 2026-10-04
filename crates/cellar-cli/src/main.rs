@@ -1808,12 +1808,19 @@ fn render_prefix_list(prefixes: &[Prefix], json: bool, color: bool) -> anyhow::R
                 Some(GraphicsSelection::Gamescope) => "gamescope".to_owned(),
                 Some(GraphicsSelection::Unrecognized(raw)) => format!("{raw} (unrecognized)"),
             };
-            let windows = p.defaults.windows_version.as_deref().unwrap_or("–");
+            // `windows_version` is marked, not shown as configured: it is
+            // stored and displayed but no launch plan reads it (#54), so a
+            // bare value would read as active. Same honesty the graphics
+            // column already has for an unknown value.
+            let windows = match p.defaults.windows_version.as_deref() {
+                None => "–".to_owned(),
+                Some(version) => format!("{version} (not read yet)"),
+            };
             [
                 p.slug.clone(),
                 runner_label(p.defaults.runner.as_ref()),
                 graphics,
-                windows.to_owned(),
+                windows,
             ]
         })
         .collect();
@@ -2451,6 +2458,16 @@ mod tests {
         let human = render_prefix_list(std::slice::from_ref(&prefix), false, false)?;
         assert!(human.contains("Slug"), "header missing:\n{human}");
         assert!(human.contains("my-games"), "row missing:\n{human}");
+        // #54: a stored `windows_version` is marked rather than shown as a
+        // working default — the human table is where a user would otherwise
+        // read it as active. JSON keeps the raw string (cli-json.md).
+        let mut with_windows = prefix.clone();
+        with_windows.defaults.windows_version = Some("win7".to_owned());
+        let marked = render_prefix_list(&[with_windows], false, false)?;
+        assert!(
+            marked.contains("win7 (not read yet)"),
+            "the unimplemented default is marked as such:\n{marked}"
+        );
         let json = render_prefix_list(&[prefix], true, false)?;
         assert!(
             json.contains("\"slug\": \"my-games\""),

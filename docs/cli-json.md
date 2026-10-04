@@ -101,6 +101,11 @@ Runner spec: `{ "family": "Proton" \| "Wine" \| "Umu", "configured": { "Path": "
 Note: `defaults.runner` serializes as `null` when unset (no `skip_serializing_if` on `Prefix`'s
 `Option` fields); `env` is omitted when empty; `graphics`/`windows_version` omitted when absent.
 
+`defaults.windows_version` is stored and reported but **not read by the launch pipeline** — the plan
+is identical with or without it. It is a live field in this shape (not deprecated): #54 records the
+decision to keep serializing it while the behavior is unimplemented, and to mark it in the human
+`prefix list` output rather than drop or rename it.
+
 ## `cellar runner list --json`
 
 One object per runner: managed installs from the authoritative inventory plus discover-only host
