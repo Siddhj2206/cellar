@@ -15,7 +15,7 @@ A registered executable the user can launch through Cellar, identified by the ca
 _Avoid_: program, game entry, shortcut, app
 
 **kind**:
-Metadata on an AppEntry — `Game` or `Tool` — that groups entries in the launcher and drives display and icons; planned as the hook for per-kind default presets (e.g. Games default to GE-Proton, Tools default to system wine). Never a storage location or a separate path.
+Metadata on an AppEntry — `Game` or `Tool` — that groups entries in the launcher and drives display and icons; planned as the hook for per-kind default presets (e.g. Games default to GE-Proton, Tools default to system wine). A new AppEntry takes `Game` when the user names no kind; re-registering an existing entry keeps whatever kind it already has unless a kind is named explicitly (#40). Never a storage location or a separate path.
 _Avoid_: category, type, genre
 
 **Prefix**:

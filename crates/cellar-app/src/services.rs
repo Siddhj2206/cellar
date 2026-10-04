@@ -2247,9 +2247,12 @@ mod tests {
             ArtifactKind::Standalone,
         )?);
         assert!(!fresh.was_update);
+        // Spelled out rather than compared against `AppKind::DEFAULT`: the
+        // point is the *value* a user gets with no flag, so the test must
+        // fail if that value ever changes.
         assert_eq!(
             fresh.entry.kind,
-            AppKind::DEFAULT,
+            AppKind::Game,
             "a new entry with no --kind is the blueprint's game default"
         );
         // And an explicit kind still moves it, in both directions.

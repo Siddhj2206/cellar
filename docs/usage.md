@@ -56,7 +56,7 @@ has a flag equivalent:
 | Which prefix               | Pick an existing one (numbered), type a new name, or empty for `default` | `--prefix <name>`                                                    |
 | Artifact kind              | Asked once, filename-hinted                                              | `--artifact <kind>`                                                  |
 | Display name               | From the exe file name by default                                        | `--name "<display name>"`                                            |
-| Kind metadata              | game or tool (default `game` for a new entry)                             | `--kind game\|tool`                                                  |
+| Kind metadata              | — (flag only; there is no kind prompt)                                   | `--kind game\|tool` (default `game` for a new entry)                  |
 | Keep which discovered exes | Numbered keep/hide review + manual adds                                  | `--keep <n>` (repeatable), `--keep-all`, `--add <path>` (repeatable) |
 
 After an installer or archive runs, Cellar decodes the Start Menu/Desktop shortcuts created inside
