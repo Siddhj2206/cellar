@@ -195,9 +195,10 @@ struct InstallArgs {
     #[arg(long)]
     name: Option<String>,
     /// Entry kind — drives the defaults-floor preset hook (games → Proton,
-    /// tools → wine).
-    #[arg(long, value_parser = AppKind::from_str, default_value = "game")]
-    kind: AppKind,
+    /// tools → wine). Omitted: a new entry becomes `game`, and a
+    /// re-install keeps the kind the entry already has (the `--name` rule).
+    #[arg(long, value_parser = AppKind::from_str)]
+    kind: Option<AppKind>,
     /// How to handle the artifact: standalone registers without executing;
     /// installer runs inside the prefix with its exit awaited; archive
     /// extracts into the prefix. Absent: hinted from the file name as the
@@ -2679,7 +2680,7 @@ mod tests {
                 &exe,
                 "default",
                 Some("My Tool"),
-                AppKind::Tool,
+                Some(AppKind::Tool),
                 ArtifactKind::Standalone,
             )?,
         );
@@ -2718,7 +2719,7 @@ mod tests {
                 &exe,
                 "default",
                 Some("My Tool"),
-                AppKind::Tool,
+                Some(AppKind::Tool),
                 ArtifactKind::Standalone,
             )?,
         );
@@ -2756,7 +2757,7 @@ mod tests {
             path: path.to_path_buf(),
             prefix: None,
             name: None,
-            kind: AppKind::Game,
+            kind: None,
             artifact: Some(ArtifactKind::Standalone),
             no_input: true,
             keep: Vec::new(),
@@ -2862,7 +2863,11 @@ mod tests {
             args.name.is_none(),
             "the name defaults to the exe file name"
         );
-        assert_eq!(args.kind, AppKind::Game, "the default kind is `game`");
+        assert_eq!(
+            args.kind, None,
+            "an omitted --kind is not a silent `game`: new entries default to \
+             game, re-installs keep the entry's kind (#40)"
+        );
         assert!(
             args.artifact.is_none(),
             "the branch is hinted from the file name, never silently fixed"
@@ -2884,7 +2889,7 @@ mod tests {
         };
         assert_eq!(args.prefix.as_deref(), Some("games"));
         assert_eq!(args.name.as_deref(), Some("Balatro"));
-        assert_eq!(args.kind, AppKind::Tool);
+        assert_eq!(args.kind, Some(AppKind::Tool));
     }
 
     #[test]
@@ -3233,7 +3238,7 @@ mod tests {
             &exe,
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert!(!first.was_update);
@@ -3247,7 +3252,7 @@ mod tests {
             &exe,
             "default",
             None,
-            AppKind::Tool,
+            Some(AppKind::Tool),
             ArtifactKind::Standalone,
         )?);
         assert!(second.was_update, "re-install updates the same entry");
@@ -3481,7 +3486,7 @@ mod tests {
                 &exe,
                 "default",
                 Some("My Tool"),
-                AppKind::Tool,
+                Some(AppKind::Tool),
                 ArtifactKind::Standalone,
             )?,
         );
@@ -3566,7 +3571,7 @@ mod tests {
                 &exe,
                 "default",
                 Some("My Tool"),
-                AppKind::Tool,
+                Some(AppKind::Tool),
                 ArtifactKind::Standalone,
             )?,
         );
@@ -3631,7 +3636,7 @@ mod tests {
                 &exe,
                 "default",
                 Some("My Tool"),
-                AppKind::Tool,
+                Some(AppKind::Tool),
                 ArtifactKind::Standalone,
             )?,
         );
@@ -3696,7 +3701,7 @@ mod tests {
                 &game_exe,
                 &games.slug,
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Standalone,
             )?,
         );
@@ -3772,7 +3777,7 @@ mod tests {
             &installer,
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Installer,
         )?;
         assert!(outcome.registrations.is_empty(), "nothing registers yet");
@@ -3806,7 +3811,7 @@ mod tests {
                 &installer,
                 "default",
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Installer,
             )
             .expect_err("failed installer aborts");
@@ -3847,7 +3852,7 @@ mod tests {
             &bundle,
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Archive,
         )?;
         // The archive landed at the prefix's wine root, structure intact.
@@ -3866,7 +3871,13 @@ mod tests {
         let evil = root.join("evil.zip");
         build_zip(&evil, &[("../evil.exe", "MZ")]);
         let err = service
-            .install(&evil, "default", None, AppKind::Game, ArtifactKind::Archive)
+            .install(
+                &evil,
+                "default",
+                None,
+                Some(AppKind::Game),
+                ArtifactKind::Archive,
+            )
             .expect_err("traversal must be refused");
         assert!(
             err.to_string().contains("escape the prefix"),
@@ -4099,7 +4110,7 @@ mod tests {
                 path: exe,
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: None,
                 no_input: true,
                 keep: Vec::new(),
@@ -4139,7 +4150,7 @@ mod tests {
                 path: exe.clone(),
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: Some(ArtifactKind::Standalone),
                 no_input: true,
                 keep: Vec::new(),
@@ -4196,7 +4207,7 @@ mod tests {
             path: exe.clone(),
             prefix: None,
             name: name.map(str::to_owned),
-            kind: AppKind::Game,
+            kind: None,
             artifact: Some(ArtifactKind::Standalone),
             no_input: true,
             keep: Vec::new(),
@@ -4210,6 +4221,51 @@ mod tests {
         assert!(!before.exists(), "the old entry file name is gone");
         let after = home.join("cellar/applications/cellar-poker-night.desktop");
         assert!(after.exists(), "the entry file name follows the rename");
+        Ok(())
+    }
+
+    #[test]
+    fn reinstalling_without_kind_keeps_the_tool_kind() -> anyhow::Result<()> {
+        // #40: a re-install that omits --kind must not reset the entry to
+        // `game` — kind drives the defaults floor (Game → Proton, Tool →
+        // wine), so the silent flip changed how the app would launch.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let home = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-kind-keep-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(home.join("cellar"));
+        std::fs::create_dir_all(home.join("cellar"))?;
+        let exe = home.join("cellar/mytool.exe");
+        std::fs::write(&exe, "MZ")?;
+        let desktop = test_desktop(&store);
+        let args = |kind: Option<AppKind>| InstallArgs {
+            path: exe.clone(),
+            prefix: None,
+            name: None,
+            kind,
+            artifact: Some(ArtifactKind::Standalone),
+            no_input: true,
+            keep: Vec::new(),
+            keep_all: false,
+            add: Vec::new(),
+        };
+        run_install(&store, &desktop, &args(Some(AppKind::Tool)), false)?;
+        let entry_file = home.join("cellar/apps/mytool.toml");
+        assert!(
+            std::fs::read_to_string(&entry_file)?.contains("kind = \"tool\""),
+            "the tool registration lands as a tool"
+        );
+        run_install(&store, &desktop, &args(None), false)?;
+        assert!(
+            std::fs::read_to_string(&entry_file)?.contains("kind = \"tool\""),
+            "no --kind keeps the entry's kind"
+        );
+        run_install(&store, &desktop, &args(Some(AppKind::Game)), false)?;
+        assert!(
+            std::fs::read_to_string(&entry_file)?.contains("kind = \"game\""),
+            "an explicit --kind still moves it"
+        );
         Ok(())
     }
 
@@ -4232,7 +4288,7 @@ mod tests {
             path: path.to_path_buf(),
             prefix: None,
             name: None,
-            kind: AppKind::Game,
+            kind: None,
             artifact: Some(ArtifactKind::Standalone),
             no_input: true,
             keep: Vec::new(),
@@ -4297,7 +4353,7 @@ mod tests {
             path: path.to_path_buf(),
             prefix: None,
             name: None,
-            kind: AppKind::Game,
+            kind: None,
             artifact: Some(ArtifactKind::Standalone),
             no_input: true,
             keep: Vec::new(),
@@ -4415,7 +4471,7 @@ mod tests {
                 path: exe.clone(),
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: Some(ArtifactKind::Standalone),
                 no_input: true,
                 keep: Vec::new(),
@@ -4482,7 +4538,7 @@ mod tests {
                 path: exe.clone(),
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: Some(ArtifactKind::Standalone),
                 no_input: true,
                 keep: Vec::new(),
@@ -4543,7 +4599,7 @@ mod tests {
             path: PathBuf::from("/tmp/setup.exe"),
             prefix: None,
             name: None,
-            kind: AppKind::Game,
+            kind: None,
             artifact: Some(ArtifactKind::Installer),
             no_input: true,
             keep: Vec::new(),
@@ -4674,7 +4730,7 @@ mod tests {
                 path: installer,
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: Some(ArtifactKind::Installer),
                 no_input: true,
                 keep: Vec::new(),
@@ -4714,7 +4770,7 @@ mod tests {
                 path: installer,
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: Some(ArtifactKind::Installer),
                 no_input: true,
                 keep: vec![1, 3, 5],
@@ -4745,7 +4801,7 @@ mod tests {
                 path: installer,
                 prefix: None,
                 name: None,
-                kind: AppKind::Game,
+                kind: None,
                 artifact: Some(ArtifactKind::Installer),
                 no_input: true,
                 keep: Vec::new(),
