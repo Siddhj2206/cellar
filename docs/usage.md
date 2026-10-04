@@ -95,6 +95,13 @@ Proton selection never silently falls back to wine. `--dry-run` shows exactly wh
 including the runner path and environment; paste `--dry-run --json` output when reporting launch
 bugs.
 
+**Order matters.** Because app arguments may start with a hyphen, Cellar stops reading its own flags
+at the first one: in `cellar launch game -windowed --dry-run`, the `--dry-run` is an argument *for
+the game*, so the game would launch instead of printing a plan. Rather than do the opposite of what
+you asked, Cellar refuses and names both orderings — put Cellar's flags first
+(`cellar launch game --dry-run -windowed`), or separate them with `--`
+(`cellar launch game -- -windowed --dry-run`) when the app really does take that token.
+
 ## Listing and removing — `cellar list`, `cellar uninstall`
 
 `cellar list` shows every registered app: slug, kind, prefix, runner, and status. A status of

@@ -518,6 +518,33 @@ fn styled(text: &str, code: &str, color: bool) -> String {
     }
 }
 
+/// The first Cellar flag that landed in the app's own argument list, if
+/// any (#39).
+///
+/// `LaunchArgs::args` accepts hyphen-leading values so that
+/// `cellar launch game -windowed` needs no separator — but that same
+/// allowance ends clap's flag scan: every token after the first
+/// hyphen-leading value becomes a game argument, so `cellar launch game
+/// -windowed --dry-run` LAUNCHES the game and passes it `--dry-run`. The
+/// user asked for a plan preview and got the opposite, silently.
+///
+/// This looks for Cellar's own flags (`--dry-run`, `-n`, `--detach`,
+/// `--json`) inside that swallowed region. Finding one is not a guess that
+/// the user meant the flag — it is a certainty that the flag did not work,
+/// and the safe reading is refusal with guidance: put Cellar's flags first,
+/// or separate them with `--` when the app really does take that token.
+///
+/// It is deliberately narrow. Unknown hyphen tokens (`-windowed`,
+/// `--fullscreen`) are ordinary game arguments and pass untouched, and a
+/// game that genuinely takes `--json` still gets it via `--`. Nothing is
+/// reordered or guessed — the command refuses and shows both orderings.
+fn swallowed_cellar_flag(args: &[String]) -> Option<&str> {
+    const CELLAR_FLAGS: [&str; 4] = ["--dry-run", "-n", "--detach", "--json"];
+    args.iter()
+        .find(|arg| CELLAR_FLAGS.contains(&arg.as_str()))
+        .map(String::as_str)
+}
+
 /// One narration line — the informational output `--quiet` silences
 /// (ADR 0004): status and summary prose. Delivered data (tables, JSON,
 /// plans, reports, the `--detach` pid/log line) and errors are never
@@ -1055,49 +1082,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             print!("{}", render_app_list(&entries, args.json, color)?);
             Ok(ExitCode::SUCCESS)
         }
-        Command::Launch(args) => {
-            let service = LaunchApp::with_chain(store.clone(), resolvers_for(&store), wrappers_for);
-            if args.dry_run {
-                // Pre-plan phases only: resolve → check → plan, pure and
-                // printable — nothing spawns (blueprint §7).
-                let plan = service.plan(&args.app, &args.args)?;
-                print!("{}", render_plan(&plan, args.json)?);
-                return Ok(ExitCode::SUCCESS);
-            }
-            // A launcher click runs this exact code with stderr detached
-            // (#63): any pre-spawn failure must also reach the desktop as
-            // a notification, or it vanishes without a trace.
-            // Execute phase (blueprint §7): spawn the frozen plan; the
-            // wait-vs-detach policy is presentation's (CLI foregrounds,
-            // --detach releases the process from the terminal).
-            let mode = if args.detach {
-                LaunchMode::Detached
-            } else {
-                LaunchMode::Foreground
-            };
-            let process = match service.spawn(&args.app, &args.args, mode) {
-                Ok(process) => process,
-                // Pre-spawn failures (resolve/check/plan/spawn) reach the
-                // desktop notification when headless (#63).
-                Err(error) => {
-                    notify_launch_failure(&error.to_string());
-                    return Err(error.into());
-                }
-            };
-            if args.detach {
-                // The pid and log path are the deliverable of --detach —
-                // never narration, so they print under --quiet too.
-                println!(
-                    "Detached '{}' — pid {}, output: {}",
-                    args.app,
-                    process.pid(),
-                    process.log_path().display()
-                );
-                return Ok(ExitCode::SUCCESS);
-            }
-            let status = process.wait()?;
-            Ok(exit_code_for(status))
-        }
+        Command::Launch(args) => run_launch(&store, &args),
         Command::Uninstall(args) => {
             let service = InstallService::new(store.clone(), resolvers_for(&store), desktop);
             service.uninstall(&args.slug)?;
@@ -1202,6 +1187,66 @@ fn exit_code_for(status: ExitStatus) -> ExitCode {
 /// rather than silently truncating a code the terminal never reported.
 fn raw_exit_code(code: i32) -> u8 {
     u8::try_from(code).unwrap_or(1)
+}
+
+/// The `cellar launch` handler (blueprint §7): resolve → check → plan, then
+/// either print the frozen plan (`--dry-run`, nothing spawns) or execute it.
+/// The wait-vs-detach policy is presentation's: the CLI foregrounds,
+/// `--detach` releases the process from the terminal.
+fn run_launch(store: &TreeStore, args: &LaunchArgs) -> anyhow::Result<ExitCode> {
+    let service = LaunchApp::with_chain(store.clone(), resolvers_for(store), wrappers_for);
+    // Once a hyphen-leading value is consumed, clap stops reading Cellar's
+    // own flags — `cellar launch game -windowed --dry-run` would launch the
+    // game and hand it `--dry-run` (#39). Refuse rather than do the opposite
+    // of what was asked; the guard names both working orderings.
+    if let Some(swallowed) = swallowed_cellar_flag(&args.args) {
+        let error = anyhow::anyhow!(
+            "'{swallowed}' after the app arguments is taken as an argument for the app, \
+             not as a Cellar flag — put Cellar's flags before the app's arguments \
+             (cellar launch {} {swallowed} …) or separate them with `--` \
+             (cellar launch {} -- {swallowed})",
+            args.app,
+            args.app
+        );
+        // A launcher click runs this exact code with stderr detached (#63),
+        // so the refusal must reach the desktop too or it vanishes.
+        notify_launch_failure(&error.to_string());
+        return Err(error);
+    }
+    if args.dry_run {
+        // Pre-plan phases only: resolve → check → plan, pure and
+        // printable — nothing spawns (blueprint §7).
+        let plan = service.plan(&args.app, &args.args)?;
+        print!("{}", render_plan(&plan, args.json)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mode = if args.detach {
+        LaunchMode::Detached
+    } else {
+        LaunchMode::Foreground
+    };
+    let process = match service.spawn(&args.app, &args.args, mode) {
+        Ok(process) => process,
+        // Pre-spawn failures (resolve/check/plan/spawn) reach the desktop
+        // notification when headless (#63).
+        Err(error) => {
+            notify_launch_failure(&error.to_string());
+            return Err(error.into());
+        }
+    };
+    if args.detach {
+        // The pid and log path are the deliverable of --detach — never
+        // narration, so they print under --quiet too.
+        println!(
+            "Detached '{}' — pid {}, output: {}",
+            args.app,
+            process.pid(),
+            process.log_path().display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let status = process.wait()?;
+    Ok(exit_code_for(status))
 }
 
 /// The `cellar install` handler — the flagship flow (blueprint §8): bind
@@ -3009,6 +3054,49 @@ mod tests {
         assert!(!detach);
         assert!(json);
         assert_eq!(args, ["--fullscreen"], "app args come after `--`");
+    }
+
+    #[test]
+    fn a_cellar_flag_after_a_hyphen_app_arg_is_refused_with_guidance() {
+        // #39: once a hyphen-leading value is consumed, clap stops reading
+        // flags — `-windowed --dry-run` would launch the game and hand it
+        // `--dry-run`. The parse succeeds (the token lands in `args`), so
+        // the guard is what catches it.
+        let parse = |rest: &[&str]| -> LaunchArgs {
+            let mut tokens = vec!["cellar", "launch", "game"];
+            tokens.extend_from_slice(rest);
+            let cli = Cli::try_parse_from(tokens).unwrap_or_else(|e| panic!("parse: {e}"));
+            let Command::Launch(parsed) = cli.command else {
+                panic!("unexpected command");
+            };
+            parsed
+        };
+        for flag in ["--dry-run", "-n", "--detach", "--json"] {
+            let args = parse(&["-windowed", flag]);
+            assert!(
+                !args.dry_run && !args.detach && !args.json,
+                "{flag} after an app arg must NOT be taken as Cellar's flag"
+            );
+            assert_eq!(
+                swallowed_cellar_flag(&args.args),
+                Some(flag),
+                "…and the guard must see it in the swallowed region"
+            );
+        }
+        // The narrowness that keeps this from being a guessing game:
+        // ordinary game arguments pass, including ones that look nothing
+        // like a flag.
+        assert_eq!(swallowed_cellar_flag(&["-windowed".to_owned()]), None);
+        assert_eq!(swallowed_cellar_flag(&["--fullscreen".to_owned()]), None);
+        assert_eq!(
+            swallowed_cellar_flag(&["-windowed".to_owned(), "1920x1080".to_owned()]),
+            None,
+            "a positional game argument is not a flag"
+        );
+        // The flags-first ordering the guard points at still works.
+        let first = parse(&["--dry-run", "-windowed"]);
+        assert!(first.dry_run, "flags before app args parse as Cellar's");
+        assert_eq!(first.args, ["-windowed"], "…and the app keeps its own");
     }
 
     #[test]
