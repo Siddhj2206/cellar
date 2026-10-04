@@ -17,6 +17,7 @@ cellar-desktop = { path = "../cellar-desktop" }
 cellar-providers = { path = "../cellar-providers" }
 cellar-storage = { path = "../cellar-storage" }
 clap.workspace = true
+clap_complete.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

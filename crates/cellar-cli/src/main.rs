@@ -58,9 +58,21 @@
 //! stdout keeps yielding clean data under pipes. An omitted version pin
 //! — or the literal `latest` — resolves the provider's newest published
 //! release through its feed (#65) and installs that concrete tag.
+//!
+//! `cellar completions <shell>` (#49) rounds the surface off: the one
+//! deliberate noun-group exception, since it acts on the CLI itself rather
+//! than on an artifact or a lifecycle object (ADR 0004's dated extension
+//! note). It prints a *static* script generated from the very same
+//! [`cellar_command`] this binary parses with — so every command, flag, and
+//! enumerated flag value completes (`--artifact` and `--kind` off the
+//! types' own `ALL` vocabularies, never a second list), nothing is read
+//! from the tree, and no script shells back into Cellar. App-slug
+//! completion (`cellar launch <TAB>`) is deliberately deferred as an opt-in
+//! per shell.
 
+use clap::builder::TypedValueParser;
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueHint};
 
 use std::ffi::OsStr;
 use std::io::IsTerminal;
@@ -175,6 +187,50 @@ enum Command {
         after_help = "Exit code is overall health: 0 healthy / 1 problems — scripts can health-check."
     )]
     Doctor(DoctorArgs),
+    /// Print the shell completion script for this CLI (#49) — the surface's
+    /// one noun-group exception, recorded in ADR 0004: it acts on the CLI
+    /// itself, not on an artifact or a lifecycle object. Static generation
+    /// only, straight from the clap definition: every command, flag, and
+    /// enumerated flag value completes, and the script never reads the tree
+    /// or shells back into Cellar.
+    #[command(
+        display_name = "cellar",
+        arg_required_else_help = true,
+        help_template = "{about-with-newline}Examples:\n  cellar completions bash > ~/.local/share/bash-completion/completions/cellar\n  cellar completions zsh > ~/.zsh/completions/_cellar\n  cellar completions fish > ~/.config/fish/completions/cellar.fish\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}",
+        after_help = "The script is the command's product, so it goes to stdout and stdout is the only thing it writes — pipe it wherever your shell looks.\nCompletion is static: every command, flag, and enumerated flag value (--artifact, --kind) completes; app slugs (`cellar launch <TAB>`) do not —\nthat needs the script to read apps/, which stays out of the generated script by decision (ADR 0004, #49)."
+    )]
+    Completions(CompletionsArgs),
+}
+
+/// A clap value parser over one of the repo's enumerated vocabularies.
+///
+/// The vocabulary lives with the type that owns it — `AppKind::ALL`,
+/// `ArtifactKind::ALL` (the `ALL` consts sit next to the `FromStr` impl they
+/// mirror) — so the accepted values and the values the completion script
+/// offers are the same list by construction: a variant added to the enum
+/// completes, and one removed stops being accepted, with no second list to
+/// update. Parsing still runs the type's own `FromStr`, so the rejection
+/// message stays that type's wording.
+fn vocabulary<T: Copy + Send + Sync + 'static>(
+    all: &'static [T],
+    parse: fn(&str) -> Result<T, String>,
+    name: fn(T) -> &'static str,
+) -> impl TypedValueParser<Value = T> {
+    clap::builder::PossibleValuesParser::new(
+        all.iter()
+            .map(|value| clap::builder::PossibleValue::new(name(*value))),
+    )
+    .try_map(move |raw| parse(&raw))
+}
+
+/// `cellar completions <shell>`: the generated script goes to stdout, so the
+/// usage is the shell's own install line. No flag here: the script is the
+/// product, and a path flag would be a second way to say `>`.
+#[derive(Debug, Args)]
+struct CompletionsArgs {
+    /// The shell to generate for.
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 /// The `cellar install` flags (blueprint §8): every interactive prompt has
@@ -182,6 +238,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct InstallArgs {
     /// Path to the Windows artifact to install.
+    #[arg(value_hint = ValueHint::FilePath)]
     path: PathBuf,
     /// Prefix to bind the entry to; created when missing. Accepts the
     /// same names the prompt does: a valid slug passes through, a human
@@ -197,14 +254,21 @@ struct InstallArgs {
     /// Entry kind — drives the defaults-floor preset hook (games → Proton,
     /// tools → wine). Omitted: a new entry becomes `game`, and a
     /// re-install keeps the kind the entry already has (the `--name` rule).
-    #[arg(long, value_parser = AppKind::from_str)]
+    #[arg(long, value_parser = vocabulary(&AppKind::ALL, AppKind::from_str, AppKind::as_str))]
     kind: Option<AppKind>,
     /// How to handle the artifact: standalone registers without executing;
     /// installer runs inside the prefix with its exit awaited; archive
     /// extracts into the prefix. Absent: hinted from the file name as the
     /// prompt's default (e.g. setup.exe → installer, .zip → archive) — the
     /// branch is asked once on a TTY, never silently fixed.
-    #[arg(long, value_parser = ArtifactKind::from_str)]
+    #[arg(
+        long,
+        value_parser = vocabulary(
+            &ArtifactKind::ALL,
+            ArtifactKind::from_str,
+            ArtifactKind::as_str,
+        )
+    )]
     artifact: Option<ArtifactKind>,
     /// Do not prompt — every decision must come from flags; unconfirmed
     /// candidates register nothing.
@@ -212,13 +276,13 @@ struct InstallArgs {
     no_input: bool,
     /// Keep the given candidates (the numbers printed after the
     /// run/extract); the rest stay hidden. Repeatable.
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::Other)]
     keep: Vec<usize>,
     /// Keep every candidate discovery found.
     #[arg(long, conflicts_with = "keep")]
     keep_all: bool,
     /// Manually add an executable discovery missed (repeatable).
-    #[arg(long)]
+    #[arg(long, value_hint = ValueHint::FilePath)]
     add: Vec<PathBuf>,
 }
 
@@ -1123,6 +1187,15 @@ fn run_runner_list(store: &TreeStore, json: bool, color: bool) -> anyhow::Result
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    let quiet = cli.quiet;
+    let color = color_enabled();
+    // `completions` acts on the CLI itself, so it runs before any tree
+    // exists: a missing or broken data root is irrelevant to a script
+    // generated from clap's own definition, and the command must not
+    // create state to print one.
+    if let Command::Completions(args) = &cli.command {
+        return run_completions(args.shell);
+    }
     let store = match TreeStore::from_env() {
         Ok(store) => store,
         // A usage-shaped environment error (#61): exit 2 like clap, the
@@ -1144,8 +1217,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // The presentation decisions are made once, at the root: `--quiet`
     // silences narration, and terminal-plus-`NO_COLOR`-free output gets
     // ANSI (piped stdout is plain everywhere).
-    let quiet = cli.quiet;
-    let color = color_enabled();
     match cli.command {
         Command::Install(args) => run_install(&store, &desktop, &args, quiet),
         Command::List(args) => {
@@ -1203,6 +1274,50 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
         },
         Command::Doctor(args) => run_doctor(&store, &desktop, args.json, color),
+        // Not reached: `completions` is answered above, before the store
+        // exists. It delegates rather than answering empty, so the
+        // exhaustive arm cannot silently print nothing if that ever changes.
+        Command::Completions(args) => run_completions(args.shell),
+    }
+}
+
+/// Print the completion script for one shell to stdout (#49).
+///
+/// Generation is static and self-contained: the script is derived from the
+/// very same [`cellar_command`] the binary parses with, so it cannot
+/// describe a command, flag, or enumerated value that has been renamed —
+/// the definition is the single source. Nothing is read from the tree, and
+/// no subprocess is spawned, so the script stays a static script.
+///
+/// The product goes to stdout and nothing else does: there is no narration
+/// to silence and no color to strip (the script is plain text by nature,
+/// which also means `--quiet` and `NO_COLOR` are already satisfied).
+///
+/// `try_generate`, not `generate`: a closed stdout (`cellar completions bash
+/// | head`) is the reader's choice, not a failure, and the panic inside
+/// `generate` would break the same rule `--help`'s rendering already keeps
+/// (see `handle_clap_error`). A broken pipe exits 0; any other write failure
+/// is an operation error, exit 1.
+fn run_completions(shell: clap_complete::Shell) -> anyhow::Result<ExitCode> {
+    use clap_complete::Generator as _;
+    use std::io::Write as _;
+
+    let mut command = cellar_command();
+    // The two steps `generate` does before writing: name the binary (the
+    // script registers itself under it) and materialize the auto-generated
+    // help/version args, so the emitted surface is the built one.
+    let name = command.get_name().to_owned();
+    command.set_bin_name(name);
+    command.build();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match shell
+        .try_generate(&command, &mut out)
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -2429,6 +2544,8 @@ mod tests {
             vec!["cellar", "runner", "install", "proton", "9.0", "-q"],
             vec!["cellar", "runner", "list", "-q"],
             vec!["cellar", "doctor", "-q"],
+            vec!["cellar", "completions", "-q", "bash"],
+            vec!["cellar", "-q", "completions", "zsh"],
         ] {
             let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("parse: {e}"));
             assert!(cli.quiet, "the flag parses everywhere");
@@ -2449,6 +2566,7 @@ mod tests {
             vec!["cellar", "prefix", "create", "--version"],
             vec!["cellar", "runner", "install", "--version"],
             vec!["cellar", "doctor", "--version"],
+            vec!["cellar", "completions", "--version"],
         ] {
             let err = Cli::try_parse_from(argv).expect_err("--version displays, it does not parse");
             assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion, "{err}");
@@ -2474,6 +2592,7 @@ mod tests {
             vec!["cellar", "runner"],
             vec!["cellar", "runner", "install"],
             vec!["cellar", "desktop"],
+            vec!["cellar", "completions"],
         ] {
             let err = Cli::try_parse_from(argv).expect_err("bare invocation");
             assert_eq!(
@@ -3236,6 +3355,82 @@ mod tests {
     #[test]
     fn unknown_kind_is_a_usage_error() {
         assert!(Cli::try_parse_from(["cellar", "install", "x.exe", "--kind", "app"]).is_err());
+    }
+
+    #[test]
+    fn parses_completions_with_a_shell_and_rejects_an_unknown_one() {
+        // The static generator's whole argument (#49): one shell, taken
+        // from `clap_complete::Shell`'s own vocabulary, so the argument
+        // completes its values and an unknown one is a usage error (exit 2
+        // through `handle_clap_error`, pinned in tests/completions.rs).
+        for (shell, expected) in [
+            ("bash", clap_complete::Shell::Bash),
+            ("elvish", clap_complete::Shell::Elvish),
+            ("fish", clap_complete::Shell::Fish),
+            ("zsh", clap_complete::Shell::Zsh),
+        ] {
+            let cli = Cli::try_parse_from(["cellar", "completions", shell])
+                .unwrap_or_else(|e| panic!("parse completions {shell}: {e}"));
+            let Command::Completions(args) = cli.command else {
+                panic!("unexpected command");
+            };
+            assert_eq!(args.shell, expected);
+        }
+        let err =
+            Cli::try_parse_from(["cellar", "completions", "nope"]).expect_err("unknown shell");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue, "{err}");
+        assert!(
+            err.to_string().contains("possible values"),
+            "the rejection lists the shells that work: {err}"
+        );
+    }
+
+    #[test]
+    fn the_completable_vocabularies_are_the_parsers_own_lists() {
+        // Value completion is free with the static generator, but a second
+        // hand-kept list would drift from the parser — so the lists the
+        // script offers are the `ALL` consts sitting next to the `FromStr`
+        // impls they mirror, and this pins that both ends still agree.
+        for kind in AppKind::ALL {
+            assert_eq!(
+                AppKind::from_str(kind.as_str()).expect("ALL round-trips"),
+                kind
+            );
+        }
+        for kind in ArtifactKind::ALL {
+            assert_eq!(
+                ArtifactKind::from_str(kind.as_str()).expect("ALL round-trips"),
+                kind
+            );
+        }
+        // The offered values are what clap was told they are: the built
+        // command's own possible-values list, read back from the definition
+        // the completion script is generated from.
+        let mut command = cellar_command();
+        command.build();
+        let install = command
+            .find_subcommand_mut("install")
+            .expect("install subcommand");
+        let values = |id: &str| -> Vec<String> {
+            install
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .expect("the flag is defined")
+                .get_possible_values()
+                .iter()
+                .map(|value| value.get_name().to_owned())
+                .collect()
+        };
+        assert_eq!(
+            values("artifact"),
+            ArtifactKind::ALL.map(ArtifactKind::as_str),
+            "--artifact completes the artifact vocabulary"
+        );
+        assert_eq!(
+            values("kind"),
+            AppKind::ALL.map(AppKind::as_str),
+            "--kind completes the kind vocabulary"
+        );
     }
 
     #[test]

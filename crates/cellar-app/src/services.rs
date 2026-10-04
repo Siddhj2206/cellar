@@ -129,6 +129,13 @@ pub enum ArtifactKind {
 }
 
 impl ArtifactKind {
+    /// Every artifact kind, in the flag vocabulary — the same strings
+    /// [`ArtifactKind::as_str`] emits and [`FromStr`] accepts. The single
+    /// list a consumer that must enumerate the vocabulary (the CLI's shell
+    /// completions, #49) reads, so no second list can drift from the
+    /// parser's.
+    pub const ALL: [Self; 3] = [Self::Standalone, Self::Installer, Self::Archive];
+
     /// The flag/choice vocabulary (`standalone`, `installer`, `archive`)
     /// — the same strings [`FromStr`] accepts, so prompting and parsing
     /// can never drift.

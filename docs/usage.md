@@ -210,6 +210,28 @@ every entry and prints how many it repaired (`Repaired N stale launcher entries`
 `cellar doctor` flags the dead ones if you haven't run it yet. An app whose file is damaged (see
 Doctor) is left untouched until you repair it, so its entry is reported as kept but unrepaired.
 
+## Shell completion — `cellar completions <shell>`
+
+Print the completion script to stdout and put it where your shell looks:
+
+```bash
+cellar completions bash > ~/.local/share/bash-completion/completions/cellar   # bash-completion
+cellar completions zsh > ~/.zsh/completions/_cellar                             # any dir on $fpath
+cellar completions fish > ~/.config/fish/completions/cellar.fish
+cellar completions elvish > ~/.config/elvish/lib/cellar.elv                    # then `use cellar`
+cellar completions powershell >> $PROFILE                                      # then `. cellar.ps1`
+```
+
+Reload the shell afterwards (`exec bash`, `exec zsh`, `source` the fish file) and tab completion
+covers every command, subcommand, and flag. Values complete too: `cellar install --artifact <TAB>`
+offers `standalone`, `installer`, `archive`, `--kind` offers `game`, `tool`, and the path arguments
+complete filenames.
+
+The script is **static** — generated from the CLI definition and nothing else. App slugs do not
+complete: `cellar launch <TAB>` would need the script to read your installed apps and shell back
+into Cellar, which would make it slow on a large tree, so it stays out for now. Slug-aware
+completion is possible later as an opt-in per shell, with the plain script staying the default.
+
 ## Doctor — `cellar doctor`
 
 Five sections, in order: **tree health**, **exe integrity**, **runner integrity**, **plan
@@ -234,6 +256,8 @@ scriptable health check.
   contractual and documented in [`cli-json.md`](cli-json.md).
 - Color appears only on a terminal without `NO_COLOR`; piped stdout is always plain.
 - `-h/--help` and `--version` work on every command; help leads with examples.
+- `cellar completions <shell>` prints a completion script to stdout (see above). It is not a data
+  command: there is no `--json` shape for it.
 
 ## Where Cellar keeps its files
 

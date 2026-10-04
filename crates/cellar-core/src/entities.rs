@@ -127,6 +127,15 @@ impl AppKind {
     }
 }
 
+impl AppKind {
+    /// Every kind, in the flag vocabulary — the same strings
+    /// [`AppKind::as_str`] emits and [`FromStr`] accepts. The single list a
+    /// consumer that must enumerate the vocabulary (the CLI's shell
+    /// completions, #49) reads, so no second list can drift from the
+    /// parser's.
+    pub const ALL: [Self; 2] = [Self::Game, Self::Tool];
+}
+
 impl std::str::FromStr for AppKind {
     type Err = String;
 
