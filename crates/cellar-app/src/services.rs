@@ -162,6 +162,13 @@ impl FromStr for ArtifactKind {
 /// with the fix where the pipeline defines one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
+    /// No entry is registered under this slug. `uninstall` speaks the same
+    /// vocabulary `launch` already does — the fix clause, not a leaked tree
+    /// path (#45). `launch`'s equivalent stays
+    /// [`LaunchError::AppNotFound`], which needs a plan, not an uninstall.
+    AppNotFound {
+        slug: String,
+    },
     Storage(StorageError),
     /// The installer's plan could not be built, spawned, or captured — the
     /// launch pipeline's taxonomy (the installer running but failing is
@@ -208,6 +215,10 @@ impl From<DesktopError> for InstallError {
 impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AppNotFound { slug } => write!(
+                f,
+                "no app '{slug}' is registered — register it with `cellar install <path>`"
+            ),
             Self::Storage(error) => write!(f, "{error}"),
             Self::Launch(error) => write!(f, "{error}"),
             Self::InstallerFailed { code, signal } => match (code, signal) {
@@ -699,8 +710,16 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             return Err(StorageError::Invalid(format!("invalid app slug {slug:?}")).into());
         }
         // The app's entry is needed for the cleanup — the entry and icon
-        // are derived from it.
-        let app = self.storage.load_app(slug)?;
+        // are derived from it. An unknown slug is this command's own
+        // failure, named in the presentation vocabulary (#45) rather than
+        // surfacing `not found: …/apps/<slug>.toml` — a path the user never
+        // typed and cannot act on.
+        let app = self.storage.load_app(slug).map_err(|err| match err {
+            StorageError::NotFound(_) => InstallError::AppNotFound {
+                slug: slug.to_owned(),
+            },
+            other => InstallError::Storage(other),
+        })?;
         self.storage.delete_app(slug)?;
         self.desktop.remove_entry(&app)?;
         Ok(())
@@ -2898,10 +2917,25 @@ mod tests {
             ["warpinator"],
             "exactly the requested entry is gone"
         );
-        assert!(matches!(
+        assert_eq!(
             service.uninstall("balatro"),
-            Err(InstallError::Storage(StorageError::NotFound(_)))
-        ));
+            Err(InstallError::AppNotFound {
+                slug: "balatro".to_owned()
+            }),
+            "uninstalling it twice is this command's own failure (#45)"
+        );
+        let spoken = service
+            .uninstall("balatro")
+            .expect_err("already removed")
+            .to_string();
+        assert!(
+            spoken.contains("register it with `cellar install"),
+            "and it speaks launch's vocabulary, not a leaked tree path: {spoken}"
+        );
+        assert!(
+            !spoken.contains("apps/") && !spoken.contains(".toml"),
+            "no tree path in the message the user reads: {spoken}"
+        );
         assert!(matches!(
             service.uninstall("../escape"),
             Err(InstallError::Storage(StorageError::Invalid(_)))

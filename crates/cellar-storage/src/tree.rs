@@ -237,8 +237,11 @@ impl TreeStore {
     /// a skipped, doctor-flagged entry, never a rewrite (ADR 0001).
     pub(crate) fn read_envelope<T: DeserializeOwned>(path: &Path) -> Result<T, StorageError> {
         let text = fs::read_to_string(path).map_err(|e| io_err(path, &e))?;
-        let meta: FileMeta =
-            toml::from_str(&text).map_err(|_| StorageError::Invalid(path.display().to_string()))?;
+        // `Invalid`'s payload is a whole sentence (#45), so the parse
+        // failures name the file and what is wrong with it rather than
+        // handing the renderer a bare path.
+        let meta: FileMeta = toml::from_str(&text)
+            .map_err(|e| StorageError::Invalid(unparseable(path, "header", &e)))?;
         if meta.schema_version != SCHEMA_VERSION {
             return Err(StorageError::Invalid(format!(
                 "{}: schema version {} (the tree reads {SCHEMA_VERSION})",
@@ -246,7 +249,7 @@ impl TreeStore {
                 meta.schema_version
             )));
         }
-        toml::from_str(&text).map_err(|_| StorageError::Invalid(path.display().to_string()))
+        toml::from_str(&text).map_err(|e| StorageError::Invalid(unparseable(path, "body", &e)))
     }
 
     /// Write an entity atomically: `schema_version` header + TOML body via a
@@ -674,6 +677,15 @@ impl Storage for TreeStore {
     fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError> {
         crate::installer::inventory(&self.root)
     }
+}
+
+/// A whole sentence for a tree file whose TOML does not parse (#45):
+/// `<path>: unparseable <what> (<detail>)`. `what` distinguishes the
+/// schema header from the entity body, since both are TOML and a user
+/// hand-editing `prefixes/x/prefix.toml` needs to know which half is
+/// broken.
+fn unparseable(path: &Path, what: &str, error: &toml::de::Error) -> String {
+    format!("{}: unparseable {what} ({error})", path.display())
 }
 
 /// Map a filesystem error at `path` onto the storage taxonomy: `NotFound`
