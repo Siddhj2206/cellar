@@ -200,6 +200,15 @@ requires `--dry-run` (usage error otherwise); nothing spawns.
 `cwd` is omitted when the plan needs none; `wrappers` lists the chain outermost-first with the
 serde-default capitalized tags: `"Display"` (gamescope) → `"Container"` (umu) → `"RuntimeEnv"`.
 
+## Commands with no JSON shape
+
+Not every command has one, and `cellar completions <shell>` (#49) is the deliberate case: its
+product is a shell completion script on stdout, so there is no `--json` flag to offer and nothing to
+document here. Adding `--json` to it would mean inventing a wrapper object around a script nobody
+parses. Every other non-data command (`prefix create`, `prefix delete`, `install`, `uninstall`,
+`desktop sync`, `runner install`) behaves the same way — it narrates or acts, and the shapes above
+cover the commands that emit data.
+
 ## Stability contract
 
 These shapes are contractual (ADR 0004): scripts may parse them. Fields are added over time;
