@@ -279,10 +279,7 @@ impl TreeStore {
             std::process::id(),
             TMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
-        let body = toml::to_string(data).map_err(|e| {
-            StorageError::Invalid(format!("cannot serialize {}: {e}", path.display()))
-        })?;
-        let contents = format!("schema_version = {SCHEMA_VERSION}\n\n{body}");
+        let contents = Self::envelope_contents(path, data)?;
         let result = (|| -> std::io::Result<()> {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(contents.as_bytes())?;
@@ -296,6 +293,19 @@ impl TreeStore {
             let _ = fs::remove_file(&tmp);
         }
         result.map_err(|e| io_err(path, &e))
+    }
+
+    /// The on-disk text of one entity: the `schema_version` header plus the
+    /// TOML body. Shared by the temp+rename upsert and the exclusive
+    /// claim, so a claimed entry is byte-identical to a saved one.
+    fn envelope_contents<T: Serialize + ?Sized>(
+        path: &Path,
+        data: &T,
+    ) -> Result<String, StorageError> {
+        let body = toml::to_string(data).map_err(|e| {
+            StorageError::Invalid(format!("cannot serialize {}: {e}", path.display()))
+        })?;
+        Ok(format!("schema_version = {SCHEMA_VERSION}\n\n{body}"))
     }
 
     /// The prefix entry inside one directory, or `Invalid` when the file
@@ -539,6 +549,48 @@ impl Storage for TreeStore {
         Self::require_valid_slug("app", &app.slug)?;
         self.ensure_tree()?;
         Self::write_envelope(&self.app_file(&app.slug), app)
+    }
+
+    fn claim_app(&self, app: &AppEntry) -> Result<(), StorageError> {
+        Self::require_valid_slug("app", &app.slug)?;
+        self.ensure_tree()?;
+        let file = self.app_file(&app.slug);
+        let contents = Self::envelope_contents(&file, app)?;
+        // The exclusive create *is* the claim (#60): `create_new` fails
+        // when the slug was taken since the caller's dedupe snapshot, so
+        // two processes registering the same display name can no longer
+        // collapse onto one file with no error anywhere. This is the
+        // primitive `create_prefix` already uses for its directory.
+        let mut handle = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+        {
+            Ok(handle) => handle,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StorageError::Exists(file.display().to_string()));
+            }
+            Err(err) => return Err(io_err(&file, &err)),
+        };
+        // The claim is held and the file is ours alone, so a failure past
+        // this point is undone rather than left squatting the slug. Only a
+        // hard crash between here and `sync` leaves anything behind: an
+        // empty entry file, which degrades to the skipped-and-doctor-
+        // flagged state the tree already models for hand-edit damage
+        // (ADR 0001), never to a lost entry.
+        if let Err(err) = handle
+            .write_all(contents.as_bytes())
+            .and_then(|()| handle.sync_all())
+        {
+            drop(handle);
+            let _ = fs::remove_file(&file);
+            return Err(io_err(&file, &err));
+        }
+        drop(handle);
+        // The new directory entry must reach the disk, or a power cut
+        // reverts the claim to absent and the next registration re-uses a
+        // name that was already handed out (#62).
+        cellar_core::durability::sync_parent_dir(&file).map_err(|e| io_err(&file, &e))
     }
 
     fn delete_app(&self, slug: &str) -> Result<(), StorageError> {
@@ -817,6 +869,21 @@ mod tests {
     fn store(tag: &str) -> (TreeStore, PathBuf) {
         let root = temp_root(tag);
         (TreeStore::new(root.clone()), root)
+    }
+
+    /// A minimal entry for the claim tests; only the slug and exe matter
+    /// to the storage layer.
+    fn entry_for(slug: &str) -> AppEntry {
+        AppEntry {
+            slug: slug.to_owned(),
+            exe: PathBuf::from(format!("/games/{slug}.exe")),
+            kind: AppKind::Game,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        }
     }
 
     fn file_text(root: &Path, relative: &str) -> String {
@@ -1556,6 +1623,123 @@ mod tests {
             "concurrent creates must dedupe, never collide"
         );
         assert_eq!(store.list_prefixes()?.len(), writers);
+        Ok(())
+    }
+
+    /// The #60 regression at the storage layer: a lost claim is *reported*,
+    /// never an overwrite, and re-deduping after the loss hands out a
+    /// distinct file. Before the claim, `save_app`'s temp+rename
+    /// overwrote unconditionally, so 8 concurrent registrations of one
+    /// display name all succeeded onto a single file.
+    ///
+    /// The retry lives in the app service (`claim_slug`), so this drives
+    /// the same loop the service does rather than asserting a policy the
+    /// storage layer does not own.
+    #[test]
+    fn a_lost_claim_reports_exists_and_the_retry_takes_a_new_file() -> Result<(), StorageError> {
+        let (store, _) = store("claim-retry");
+        let mut first = entry_for("mygame");
+        store.claim_app(&first)?;
+        // The second writer's first attempt loses.
+        assert!(
+            matches!(store.claim_app(&first), Err(StorageError::Exists(_))),
+            "the incumbent's slug must report Exists, not clobber"
+        );
+        // Re-dedupe against the live slug set, as the service does.
+        let taken: std::collections::BTreeSet<String> =
+            store.list_app_slugs()?.into_iter().collect();
+        first.slug = cellar_core::slug::dedupe_slug("mygame", &taken);
+        store.claim_app(&first)?;
+        assert_eq!(first.slug, "mygame-2");
+        assert_eq!(store.list_apps()?.len(), 2, "both entries must survive");
+        Ok(())
+    }
+
+    /// The concurrency property that matters: writers racing for one slug,
+    /// each re-deduping on a lost claim, end up with distinct files and no
+    /// errors — the shape `concurrent_creates_dedupe_atomically` pins for
+    /// prefixes, applied to entries.
+    #[test]
+    fn concurrent_claims_dedupe_to_distinct_files() -> Result<(), StorageError> {
+        let (store, _) = store("concurrent-claim");
+        let writers = 8;
+        let mut handles = Vec::new();
+        for _ in 0..writers {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut entry = entry_for("mygame");
+                loop {
+                    match store.claim_app(&entry) {
+                        Ok(()) => return entry.slug,
+                        Err(StorageError::Exists(_)) => {}
+                        Err(err) => panic!("claim: {err}"),
+                    }
+                    let taken: std::collections::BTreeSet<String> = store
+                        .list_app_slugs()
+                        .unwrap_or_else(|e| panic!("slugs: {e}"))
+                        .into_iter()
+                        .collect();
+                    entry.slug = cellar_core::slug::dedupe_slug("mygame", &taken);
+                }
+            }));
+        }
+        let mut claimed: Vec<String> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_else(|e| panic!("join: {e:?}")))
+            .collect();
+        claimed.sort();
+        let mut expected: Vec<String> = (0..writers)
+            .map(|i| {
+                if i == 0 {
+                    "mygame".to_owned()
+                } else {
+                    format!("mygame-{}", i + 1)
+                }
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            claimed, expected,
+            "concurrent claims must dedupe, never collide"
+        );
+        assert_eq!(
+            store.list_apps()?.len(),
+            writers,
+            "every registration must survive — no lost update"
+        );
+        Ok(())
+    }
+
+    /// A claimed entry is byte-identical to a saved one: same header, same
+    /// body. The claim bypasses `write_envelope`, so this pins that it did
+    /// not quietly invent a second on-disk shape.
+    #[test]
+    fn claim_matches_the_saved_shape() -> Result<(), StorageError> {
+        let (claimed_store, claimed_root) = store("claim-shape");
+        claimed_store.claim_app(&entry_for("shape"))?;
+        let (saved_store, saved_root) = store("claim-shape-saved");
+        saved_store.save_app(&entry_for("shape"))?;
+        assert_eq!(
+            file_text(&claimed_root, "apps/shape.toml"),
+            file_text(&saved_root, "apps/shape.toml"),
+            "a claimed entry must serialize exactly like a saved one"
+        );
+        Ok(())
+    }
+
+    /// An invalid slug is rejected before any filesystem work, on the
+    /// claim as on every other storage entry point.
+    #[test]
+    fn claim_validates_the_slug_first() -> Result<(), StorageError> {
+        let (store, _) = store("claim-validate");
+        let mut bad = entry_for("Not A Slug!");
+        assert!(matches!(
+            store.claim_app(&bad),
+            Err(StorageError::Invalid(_))
+        ));
+        bad.slug = "ok".to_owned();
+        store.claim_app(&bad)?;
+        assert_eq!(store.list_app_slugs()?, vec!["ok".to_owned()]);
         Ok(())
     }
 
