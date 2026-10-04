@@ -113,8 +113,8 @@ game's, and pass through untouched.
 `missing-exe` means the registered executable was deleted or moved on disk — re-register it or
 uninstall the entry.
 
-`cellar uninstall <slug>` removes the entry and its launcher integration. **Cellar never deletes
-the app's own files.**
+`cellar uninstall <slug>` removes the entry, its per-app overrides, and the app's launcher entry and
+cached icon. **Cellar never deletes the app's own files** — they stay until you remove them.
 
 ## Prefixes — `cellar prefix`
 
@@ -249,8 +249,12 @@ uninstalling removes exactly that app's file.
 A few glossary-level behaviors are specified but not built yet — described here so expectations are
 honest:
 
-- **Uninstall** currently removes the entry only. Running the app's own Windows uninstaller, and
-  offering prefix deletion when the last app goes away, are designed but not implemented.
+- **Uninstall** currently removes the entry, its overrides, and its launcher entry and icon. Running
+  the app's own Windows uninstaller, and offering prefix deletion when the last app goes away, are
+  designed but not implemented.
+- **A prefix's `windows_version` default** is stored and shown by `prefix list`, but no launch plan
+  reads it — the plan is identical with or without it. There is no flag for it: hand-edit
+  `prefixes/<slug>/prefix.toml`, and nothing changes today (#54).
 - **MangoHud** exists as a wrapper concept in the design but has no implementation yet; only the
   umu container and gamescope wrappers are active.
 - **DXVK/VKD3D components**, a GUI presentation, and further runner support are future work — see
