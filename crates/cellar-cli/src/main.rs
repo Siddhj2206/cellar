@@ -528,21 +528,92 @@ fn styled(text: &str, code: &str, color: bool) -> String {
 /// -windowed --dry-run` LAUNCHES the game and passes it `--dry-run`. The
 /// user asked for a plan preview and got the opposite, silently.
 ///
-/// This looks for Cellar's own flags (`--dry-run`, `-n`, `--detach`,
-/// `--json`) inside that swallowed region. Finding one is not a guess that
-/// the user meant the flag — it is a certainty that the flag did not work,
-/// and the safe reading is refusal with guidance: put Cellar's flags first,
-/// or separate them with `--` when the app really does take that token.
+/// Finding one of Cellar's own flags in that region is not a guess that the
+/// user meant the flag — it is a certainty that the flag did not work, and
+/// the safe reading is refusal with guidance: put Cellar's flags first, or
+/// separate them with `--` when the app really does take that token.
 ///
 /// It is deliberately narrow. Unknown hyphen tokens (`-windowed`,
 /// `--fullscreen`) are ordinary game arguments and pass untouched, and a
-/// game that genuinely takes `--json` still gets it via `--`. Nothing is
-/// reordered or guessed — the command refuses and shows both orderings.
-fn swallowed_cellar_flag(args: &[String]) -> Option<&str> {
-    const CELLAR_FLAGS: [&str; 4] = ["--dry-run", "-n", "--detach", "--json"];
+/// game that genuinely takes `--json` still gets it via `--` — so a `--`
+/// anywhere on the command line (`separated`) disables the check
+/// outright.
+///
+/// The vocabulary comes from clap itself rather than a hand-kept list: a
+/// flag added to `LaunchArgs` later is guarded the day it lands, instead of
+/// silently becoming the next `-windowed --quiet` that launches a game the
+/// user asked to preview.
+fn swallowed_cellar_flag(args: &[String], separated: bool) -> Option<&str> {
+    if separated {
+        return None;
+    }
+    let flags = cellar_flag_tokens();
     args.iter()
-        .find(|arg| CELLAR_FLAGS.contains(&arg.as_str()))
+        .find(|arg| is_cellar_flag(arg, &flags))
         .map(String::as_str)
+}
+
+/// Cellar's own flag spellings on `launch`: the long and short forms of
+/// every non-positional argument, read from the built command. That
+/// includes the global `-q/--quiet` and the `-h/--help` / `-V/--version`
+/// clap adds — all of which the issue's "Cellar's own flags" covers, and
+/// all of which a hand-written list would miss (verified: `cellar launch
+/// game -windowed --quiet` parsed to `args=["-windowed","--quiet"]` with
+/// `quiet=false`, i.e. silently launched and narrated).
+fn cellar_flag_tokens() -> Vec<String> {
+    let mut command = cellar_command();
+    // `build` materializes the auto-generated help/version args and
+    // propagates the globals into the subcommand.
+    command.build();
+    let Some(launch) = command.find_subcommand_mut("launch") else {
+        return Vec::new();
+    };
+    let mut tokens = Vec::new();
+    for arg in launch.get_arguments() {
+        if arg.is_positional() {
+            continue;
+        }
+        if let Some(long) = arg.get_long() {
+            tokens.push(format!("--{long}"));
+        }
+        if let Some(short) = arg.get_short() {
+            tokens.push(format!("-{short}"));
+        }
+    }
+    tokens
+}
+
+/// Would clap have read this token as one of Cellar's flags had its scan
+/// still been running?
+///
+/// - an exact spelling (`--detach`) is a flag;
+/// - `--dry-run=true` is the same flag with an attached value;
+/// - a single-hyphen cluster is only read as flags when its FIRST letter
+///   is one of Cellar's shorts, which is exactly clap's own rule. That
+///   keeps `-nd` (cluster: `-n -d`) guarded while leaving `-windowed`
+///   alone — its leading `w` is not Cellar's, so the token is the game's.
+fn is_cellar_flag(arg: &str, flags: &[String]) -> bool {
+    let token = arg.split_once('=').map_or(arg, |(name, _)| name);
+    if flags.iter().any(|flag| flag == token) {
+        return true;
+    }
+    let Some(cluster) = token.strip_prefix('-') else {
+        return false;
+    };
+    let mut chars = cluster.chars();
+    chars
+        .next()
+        .is_some_and(|first| flags.contains(&format!("-{first}")))
+}
+
+/// Did the user separate Cellar's flags from the app's arguments with a
+/// `--` separator? Read from the raw argv, because clap consumes the
+/// separator and `LaunchArgs` cannot see it: `cellar launch game -- -windowed
+/// --dry-run` parses to `args=["-windowed","--dry-run"]`, byte-identical to
+/// the swallowed-flag case, so the guard needs the argv to tell "the user
+/// meant that for the game" from "clap ate my flag".
+fn separator_used() -> bool {
+    std::env::args_os().any(|token| token == "--")
 }
 
 /// One narration line — the informational output `--quiet` silences
@@ -1199,19 +1270,28 @@ fn run_launch(store: &TreeStore, args: &LaunchArgs) -> anyhow::Result<ExitCode> 
     // own flags — `cellar launch game -windowed --dry-run` would launch the
     // game and hand it `--dry-run` (#39). Refuse rather than do the opposite
     // of what was asked; the guard names both working orderings.
-    if let Some(swallowed) = swallowed_cellar_flag(&args.args) {
-        let error = anyhow::anyhow!(
-            "'{swallowed}' after the app arguments is taken as an argument for the app, \
-             not as a Cellar flag — put Cellar's flags before the app's arguments \
+    // Once a hyphen-leading value is consumed, clap stops reading Cellar's
+    // own flags — `cellar launch game -windowed --dry-run` would launch the
+    // game and hand it `--dry-run` (#39). Refuse rather than do the opposite
+    // of what was asked; the guard names both working orderings. A `--`
+    // anywhere on the line means the user already separated the two, so
+    // there is nothing to catch.
+    if let Some(swallowed) = swallowed_cellar_flag(&args.args, separator_used()) {
+        // A usage error, in ADR 0004's vocabulary: the user mistyped an
+        // ordering, so exit 2 like every other usage failure rather than 1
+        // (which is reserved for operation errors, and is the code the
+        // game's own exit may collide with). No desktop notification — #63's
+        // notifications are for launch failures, and this is not one: a
+        // launcher click passes no app arguments at all, so it cannot reach
+        // this branch.
+        eprintln!(
+            "cellar: '{swallowed}' after the app arguments is taken as an argument for the \
+             app, not as a Cellar flag — put Cellar's flags before the app's arguments \
              (cellar launch {} {swallowed} …) or separate them with `--` \
              (cellar launch {} -- {swallowed})",
-            args.app,
-            args.app
+            args.app, args.app
         );
-        // A launcher click runs this exact code with stderr detached (#63),
-        // so the refusal must reach the desktop too or it vanishes.
-        notify_launch_failure(&error.to_string());
-        return Err(error);
+        return Ok(ExitCode::from(2));
     }
     if args.dry_run {
         // Pre-plan phases only: resolve → check → plan, pure and
@@ -3071,32 +3151,100 @@ mod tests {
             };
             parsed
         };
-        for flag in ["--dry-run", "-n", "--detach", "--json"] {
+        // Every flag `launch` accepts must be caught when it lands in the
+        // app's arguments — including the ones a hand-written list forgot.
+        for flag in [
+            "--dry-run",
+            "-n",
+            "--detach",
+            "--json",
+            "--quiet",
+            "-q",
+            "--help",
+            "-h",
+            "--version",
+            "-V",
+        ] {
             let args = parse(&["-windowed", flag]);
             assert!(
                 !args.dry_run && !args.detach && !args.json,
                 "{flag} after an app arg must NOT be taken as Cellar's flag"
             );
             assert_eq!(
-                swallowed_cellar_flag(&args.args),
+                swallowed_cellar_flag(&args.args, false),
                 Some(flag),
-                "…and the guard must see it in the swallowed region"
+                "…and the guard must see {flag} in the swallowed region"
+            );
+        }
+        // The written forms clap would have accepted but a literal
+        // comparison misses: a value attached with `=`, and a short
+        // cluster.
+        for flag in ["--dry-run=true", "-nd", "-nq"] {
+            let args = parse(&["-windowed", flag]);
+            assert_eq!(
+                swallowed_cellar_flag(&args.args, false),
+                Some(flag),
+                "{flag} is Cellar's flag in a form the guard must still read"
             );
         }
         // The narrowness that keeps this from being a guessing game:
         // ordinary game arguments pass, including ones that look nothing
-        // like a flag.
-        assert_eq!(swallowed_cellar_flag(&["-windowed".to_owned()]), None);
-        assert_eq!(swallowed_cellar_flag(&["--fullscreen".to_owned()]), None);
+        // like a flag, and one whose letters contain a Cellar short.
+        for game_arg in ["-windowed", "--fullscreen", "-window", "-dx11"] {
+            assert_eq!(
+                swallowed_cellar_flag(&[game_arg.to_owned()], false),
+                None,
+                "{game_arg} is the game's, leading letter included"
+            );
+        }
         assert_eq!(
-            swallowed_cellar_flag(&["-windowed".to_owned(), "1920x1080".to_owned()]),
+            swallowed_cellar_flag(&["-windowed".to_owned(), "1920x1080".to_owned()], false),
             None,
             "a positional game argument is not a flag"
+        );
+        // The `--` escape hatch the guard's own message recommends: a game
+        // that genuinely takes `--json` must still be launchable.
+        assert_eq!(
+            swallowed_cellar_flag(&["-windowed".to_owned(), "--json".to_owned()], true),
+            None,
+            "a `--` separator means every token after it was meant for the app"
         );
         // The flags-first ordering the guard points at still works.
         let first = parse(&["--dry-run", "-windowed"]);
         assert!(first.dry_run, "flags before app args parse as Cellar's");
         assert_eq!(first.args, ["-windowed"], "…and the app keeps its own");
+    }
+
+    #[test]
+    fn the_guard_covers_every_flag_launch_accepts() {
+        // The mirror of the hand-kept-list bug: the guard derives its
+        // vocabulary from the clap definition, so a flag added to `launch`
+        // later cannot silently become the next swallowed-and-ignored one.
+        // If this test fails after adding a flag, the guard needs no edit —
+        // this assertion is what says so.
+        let flags = cellar_flag_tokens();
+        for expected in [
+            "--dry-run",
+            "-n",
+            "--detach",
+            "--json",
+            "--quiet",
+            "-q",
+            "--help",
+            "-h",
+            "--version",
+            "-V",
+        ] {
+            assert!(
+                flags.iter().any(|flag| flag == expected),
+                "{expected} is accepted by `launch` but the guard does not know it: {flags:?}"
+            );
+        }
+        // And the app's own positionals are not in the vocabulary.
+        assert!(
+            !flags.iter().any(|flag| flag == "app" || flag == "args"),
+            "positionals are not flags: {flags:?}"
+        );
     }
 
     #[test]

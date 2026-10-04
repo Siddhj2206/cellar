@@ -97,10 +97,15 @@ bugs.
 
 **Order matters.** Because app arguments may start with a hyphen, Cellar stops reading its own flags
 at the first one: in `cellar launch game -windowed --dry-run`, the `--dry-run` is an argument *for
-the game*, so the game would launch instead of printing a plan. Rather than do the opposite of what
-you asked, Cellar refuses and names both orderings — put Cellar's flags first
-(`cellar launch game --dry-run -windowed`), or separate them with `--`
-(`cellar launch game -- -windowed --dry-run`) when the app really does take that token.
+the game*. Rather than launch a game you asked to preview, Cellar refuses (exit 2) and names both
+orderings — put Cellar's flags first (`cellar launch game --dry-run -windowed`), or separate them
+with `--` (`cellar launch game -- -windowed --dry-run`) when the app really does take that token. A
+`--` anywhere on the line is taken at its word, so the second form launches the game with
+`--dry-run` as its own argument.
+
+The refusal covers every flag `launch` accepts — `--dry-run`/`-n`, `--detach`, `--json`, the global
+`-q`/`--quiet`, and `-h`/`--help` and `-V`/`--version`. Arguments that are not one of those are the
+game's, and pass through untouched.
 
 ## Listing and removing — `cellar list`, `cellar uninstall`
 

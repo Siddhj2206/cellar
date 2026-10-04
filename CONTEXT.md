@@ -51,7 +51,7 @@ The Windows-side removal program for an app, recorded in the prefix's registry (
 _Avoid_: uninstall program, remover
 
 **CLI contract**:
-The presentation's locked surface (ADR 0004, surface sweep #36): the standard flag set with consistent semantics (`-q/--quiet` global, `--json` on the data commands, `--no-input` and `-n/--dry-run` where they mean something, `--version`/`--help` on every command), examples-first help, "Did you mean?" suggestions for unknown commands and flags, exit codes 0 success / 1 operation error / 2 usage with `launch` propagating the game's code raw, and plain output under `NO_COLOR` or pipes. The `--json` shapes are contractual — see `docs/cli-json.md`.
+The presentation's locked surface (ADR 0004, surface sweep #36): the standard flag set with consistent semantics (`-q/--quiet` global, `--json` on the data commands, `--no-input` and `-n/--dry-run` where they mean something, `--version`/`--help` on every command), examples-first help, "Did you mean?" suggestions for unknown commands and flags, exit codes 0 success / 1 operation error / 2 usage with `launch` propagating the game's code raw, and plain output under `NO_COLOR` or pipes. Because app arguments may begin with a hyphen, a `launch` flag placed after one is taken as the app's argument; Cellar refuses that ordering with exit 2 rather than launch the app the preview was meant to replace, and a `--` separator means the app's arguments were intended (#39). The `--json` shapes are contractual — see `docs/cli-json.md`.
 
 **Launch**:
 The act of running an AppEntry through its launch plan. Running an exe that is already registered launches it directly — it never re-enters the install flow; an explicit re-install action starts a new InstallSession instead.
