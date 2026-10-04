@@ -92,9 +92,24 @@ pub enum StorageError {
     /// Hand-edited files degrade to a skipped entry flagged by doctor —
     /// never silently overwritten (ADR 0001).
     Invalid(String),
-    /// The requested node does not exist.
+    /// The requested node does not exist. The payload is the path the
+    /// adapter touched — true and complete *at this layer*, where the path
+    /// is the only fact available. It is deliberately NOT the vocabulary a
+    /// user should read: a command that knows what the user named translates
+    /// this into its own domain variant (`LaunchError::AppNotFound`,
+    /// `InstallError::AppNotFound`, `InstallError::ArtifactMissing`,
+    /// `PrefixError::PrefixNotFound`), so an ordinary "that isn't there"
+    /// never reaches a terminal as `not found: <tree path>` (#45).
+    ///
+    /// A raw path *is* right in one case — the path the user typed in (an
+    /// install artifact, a manual `--add`) — and those call sites carry a
+    /// path of the user's own, not the tree's layout.
     NotFound(String),
-    /// The node already exists (slug clash without dedupe).
+    /// The node already exists (slug clash without dedupe). Same discipline
+    /// as [`StorageError::NotFound`]: truthful here, translated by whichever
+    /// command reports it. As of #45 nothing in the workspace constructs it
+    /// — the dedupe domain resolves a slug clash instead of reporting one
+    /// — so it carries no user-facing string today.
     Exists(String),
     /// A shared-pipeline artifact failure — the managed-installer pipeline
     /// (fetch, checksum, extraction, layout, probe): the artifact could not
@@ -115,6 +130,9 @@ impl fmt::Display for StorageError {
             // as "invalid file at invalid app slug …".
             Self::Config(what) | Self::Invalid(what) => write!(f, "{what}"),
             Self::Io(path) => write!(f, "I/O failure at {path}"),
+            // The path stays: at this layer it is the whole fact (#45). The
+            // user-facing form is built above, by the command that knows what
+            // the user actually named.
             Self::NotFound(path) => write!(f, "not found: {path}"),
             Self::Exists(path) => write!(f, "already exists: {path}"),
             Self::Artifact(what) => write!(f, "artifact failure: {what}"),
@@ -175,6 +193,50 @@ mod tests {
                 "the frame is gone (#45): {rendered}"
             );
         }
+    }
+
+    /// AC (#45): `NotFound` keeps naming the path *at the storage
+    /// layer*, deliberately — the path is the only fact an adapter has. The
+    /// sweep's contract is that nothing above this layer lets one reach a
+    /// terminal untranslated, which the companion tests in `cellar-app` /
+    /// `cellar-launch` pin per command.
+    ///
+    /// Pinned here so the decision is explicit rather than accidental: a
+    /// future edit that "helpfully" reworded this to hide the path would
+    /// make every adapter's error lie about which node was missing, and
+    /// would leave the command-level translations looking like stringly
+    /// edits of a message that no longer says anything.
+    #[test]
+    fn not_found_stays_truthful_at_the_storage_layer() {
+        assert_eq!(
+            StorageError::NotFound("/…/cellar/prefixes/games".to_owned()).to_string(),
+            "not found: /…/cellar/prefixes/games",
+            "the adapter knows only the path it touched"
+        );
+    }
+
+    /// AC (#45): the already-exists half of the sweep has nothing to
+    /// translate. `create_prefix` claims its slug with `create_dir` and
+    /// *retries* the dedupe on `AlreadyExists`, and every save is an
+    /// overwrite — so as of this sweep `StorageError::Exists` has no
+    /// construction site anywhere in the workspace, and no ordinary "that
+    /// already exists" outcome reaches a user as `already exists: <path>`.
+    /// (That absence is a finding from grepping the call sites, not
+    /// something a unit test can assert; what is pinned here is the payload
+    /// contract an adapter may rely on, so the variant is not quietly
+    /// reworded to hide the path the way a command-level translation does.)
+    #[test]
+    fn already_exists_names_its_path_for_the_adapters_that_report_one() {
+        // The dedupe domain is where "already exists" goes instead:
+        // `prefix create games` twice yields `games` and `games-2`, and
+        // `register_one` dedupes the app slug against every file stem. Both
+        // are successes, not errors — a slug clash is resolved, never
+        // reported.
+        assert_eq!(
+            StorageError::Exists("/…/cellar/apps/balatro.toml".to_owned()).to_string(),
+            "already exists: /…/cellar/apps/balatro.toml",
+            "the node it collided with is named, as at the storage layer"
+        );
     }
 }
 
