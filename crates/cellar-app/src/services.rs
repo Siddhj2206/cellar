@@ -171,6 +171,17 @@ pub enum InstallError {
     AppNotFound {
         slug: String,
     },
+    /// The artifact path the user gave is not there. This is the one
+    /// not-found where a raw path *is* the right thing to show: the path is
+    /// the user's own input, echoed back exactly as typed so they can see
+    /// which of several paths Cellar took (a script's variable, a glob, a
+    /// `--add` from the review) — the storage layer's `NotFound(<tree
+    /// path>)` would name a path they never wrote and cannot act on (#45).
+    /// The fix clause is advice, not a command: no command installs a file
+    /// that does not exist.
+    ArtifactMissing {
+        path: PathBuf,
+    },
     Storage(StorageError),
     /// The installer's plan could not be built, spawned, or captured — the
     /// launch pipeline's taxonomy (the installer running but failing is
@@ -229,6 +240,17 @@ impl fmt::Display for InstallError {
                 "no app '{slug}' is registered — nothing to uninstall; \
                  `cellar list` shows what is"
             ),
+            // #45: the third member of the "subject as the user typed it"
+            // family. A path, not a slug — hence no quotes — and the fix is
+            // advice rather than a command, because there is no Cellar
+            // command that installs a file which is not on disk.
+            Self::ArtifactMissing { path } => {
+                write!(
+                    f,
+                    "no such file: {} — check the path you gave",
+                    path.display()
+                )
+            }
             Self::Storage(error) => write!(f, "{error}"),
             Self::Launch(error) => write!(f, "{error}"),
             Self::InstallerFailed { code, signal } => match (code, signal) {
@@ -328,7 +350,18 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         // The file-exists preflight every branch shares; the shape check is
         // branch-specific (an archive may be any regular file — the content
         // decides, `NotAnArchive`).
-        let canonical = self.storage.canonicalize_exe(path)?;
+        let canonical = self
+            .storage
+            .canonicalize_exe(path)
+            .map_err(|err| match err {
+                // #45: the user's own artifact path, named back exactly as
+                // typed — not the tree path the storage layer could only
+                // report.
+                StorageError::NotFound(_) => InstallError::ArtifactMissing {
+                    path: path.to_path_buf(),
+                },
+                other => InstallError::Storage(other),
+            })?;
         if artifact != ArtifactKind::Archive && !is_exe(&canonical) {
             return Err(StorageError::Invalid(format!(
                 "{}: not a Windows executable — only .exe files are installed \
@@ -452,8 +485,20 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         // before anything is written.
         let mut planned: Vec<(PathBuf, String)> = Vec::new();
         let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut plan = |exe: &Path, label: &str| -> Result<(), StorageError> {
-            let canonical = self.storage.canonicalize_exe(exe)?;
+        let mut plan = |exe: &Path, label: &str| -> Result<(), InstallError> {
+            // A `NotFound` here is one of the review's own inputs (a kept
+            // candidate or a manual `--add`) that is not on disk — the same
+            // [`InstallError::ArtifactMissing`] the session's own path gets,
+            // in the same vocabulary (#45).
+            let canonical = self
+                .storage
+                .canonicalize_exe(exe)
+                .map_err(|err| match err {
+                    StorageError::NotFound(_) => InstallError::ArtifactMissing {
+                        path: exe.to_path_buf(),
+                    },
+                    other => InstallError::Storage(other),
+                })?;
             if !seen.insert(canonical.clone()) {
                 return Ok(());
             }
@@ -461,7 +506,8 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             if base.is_empty() {
                 return Err(StorageError::Invalid(format!(
                     "cannot form an app slug from {label:?}"
-                )));
+                ))
+                .into());
             }
             planned.push((canonical, base));
             Ok(())
@@ -1150,6 +1196,50 @@ fn is_exe(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
 }
 
+/// Failures of the prefix lifecycle (`cellar prefix …`, blueprint §8): this
+/// noun group's own vocabulary plus the storage taxonomy passed through —
+/// one error enum per use-case group, the [`InstallError`] /
+/// [`LaunchError`] precedent, so a command's message is built where the
+/// command's vocabulary lives rather than by the storage layer guessing a
+/// path it owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefixError {
+    /// No prefix occupies this slug. `prefix delete` names it in the
+    /// vocabulary `launch` and `uninstall` already established — the slug
+    /// the user typed, not `prefixes/<slug>/` under the tree root, which
+    /// they never wrote and cannot act on (#45). Its fix clause is its own
+    /// for the same reason `uninstall`'s is: the command was asked to remove
+    /// something, so the helpful next step is seeing what *does* exist —
+    /// here, of this noun group.
+    PrefixNotFound {
+        slug: String,
+    },
+    Storage(StorageError),
+}
+
+impl From<StorageError> for PrefixError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl fmt::Display for PrefixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // The `prefix delete` half of #45 — the third member of the one
+            // "subject as the user typed it" family (with
+            // `LaunchError::AppNotFound` and `InstallError::AppNotFound`).
+            Self::PrefixNotFound { slug } => write!(
+                f,
+                "no prefix '{slug}' exists — `cellar prefix list` shows what does"
+            ),
+            Self::Storage(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PrefixError {}
+
 /// Prefix lifecycle: create with slug naming and `-2` dedupe, list, delete
 /// with directory ownership (blueprint §6, ADR 0001).
 pub struct PrefixService<S: Storage> {
@@ -1166,31 +1256,36 @@ impl<S: Storage> PrefixService<S> {
     /// resulting slug is deduped against every existing prefix directory —
     /// including broken ones, so a hand-edited entry is never clobbered.
     /// Returns the created prefix with its final (deduped) slug.
-    pub fn create(&self, name: &str) -> Result<Prefix, StorageError> {
+    pub fn create(&self, name: &str) -> Result<Prefix, PrefixError> {
         let slug = slug::slugify(name);
         if slug.is_empty() {
-            return Err(StorageError::Invalid(format!(
-                "cannot form a prefix slug from {name:?}"
-            )));
+            return Err(
+                StorageError::Invalid(format!("cannot form a prefix slug from {name:?}")).into(),
+            );
         }
-        self.storage.create_prefix(&slug)
+        Ok(self.storage.create_prefix(&slug)?)
     }
 
     /// Every valid prefix in the tree. Invalid hand-edited entries are
     /// skipped here — the doctor flags them (ADR 0001).
-    pub fn list(&self) -> Result<Vec<Prefix>, StorageError> {
-        self.storage.list_prefixes()
+    pub fn list(&self) -> Result<Vec<Prefix>, PrefixError> {
+        Ok(self.storage.list_prefixes()?)
     }
 
     /// Delete a prefix and exactly its directory — never more (ADR 0001
-    /// ownership).
-    pub fn delete(&self, slug: &str) -> Result<(), StorageError> {
+    /// ownership). An unknown slug is this command's own failure: the
+    /// storage layer's `NotFound(<prefix dir path>)` is true and useless
+    /// here, so it is translated into the slug the user typed (#45).
+    pub fn delete(&self, slug: &str) -> Result<(), PrefixError> {
         if !slug::is_valid_slug(slug) {
-            return Err(StorageError::Invalid(format!(
-                "invalid prefix slug {slug:?}"
-            )));
+            return Err(StorageError::Invalid(format!("invalid prefix slug {slug:?}")).into());
         }
-        self.storage.delete_prefix(slug)
+        self.storage.delete_prefix(slug).map_err(|err| match err {
+            StorageError::NotFound(_) => PrefixError::PrefixNotFound {
+                slug: slug.to_owned(),
+            },
+            other => PrefixError::Storage(other),
+        })
     }
 }
 
@@ -1715,8 +1810,8 @@ fn damaged_slug_set<S: Storage>(
 mod tests {
     use super::{
         ArtifactKind, DesktopSync, DoctorFinding, DoctorService, InstallError, InstallOutcome,
-        InstallResult, InstallService, LaunchApp, PrefixService, RunnerService, Storage,
-        empty_chain,
+        InstallResult, InstallService, LaunchApp, PrefixError, PrefixService, RunnerService,
+        Storage, empty_chain,
     };
 
     use std::collections::{BTreeMap, BTreeSet};
@@ -1751,6 +1846,9 @@ mod tests {
         taken_app_slugs: Mutex<Vec<String>>,
         /// Prefix slugs whose file is broken (loads yield `Invalid`).
         broken_prefixes: Mutex<Vec<String>>,
+        /// Prefix slugs whose directory does not exist (`delete_prefix`
+        /// yields the real store's `NotFound` for these).
+        absent_prefixes: Mutex<Vec<String>>,
         canonicalized: Mutex<Vec<PathBuf>>,
         /// Exe paths that fail the launch check (canonicalize → `NotFound`).
         missing_exes: Mutex<Vec<PathBuf>>,
@@ -1776,6 +1874,7 @@ mod tests {
                 apps: Mutex::new(Vec::new()),
                 taken_app_slugs: Mutex::new(Vec::new()),
                 broken_prefixes: Mutex::new(Vec::new()),
+                absent_prefixes: Mutex::new(Vec::new()),
                 canonicalized: Mutex::new(Vec::new()),
                 missing_exes: Mutex::new(Vec::new()),
                 candidates: Mutex::new(Vec::new()),
@@ -1848,6 +1947,13 @@ mod tests {
 
         fn mark_broken_prefix(&self, slug: &str) {
             self.broken_prefixes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(slug.to_owned());
+        }
+
+        fn mark_prefix_absent(&self, slug: &str) {
+            self.absent_prefixes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(slug.to_owned());
@@ -1941,6 +2047,19 @@ mod tests {
         }
 
         fn delete_prefix(&self, slug: &str) -> Result<(), StorageError> {
+            // The real store's shape: a slug with no directory fails with
+            // `NotFound(<prefix dir path>)` — the leak #45 translates.
+            if self
+                .absent_prefixes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|absent| absent == slug)
+            {
+                return Err(StorageError::NotFound(
+                    self.prefix_base.join(slug).display().to_string(),
+                ));
+            }
             self.deleted
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2076,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn create_slugifies_the_name_before_storage() -> Result<(), StorageError> {
+    fn create_slugifies_the_name_before_storage() -> Result<(), PrefixError> {
         let mock = MockStorage::new(healthy_tree());
         let service = PrefixService::new(mock);
         let created = service.create("My Games")?;
@@ -2094,14 +2213,75 @@ mod tests {
     }
 
     #[test]
-    fn delete_validates_before_storage_and_passes_valid_slugs() -> Result<(), StorageError> {
+    fn delete_validates_before_storage_and_passes_valid_slugs() -> Result<(), PrefixError> {
         let mock = MockStorage::new(healthy_tree());
         let service = PrefixService::new(mock);
-        assert!(service.delete("../escape").is_err());
+        assert!(matches!(
+            service.delete("../escape"),
+            Err(PrefixError::Storage(StorageError::Invalid(_)))
+        ));
         assert!(service.storage.deleted().is_empty());
         service.delete("my-games")?;
         assert_eq!(service.storage.deleted(), ["my-games"]);
         Ok(())
+    }
+
+    #[test]
+    fn delete_of_an_unknown_prefix_names_the_slug_not_the_tree_path() {
+        // #45: `prefix delete` used to surface the storage layer's
+        // `NotFound(<prefix dir path>)` verbatim — `not found:
+        // /…/cellar/prefixes/my-games`, a path the user never typed and
+        // cannot act on. The command owns this failure, so the command names
+        // the subject and its fix.
+        let mock = MockStorage::new(healthy_tree());
+        mock.mark_prefix_absent("my-games");
+        let service = PrefixService::new(mock);
+        assert_eq!(
+            service.delete("my-games"),
+            Err(PrefixError::PrefixNotFound {
+                slug: "my-games".to_owned()
+            }),
+            "the slug the user typed, in this command's own variant"
+        );
+        let spoken = service
+            .delete("my-games")
+            .expect_err("nothing occupies that slug")
+            .to_string();
+        assert_eq!(
+            spoken, "no prefix 'my-games' exists — `cellar prefix list` shows what does",
+            "the vocabulary `launch` and `uninstall` established: a named \
+             subject and a fix that fits this command"
+        );
+        assert!(
+            !spoken.contains("/mock") && !spoken.contains("prefixes/"),
+            "no internal tree path in the message the user reads: {spoken}"
+        );
+        assert!(
+            service.storage.deleted().is_empty(),
+            "the failed delete removed nothing"
+        );
+    }
+
+    #[test]
+    fn prefix_errors_keep_the_rest_of_the_storage_taxonomy() {
+        // Only the ordinary "that isn't there" case is translated (#45): every
+        // other storage failure still reaches the user in the tree's own
+        // vocabulary — `create` cannot even report one today (it dedupes),
+        // and `Invalid` still names the user's own bad slug.
+        let mock = MockStorage::new(healthy_tree());
+        let service = PrefixService::new(mock);
+        assert!(matches!(
+            service.create("!!!"),
+            Err(PrefixError::Storage(StorageError::Invalid(_)))
+        ));
+        assert_eq!(
+            PrefixError::Storage(StorageError::Invalid(
+                "invalid prefix slug \"Not A Slug!\"".to_owned()
+            ))
+            .to_string(),
+            "invalid prefix slug \"Not A Slug!\"",
+            "the passthrough is transparent, not re-framed"
+        );
     }
 
     #[test]
@@ -2360,6 +2540,54 @@ mod tests {
     }
 
     #[test]
+    fn install_of_a_missing_artifact_names_the_path_the_user_typed() {
+        // #45: `cellar install /no/such/file.exe` surfaced the storage
+        // layer's `not found: <path>`. This is the one not-found where the
+        // raw path is *right* — it is the user's own input, echoed back so
+        // they can see which of several paths Cellar took — but the framing
+        // is now the launch-style one: a named subject and its fix.
+        let mock = MockStorage::new(healthy_tree());
+        mock.mark_exe_missing(Path::new("/no/such/file.exe"));
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
+        assert_eq!(
+            service.install(
+                Path::new("/no/such/file.exe"),
+                "default",
+                None,
+                Some(AppKind::Game),
+                ArtifactKind::Standalone,
+            ),
+            Err(InstallError::ArtifactMissing {
+                path: PathBuf::from("/no/such/file.exe"),
+            }),
+            "the path as given, in the session's own variant"
+        );
+        let spoken = service
+            .install(
+                Path::new("/no/such/file.exe"),
+                "default",
+                None,
+                Some(AppKind::Game),
+                ArtifactKind::Standalone,
+            )
+            .expect_err("the artifact is not on disk")
+            .to_string();
+        assert_eq!(
+            spoken, "no such file: /no/such/file.exe — check the path you gave",
+            "the fix is advice, not a command: no Cellar command installs a \
+             file that is not on disk"
+        );
+        assert!(
+            !spoken.contains("cellar/") && !spoken.contains(".toml"),
+            "still no tree path in the message the user reads: {spoken}"
+        );
+        assert!(
+            service.storage.created().is_empty(),
+            "a missing artifact creates no prefix — the preflight comes first"
+        );
+    }
+
+    #[test]
     fn install_rejects_bad_inputs_before_touching_the_tree() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
         let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
@@ -2612,9 +2840,14 @@ mod tests {
                 Some(AppKind::Game),
             )
             .expect_err("the missing add aborts the review");
-        assert!(
-            matches!(&err, InstallError::Storage(StorageError::NotFound(_))),
-            "the missing exe is named: {err}"
+        // The missing exe is named as the *user's own* `--add` path, not as
+        // the tree path the storage layer could only report (#45).
+        assert_eq!(
+            err,
+            InstallError::ArtifactMissing {
+                path: PathBuf::from("/prefix/drive_c/gone.exe"),
+            },
+            "the missing add is named in the install session's own vocabulary"
         );
         assert!(
             service.storage.list_apps()?.is_empty(),
