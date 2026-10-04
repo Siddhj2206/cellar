@@ -772,6 +772,11 @@ fn discard_download(artifact: &Path) {
 /// Returns whether this call RESUMED a partial (`from > 0`): a resumed
 /// download that later fails verification earns one automatic fresh
 /// restart, not a "corrupt download" verdict (#59).
+///
+/// A terminal fetch failure keeps a part that carries bytes — that is the
+/// resume material a later run continues from. A part with nothing in it
+/// carries none, so it goes with its sidecar: the disposable cache never
+/// accumulates empty debris from attempts that never landed a byte (#46).
 fn download_resumable(
     source: &ArtifactSource,
     artifact: &Path,
@@ -803,11 +808,25 @@ fn download_resumable(
         from = 0;
     }
     let resumed = from > 0;
-    let fresh_validator = source
-        .stream_from(from, &mut out, progress, validator.as_deref())
-        .map_err(|error| {
-            StorageError::Artifact(format!("download to {}: {error}", part.display()))
-        })?;
+    let fresh_validator = match source.stream_from(from, &mut out, progress, validator.as_deref()) {
+        Ok(fresh_validator) => fresh_validator,
+        Err(error) => {
+            // The landed byte count decides whether the part is resume
+            // material or debris (#46). `metadata` on the open handle is
+            // the truth about what the failed attempts wrote.
+            let landed = out.metadata().map_or(0, |meta| meta.len());
+            if landed == 0 {
+                // Closed before the unlink so the removal works on
+                // platforms that refuse to delete an open file.
+                drop(out);
+                discard_part_and_meta(&part);
+            }
+            return Err(StorageError::Artifact(format!(
+                "download to {}: {error}",
+                part.display()
+            )));
+        }
+    };
     match fresh_validator {
         Some(value) => {
             let _ = fs::write(&meta, value);
@@ -2269,6 +2288,67 @@ mod tests {
                 .len(),
             1,
             "no retry for a fatal status"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_terminal_failure_that_landed_no_bytes_leaves_no_part_behind() {
+        // AC (#46): a failed attempt that never wrote a byte leaves nothing
+        // in the disposable cache — an empty `.part` can never resume, and
+        // the next run truncates it anyway.
+        let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("empty-part");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.tar.gz");
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect_err("404 is fatal");
+        assert!(
+            !artifact.with_extension("part").exists(),
+            "no empty part in the cache"
+        );
+        assert!(
+            !part_meta_path(&artifact.with_extension("part")).exists(),
+            "no sidecar either"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_terminal_failure_keeps_a_part_that_can_still_resume() {
+        // AC (#46): the other half — bytes on disk are resume material for
+        // the next run (#59), so a fatal failure must not throw them away.
+        let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("kept-part");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.tar.gz");
+        let partial = artifact.with_extension("part");
+        // An earlier interrupted run left seven bytes plus the freshness
+        // sidecar that makes them resumable.
+        fs::write(&partial, b"1234567").expect("seed partial");
+        fs::write(
+            PathBuf::from(format!("{}.meta", partial.display())),
+            "\"etag-keep\"",
+        )
+        .expect("seed sidecar");
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect_err("404 is fatal");
+        assert_eq!(
+            fs::metadata(&partial).expect("the partial survives").len(),
+            7,
+            "the resumable bytes are kept for the next attempt"
         );
         drop(server); // the accept loop runs until process exit — joining would block forever
     }
