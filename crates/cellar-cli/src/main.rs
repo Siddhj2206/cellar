@@ -1365,7 +1365,7 @@ fn review_and_register(
     // The summary's builder ends lines with `\n` (it is a multi-line
     // report); `narrate` appends its own, so the trailing newline is
     // trimmed here — no blank line between the summary and the prompt.
-    let summary = registration_summary(&registrations, &outcome.prefix_slug);
+    let summary = registration_summary(&registrations, outcome, store);
     narrate(quiet, format_args!("{}", summary.trim_end()));
     // The #63 write-time honesty pass: an entry whose launch plan cannot
     // build right now says so — ordinary narration, no prompting.
@@ -1517,11 +1517,40 @@ fn select_kept(candidates: &[Candidate], args: &InstallArgs) -> anyhow::Result<V
 /// created vs updated — and the next command per entry. Zero
 /// registrations is a valid session outcome (an empty review); it says so
 /// plainly rather than pretending.
-fn registration_summary(registrations: &[InstallResult], prefix_slug: &str) -> String {
+///
+/// The empty outcome reads differently depending on WHY it is empty (#43):
+/// candidates that were found but not confirmed get the review-and-re-run
+/// line, while an extraction that produced no candidates at all — the
+/// portable-zip case — names the directory to `--add` from instead of
+/// pointing at the same command that just found nothing.
+fn registration_summary(
+    registrations: &[InstallResult],
+    session: &InstallOutcome,
+    store: &TreeStore,
+) -> String {
     use std::fmt::Write;
 
+    let prefix_slug = &session.prefix_slug;
     let mut out = String::new();
     if registrations.is_empty() {
+        if session.candidates.is_empty() {
+            let drive_c = store.prefix_dir(prefix_slug).join("drive_c");
+            writeln!(
+                out,
+                "Registered nothing in prefix '{prefix_slug}' — the artifact left no Start \
+                 Menu/Desktop shortcut to register. Portable zips of bare exes usually do not."
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(out, "Name the exe yourself with --add <path>, e.g.").expect("write");
+            writeln!(
+                out,
+                "  cellar install <artifact> --prefix {prefix_slug} --artifact archive \
+                 --add {}/…/game.exe",
+                drive_c.display()
+            )
+            .expect("write");
+            return out;
+        }
         writeln!(
             out,
             "Registered nothing in prefix '{prefix_slug}' — no entries were confirmed; \
@@ -3717,6 +3746,53 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn archive_with_no_shortcuts_says_where_to_add_from() -> anyhow::Result<()> {
+        // #43: a portable zip of bare exes extracts and then ends in "no
+        // candidates". The summary must name the `--add` escape hatch and
+        // its directory — telling the user to re-run the same command that
+        // just found nothing is a dead end.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-archive-bare-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let bundle = root.join("bundle.zip");
+        build_zip(&bundle, &[("game/Game.exe", "MZ")]);
+        let code = run_install(
+            &store,
+            &test_desktop(&store),
+            &InstallArgs {
+                path: bundle,
+                prefix: None,
+                name: None,
+                // No `--kind`: a new entry takes the game default (#40),
+                // and this test is about the summary, not the kind.
+                kind: None,
+                artifact: Some(ArtifactKind::Archive),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+            false,
+        )?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            store.list_apps()?.is_empty(),
+            "zero candidates still registers nothing"
+        );
+        // The extracted exe is on disk — only the shortcut was missing.
+        assert!(
+            root.join("prefixes/default/drive_c/game/Game.exe")
+                .is_file(),
+            "the extraction itself succeeded"
+        );
+        Ok(())
+    }
+
     /// Build a ZIP with the given `(name, contents)` pairs — the CLI's
     /// mirror of the fixtures cellar-app owns (a shared harness crate stays
     /// out per the locked §4 graph); kept write→close so it cannot drift.
@@ -4650,12 +4726,23 @@ mod tests {
             },
             was_update: update,
         };
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: vec![Candidate {
+                exe: PathBuf::from("/prefix/drive_c/game-a.exe"),
+                label: "Game A".to_owned(),
+            }],
+            log_path: None,
+            artifact: None,
+        };
         let summary = registration_summary(
             &[
                 result("game-a", AppKind::Game, false),
                 result("game-b", AppKind::Game, true),
             ],
-            "default",
+            &outcome,
+            &TreeStore::new(PathBuf::from("/nonexistent-tree")),
         );
         assert!(
             summary.contains("Registered 1 entry in prefix 'default'"),
@@ -4669,10 +4756,31 @@ mod tests {
             summary.contains("cellar launch game-a") && summary.contains("cellar launch game-b"),
             "the next command per entry:\n{summary}"
         );
-        let empty = registration_summary(&[], "default");
+        let store = TreeStore::new(PathBuf::from("/nonexistent-tree"));
+        let declined = registration_summary(&[], &outcome, &store);
         assert!(
-            empty.contains("Registered nothing") && empty.contains("--keep"),
-            "an empty review is a plain outcome, not an error:\n{empty}"
+            declined.contains("Registered nothing") && declined.contains("--keep"),
+            "candidates found but none confirmed keeps the review line:\n{declined}"
+        );
+        // #43: an extraction that found nothing is a different dead end —
+        // re-running the same command would find nothing again, so the
+        // summary names the directory to `--add` from.
+        let barren = InstallOutcome {
+            candidates: Vec::new(),
+            ..outcome.clone()
+        };
+        let empty = registration_summary(&[], &barren, &store);
+        assert!(
+            empty.contains("Registered nothing"),
+            "zero candidates is still a plain outcome:\n{empty}"
+        );
+        assert!(
+            !empty.contains("--keep"),
+            "pointing at --keep/--keep-all with zero candidates is a dead end:\n{empty}"
+        );
+        assert!(
+            empty.contains("--add") && empty.contains("drive_c"),
+            "the manual-add escape hatch names its directory:\n{empty}"
         );
     }
 

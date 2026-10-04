@@ -71,6 +71,16 @@ Run it with:
   cellar launch game
 ```
 
+A portable zip of bare executables extracts fine but creates no shortcut, so discovery finds
+nothing to review. That summary names the directory to register from instead of sending you back
+to the same command:
+
+```
+Registered nothing in prefix 'default' — the artifact left no Start Menu/Desktop shortcut to register. Portable zips of bare exes usually do not.
+Name the exe yourself with --add <path>, e.g.
+  cellar install <artifact> --prefix default --artifact archive --add …/prefixes/default/drive_c/…/game.exe
+```
+
 Re-running `cellar install` on an already-registered exe updates that same entry (use `--name` to
 rename it; without `--name` the display name stays, and without `--kind` the entry's kind stays).
 
