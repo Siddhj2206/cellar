@@ -162,9 +162,11 @@ impl FromStr for ArtifactKind {
 /// with the fix where the pipeline defines one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
-    /// No entry is registered under this slug. `uninstall` speaks the same
-    /// vocabulary `launch` already does — the fix clause, not a leaked tree
-    /// path (#45). `launch`'s equivalent stays
+    /// No entry is registered under this slug. `uninstall` names the
+    /// failure in the vocabulary `launch` already established — an app the
+    /// user named, not a tree path they never typed (#45). Its fix clause
+    /// is its own: the command asked to remove something, so the helpful
+    /// next step is listing what exists. `launch`'s equivalent stays
     /// [`LaunchError::AppNotFound`], which needs a plan, not an uninstall.
     AppNotFound {
         slug: String,
@@ -215,9 +217,17 @@ impl From<DesktopError> for InstallError {
 impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // The `uninstall` half of #45: the vocabulary matches
+            // `LaunchError::AppNotFound` — same opening clause, so the two
+            // read as one language — but not its fix. `launch` wants the
+            // app to exist; `uninstall` was asked to remove something that
+            // is not there, so telling the user to register it is advice
+            // for the opposite intent. The action that helps is seeing
+            // what *is* registered.
             Self::AppNotFound { slug } => write!(
                 f,
-                "no app '{slug}' is registered — register it with `cellar install <path>`"
+                "no app '{slug}' is registered — nothing to uninstall; \
+                 `cellar list` shows what is"
             ),
             Self::Storage(error) => write!(f, "{error}"),
             Self::Launch(error) => write!(f, "{error}"),
@@ -2929,8 +2939,16 @@ mod tests {
             .expect_err("already removed")
             .to_string();
         assert!(
-            spoken.contains("register it with `cellar install"),
-            "and it speaks launch's vocabulary, not a leaked tree path: {spoken}"
+            spoken.contains("no app 'balatro' is registered")
+                && spoken.contains("nothing to uninstall"),
+            "and it speaks the vocabulary `launch` established, with a fix \
+             that fits this command: {spoken}"
+        );
+        assert!(
+            !spoken.contains("register it with"),
+            "not launch's fix — `uninstall` was asked to remove something, \
+             so telling the user to register it is advice for the opposite \
+             intent: {spoken}"
         );
         assert!(
             !spoken.contains("apps/") && !spoken.contains(".toml"),

@@ -241,7 +241,7 @@ impl TreeStore {
         // failures name the file and what is wrong with it rather than
         // handing the renderer a bare path.
         let meta: FileMeta = toml::from_str(&text)
-            .map_err(|e| StorageError::Invalid(unparseable(path, "header", &e)))?;
+            .map_err(|e| StorageError::Invalid(unparseable(path, Half::Header, &e)))?;
         if meta.schema_version != SCHEMA_VERSION {
             return Err(StorageError::Invalid(format!(
                 "{}: schema version {} (the tree reads {SCHEMA_VERSION})",
@@ -249,7 +249,8 @@ impl TreeStore {
                 meta.schema_version
             )));
         }
-        toml::from_str(&text).map_err(|e| StorageError::Invalid(unparseable(path, "body", &e)))
+        toml::from_str(&text)
+            .map_err(|e| StorageError::Invalid(unparseable(path, Half::Entity, &e)))
     }
 
     /// Write an entity atomically: `schema_version` header + TOML body via a
@@ -679,13 +680,32 @@ impl Storage for TreeStore {
     }
 }
 
-/// A whole sentence for a tree file whose TOML does not parse (#45):
-/// `<path>: unparseable <what> (<detail>)`. `what` distinguishes the
-/// schema header from the entity body, since both are TOML and a user
-/// hand-editing `prefixes/x/prefix.toml` needs to know which half is
-/// broken.
-fn unparseable(path: &Path, what: &str, error: &toml::de::Error) -> String {
-    format!("{}: unparseable {what} ({error})", path.display())
+/// Which half of a tree file a parse failure came from (#45).
+///
+/// The two parses are not two regions of the document — `FileMeta` parses
+/// the *whole* file and ignores unknown fields, so a TOML syntax error
+/// anywhere (body included) fails the header parse first, and a failure
+/// here means "the file does not even read as a tree file". [`Entity`] is
+/// reached only when the file parsed cleanly but is missing a required
+/// field or has one of the wrong type — the hand-edit damage a user is
+/// likelier to cause, and the one where naming the half helps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Half {
+    Header,
+    Entity,
+}
+
+/// A whole sentence for a tree file that does not parse (#45):
+/// `<path>: <what> (<detail>)`. The detail is the `toml` error verbatim —
+/// it carries the line and column, which is what a hand-editor needs.
+fn unparseable(path: &Path, half: Half, error: &toml::de::Error) -> String {
+    let what = match half {
+        Half::Header => {
+            "not readable as a tree file (a TOML syntax error, or a `schema_version` that is not a number)"
+        }
+        Half::Entity => "reads as TOML but is missing a required field, or one has the wrong type",
+    };
+    format!("{}: {what} ({error})", path.display())
 }
 
 /// Map a filesystem error at `path` onto the storage taxonomy: `NotFound`

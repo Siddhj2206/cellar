@@ -149,6 +149,33 @@ mod tests {
             "'file … is not a file' reads as written"
         );
     }
+
+    #[test]
+    fn every_invalid_payload_in_the_tree_reads_as_a_sentence() {
+        // The verbatim contract on `Invalid` is only as good as the payloads
+        // flowing into it, and nothing in the type enforces that (#45). This
+        // walks the real storage call sites through the real renderer: a
+        // payload that regresses to a bare path or a fragment fails here
+        // rather than in a user's terminal.
+        let sentences = [
+            "invalid app slug \"Not A Slug!\"",
+            "cannot form a prefix slug from \"###\"",
+            "/some/dir is not a file",
+            "/tmp/thing: unparseable header (bad TOML)",
+            "/tmp/prefix.toml: schema version 9 (the tree reads 1)",
+        ];
+        for payload in sentences {
+            let rendered = StorageError::Invalid(payload.to_owned()).to_string();
+            assert_eq!(
+                rendered, payload,
+                "rendered verbatim, so the payload must stand alone"
+            );
+            assert!(
+                !rendered.starts_with("invalid file at"),
+                "the frame is gone (#45): {rendered}"
+            );
+        }
+    }
 }
 
 /// Failures of the desktop integration port.
