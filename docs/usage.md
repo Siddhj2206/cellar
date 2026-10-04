@@ -239,6 +239,8 @@ honest:
 
 - **Uninstall** currently removes the entry only. Running the app's own Windows uninstaller, and
   offering prefix deletion when the last app goes away, are designed but not implemented.
+- **A prefix's `windows_version` default** is stored and shown by `prefix list`, but no launch plan
+  reads it — the plan is identical with or without it. Setting it changes nothing today (#54).
 - **MangoHud** exists as a wrapper concept in the design but has no implementation yet; only the
   umu container and gamescope wrappers are active.
 - **DXVK/VKD3D components**, a GUI presentation, and further runner support are future work — see

@@ -22,6 +22,8 @@ _Avoid_: category, type, genre
 A Cellar-managed Windows environment (a Wine prefix) that holds the defaults for every AppEntry inside it: runner, environment, graphics, Windows version. One prefix contains many AppEntries.
 _Avoid_: bottle, environment, container
 
+Which of those defaults the launch pipeline actually reads is a separate question from which ones the prefix stores. `runner` and `graphics` are consulted at launch; `windows_version` is **stored, displayed, and not yet read** — no launch plan changes because it is set (#54).
+
 **Override**:
 A per-AppEntry setting that replaces one of its prefix's defaults — including the AppEntry's own prefix binding, whose default is the prefix that registered it.
 _Avoid_: setting, option, assignment
@@ -35,7 +37,7 @@ The executable-finding step of an InstallSession: the prefix's Start Menu and De
 _Avoid_: scan, rescan, finder
 
 **Uninstall**:
-Removing an AppEntry: Cellar runs the app's Windows uninstaller when one is registered in the prefix, then deletes the entry and its overrides; without a registered uninstaller it degrades to entry removal only. Cellar deletes no files itself — the uninstaller cleans the app's files, or they stay. Uninstalling the last AppEntry in a prefix offers to delete the prefix too, which removes everything inside it.
+Removing an AppEntry: Cellar deletes the entry, its overrides, and its derived launcher integration. Cellar deletes no app files itself — the app's own files stay until the user removes them. Two halves of the fuller flow are **design intent, not current behavior**: running the app's Windows [Uninstaller](#uninstaller) when one is registered, and offering to delete the prefix when its last AppEntry goes (#44).
 _Avoid_: unregister, remove, delete
 
 **Doctor**:
