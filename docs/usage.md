@@ -71,6 +71,21 @@ Run it with:
   cellar launch game
 ```
 
+A portable zip of bare executables extracts fine but creates no shortcut, so discovery finds
+nothing to review. That summary names the directory to register from instead of sending you back
+to the same command:
+
+```
+Registered nothing in prefix 'default' — discovery found no executable in the prefix's Start Menu/Desktop areas, so there is nothing to review. A zip of bare exes extracts without writing any shortcut — the usual cause.
+Look at what the artifact left, then name the exe to register (repeat --add per exe):
+  ls '~/.local/share/cellar/prefixes/default/drive_c'
+  cellar install '/home/you/Downloads/bundle.zip' --prefix default --artifact archive --add '~/.local/share/cellar/prefixes/default/drive_c'/<the exe you picked>
+```
+
+The only placeholder is the exe itself — Cellar never discovered it, so it cannot name it. The rest
+is the session's own artifact path and the prefix's real directory, shell-quoted. An installer that
+leaves nothing behind gets the same shape with `--artifact installer` and its own explanation.
+
 Re-running `cellar install` on an already-registered exe updates that same entry (use `--name` to
 rename it; without `--name` the display name stays, and without `--kind` the entry's kind stays).
 

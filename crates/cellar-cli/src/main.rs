@@ -1433,7 +1433,15 @@ fn run_install(
             if let Some(log) = &outcome.log_path {
                 narrate(quiet, format_args!("output: {}", log.display()));
             }
-            review_and_register(store, &service, &outcome, args, interactive, quiet)?;
+            review_and_register(
+                store,
+                &service,
+                &outcome,
+                args,
+                ArtifactKind::Installer,
+                interactive,
+                quiet,
+            )?;
         }
         ArtifactKind::Archive => {
             narrate(
@@ -1444,7 +1452,15 @@ fn run_install(
                     outcome.prefix_slug
                 ),
             );
-            review_and_register(store, &service, &outcome, args, interactive, quiet)?;
+            review_and_register(
+                store,
+                &service,
+                &outcome,
+                args,
+                ArtifactKind::Archive,
+                interactive,
+                quiet,
+            )?;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -1462,9 +1478,13 @@ fn review_and_register(
     service: &InstallService<TreeStore, ResolverSet, DesktopService>,
     outcome: &InstallOutcome,
     args: &InstallArgs,
+    artifact: ArtifactKind,
     interactive: bool,
     quiet: bool,
 ) -> anyhow::Result<()> {
+    let keep_flags = KeepFlags {
+        any: !args.keep.is_empty() || args.keep_all,
+    };
     let decided = !args.keep.is_empty() || args.keep_all || !args.add.is_empty();
     let (keep, add) = if interactive && !decided {
         interactive_review(&outcome.candidates)?
@@ -1490,7 +1510,7 @@ fn review_and_register(
     // The summary's builder ends lines with `\n` (it is a multi-line
     // report); `narrate` appends its own, so the trailing newline is
     // trimmed here — no blank line between the summary and the prompt.
-    let summary = registration_summary(&registrations, &outcome.prefix_slug);
+    let summary = registration_summary(&registrations, outcome, store, artifact, &keep_flags);
     narrate(quiet, format_args!("{}", summary.trim_end()));
     // The #63 write-time honesty pass: an entry whose launch plan cannot
     // build right now says so — ordinary narration, no prompting.
@@ -1638,15 +1658,121 @@ fn select_kept(candidates: &[Candidate], args: &InstallArgs) -> anyhow::Result<V
     Ok(kept)
 }
 
+/// Whether the user passed a keep flag — kept as its own type because the
+/// summary's job is to tell the user when a flag of theirs had nothing to
+/// act on, and `--keep-all` over zero candidates is exactly that (#43).
+struct KeepFlags {
+    any: bool,
+}
+
+/// One path as a single shell word: single-quoted, so a data home or prefix
+/// containing a space cannot split the command the summary prints. Printed
+/// commands are meant to be pasted, so they are built to survive a paste.
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
+}
+
+/// The zero-candidate summary (#43): the session ran and its artifact left
+/// nothing for review, so this names where the artifact's output is and how
+/// to register an exe by hand — instead of pointing back at the command that
+/// just found nothing.
+///
+/// Discovery reads the Start Menu/Desktop areas, so an empty candidate list
+/// means the artifact left nothing there that resolves to an exe *inside the
+/// prefix*. That covers both "wrote no shortcut" (the portable-zip case) and
+/// "wrote a shortcut pointing elsewhere" (dangling or out-of-prefix targets),
+/// so the text says which is usual for the branch rather than asserting the
+/// cause.
+///
+/// The printed command is meant to be pasted: paths are shell-quoted, the
+/// artifact path is this session's own, and the one thing Cellar cannot name
+/// — the exe, which it never discovered — is the single bracketed placeholder.
+fn nothing_discovered_summary(
+    out: &mut String,
+    session: &InstallOutcome,
+    store: &TreeStore,
+    artifact: ArtifactKind,
+    keep_flags: &KeepFlags,
+) -> String {
+    use std::fmt::Write;
+
+    let prefix_slug = &session.prefix_slug;
+    let usual = match artifact {
+        ArtifactKind::Archive => {
+            "A zip of bare exes extracts without writing any shortcut — the usual cause."
+        }
+        ArtifactKind::Installer => {
+            "An installer that writes no shortcut, or whose shortcut targets resolve outside \
+             the prefix, leaves nothing here."
+        }
+        ArtifactKind::Standalone => "Nothing resolved to an executable inside the prefix.",
+    };
+    writeln!(
+        out,
+        "Registered nothing in prefix '{prefix_slug}' — discovery found no executable in the \
+         prefix's Start Menu/Desktop areas, so there is nothing to review. {usual}"
+    )
+    .expect("writing to a String cannot fail");
+    if keep_flags.any {
+        writeln!(
+            out,
+            "--keep/--keep-all had no candidates to apply to: nothing was discovered to keep."
+        )
+        .expect("write");
+    }
+    let artifact_flag = artifact.as_str();
+    let re_install = session
+        .artifact
+        .as_deref()
+        .map_or_else(|| format!("<{artifact_flag} path>"), shell_quote);
+    let drive_c = shell_quote(&store.prefix_drive_c(prefix_slug));
+    writeln!(
+        out,
+        "Look at what the artifact left, then name the exe to register (repeat --add per exe):"
+    )
+    .expect("write");
+    writeln!(out, "  ls {drive_c}").expect("write");
+    writeln!(
+        out,
+        "  cellar install {re_install} --prefix {prefix_slug} --artifact {artifact_flag} \
+         --add {drive_c}/<the exe you picked>"
+    )
+    .expect("write");
+    std::mem::take(out)
+}
+
 /// The session summary (blueprint §8 step 4): what was registered —
 /// created vs updated — and the next command per entry. Zero
 /// registrations is a valid session outcome (an empty review); it says so
 /// plainly rather than pretending.
-fn registration_summary(registrations: &[InstallResult], prefix_slug: &str) -> String {
+///
+/// The empty outcome reads differently depending on WHY it is empty (#43):
+/// candidates that were found but not confirmed get the review-and-re-run
+/// line, while a session that produced no candidates at all gets the
+/// directory to `--add` from instead of a pointer back at the command that
+/// just found nothing.
+///
+/// `outcome` carries what the summary needs to be honest about an empty
+/// review: the artifact branch (an archive and an installer fail to produce
+/// candidates for different reasons, so they get different explanations)
+/// and whether a keep flag was passed — `--keep-all` over an empty
+/// candidate list is a no-op, and saying nothing leaves the user thinking
+/// their flag worked.
+fn registration_summary(
+    registrations: &[InstallResult],
+    session: &InstallOutcome,
+    store: &TreeStore,
+    artifact: ArtifactKind,
+    keep_flags: &KeepFlags,
+) -> String {
     use std::fmt::Write;
 
+    let prefix_slug = &session.prefix_slug;
     let mut out = String::new();
     if registrations.is_empty() {
+        if session.candidates.is_empty() {
+            return nothing_discovered_summary(&mut out, session, store, artifact, keep_flags);
+        }
         writeln!(
             out,
             "Registered nothing in prefix '{prefix_slug}' — no entries were confirmed; \
@@ -3970,6 +4096,79 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn archive_with_no_shortcuts_says_where_to_add_from() -> anyhow::Result<()> {
+        // #43: a portable zip of bare exes extracts and then ends in "no
+        // candidates". The summary must name the `--add` escape hatch and
+        // its directory — telling the user to re-run the same command that
+        // just found nothing is a dead end.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-archive-bare-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let bundle = root.join("bundle.zip");
+        build_zip(&bundle, &[("game/Game.exe", "MZ")]);
+        let code = run_install(
+            &store,
+            &test_desktop(&store),
+            &InstallArgs {
+                path: bundle.clone(),
+                prefix: None,
+                name: None,
+                // No `--kind`: a new entry takes the game default (#40),
+                // and this test is about the summary, not the kind.
+                kind: None,
+                artifact: Some(ArtifactKind::Archive),
+                no_input: true,
+                keep: Vec::new(),
+                keep_all: false,
+                add: Vec::new(),
+            },
+            false,
+        )?;
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            store.list_apps()?.is_empty(),
+            "zero candidates still registers nothing"
+        );
+        // The extracted exe is on disk — only the shortcut was missing.
+        let extracted = root.join("prefixes/default/drive_c/game/Game.exe");
+        assert!(extracted.is_file(), "the extraction itself succeeded");
+        // And the directory the summary names is the one the exe is
+        // actually under. `run_install` narrates to stdout rather than
+        // returning, so this rebuilds the same summary against the same
+        // tree: what matters is that the path it prints is this path, not
+        // a plausible-looking string.
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: Vec::new(),
+            log_path: None,
+            artifact: Some(bundle.clone()),
+        };
+        let summary = registration_summary(
+            &[],
+            &outcome,
+            &store,
+            ArtifactKind::Archive,
+            &KeepFlags { any: true },
+        );
+        let drive_c = store.prefix_drive_c("default");
+        assert!(
+            summary.contains(&shell_quote(&drive_c)),
+            "the summary names the real drive_c:\n{summary}"
+        );
+        assert!(
+            extracted.starts_with(&drive_c),
+            "…and the extracted exe really is under it: {}",
+            extracted.display()
+        );
+        Ok(())
+    }
+
     /// Build a ZIP with the given `(name, contents)` pairs — the CLI's
     /// mirror of the fixtures cellar-app owns (a shared harness crate stays
     /// out per the locked §4 graph); kept write→close so it cannot drift.
@@ -4903,12 +5102,25 @@ mod tests {
             },
             was_update: update,
         };
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: vec![Candidate {
+                exe: PathBuf::from("/prefix/drive_c/game-a.exe"),
+                label: "Game A".to_owned(),
+            }],
+            log_path: None,
+            artifact: None,
+        };
         let summary = registration_summary(
             &[
                 result("game-a", AppKind::Game, false),
                 result("game-b", AppKind::Game, true),
             ],
-            "default",
+            &outcome,
+            &TreeStore::new(PathBuf::from("/nonexistent-tree")),
+            ArtifactKind::Archive,
+            &KeepFlags { any: false },
         );
         assert!(
             summary.contains("Registered 1 entry in prefix 'default'"),
@@ -4922,10 +5134,136 @@ mod tests {
             summary.contains("cellar launch game-a") && summary.contains("cellar launch game-b"),
             "the next command per entry:\n{summary}"
         );
-        let empty = registration_summary(&[], "default");
+        let store = TreeStore::new(PathBuf::from("/nonexistent-tree"));
+        let declined = registration_summary(
+            &[],
+            &outcome,
+            &store,
+            ArtifactKind::Archive,
+            &KeepFlags { any: false },
+        );
         assert!(
-            empty.contains("Registered nothing") && empty.contains("--keep"),
-            "an empty review is a plain outcome, not an error:\n{empty}"
+            declined.contains("Registered nothing") && declined.contains("--keep"),
+            "candidates found but none confirmed keeps the review line:\n{declined}"
+        );
+    }
+
+    #[test]
+    fn the_zero_candidate_summary_says_where_to_add_from() {
+        // #43: a session that found nothing is a different dead end —
+        // re-running the same command would find nothing again, so the
+        // summary names where the artifact's output is and how to register
+        // an exe by hand.
+        let store = TreeStore::new(PathBuf::from("/nonexistent-tree"));
+        let outcome = InstallOutcome {
+            prefix_slug: "default".to_owned(),
+            registrations: Vec::new(),
+            candidates: vec![Candidate {
+                exe: PathBuf::from("/prefix/drive_c/game-a.exe"),
+                label: "Game A".to_owned(),
+            }],
+            log_path: None,
+            artifact: None,
+        };
+        let barren = InstallOutcome {
+            candidates: Vec::new(),
+            artifact: Some(PathBuf::from("/downloads/my games/bundle.zip")),
+            ..outcome.clone()
+        };
+        let empty = registration_summary(
+            &[],
+            &barren,
+            &store,
+            ArtifactKind::Archive,
+            &KeepFlags { any: false },
+        );
+        assert!(
+            empty.contains("Registered nothing"),
+            "zero candidates is still a plain outcome:\n{empty}"
+        );
+        assert!(
+            !empty.contains("re-run `cellar install`"),
+            "pointing back at the command that just found nothing is the dead end \
+             this replaces:\n{empty}"
+        );
+        assert!(
+            empty.contains("--add") && empty.contains("drive_c"),
+            "the manual-add escape hatch names its directory:\n{empty}"
+        );
+        // The printed command is meant to be pasted: this session's own
+        // artifact path, quoted (the space here would otherwise split the
+        // argument), and its real drive_c.
+        assert!(
+            empty.contains("'/downloads/my games/bundle.zip'"),
+            "the artifact path is this session's own, shell-quoted:\n{empty}"
+        );
+        assert!(
+            empty.contains("--artifact archive"),
+            "…with the branch's own artifact flag, not a hardcoded one:\n{empty}"
+        );
+        // A keep flag over zero candidates had nothing to do — saying so is
+        // the difference between a no-op and a silent one.
+        let kept = registration_summary(
+            &[],
+            &barren,
+            &store,
+            ArtifactKind::Archive,
+            &KeepFlags { any: true },
+        );
+        assert!(
+            kept.contains("--keep/--keep-all had no candidates"),
+            "a --keep-all that could not apply says so:\n{kept}"
+        );
+        // The installer branch reaches the same place for different reasons
+        // and must not claim the portable-zip cause.
+        let installed = registration_summary(
+            &[],
+            &InstallOutcome {
+                candidates: Vec::new(),
+                ..outcome.clone()
+            },
+            &store,
+            ArtifactKind::Installer,
+            &KeepFlags { any: false },
+        );
+        assert!(
+            installed.contains("--artifact installer"),
+            "the installer re-runs as an installer:\n{installed}"
+        );
+        assert!(
+            !installed.contains("bare exes"),
+            "an installer session is not explained by a zip of bare exes:\n{installed}"
+        );
+    }
+
+    #[test]
+    fn the_zero_candidate_summary_names_this_sessions_own_artifact() {
+        // Split from the summary test above because it asserts a different
+        // thing: the printed command is pasteable. A path with a space in it
+        // is the whole point — `$XDG_DATA_HOME` is under the user's control,
+        // so an unquoted path silently splits into two arguments.
+        let store = TreeStore::new(PathBuf::from("/nonexistent tree"));
+        let session = InstallOutcome {
+            prefix_slug: "my games".to_owned(),
+            registrations: Vec::new(),
+            candidates: Vec::new(),
+            log_path: None,
+            artifact: Some(PathBuf::from("/downloads/bundle.zip")),
+        };
+        let summary = nothing_discovered_summary(
+            &mut String::new(),
+            &session,
+            &store,
+            ArtifactKind::Archive,
+            &KeepFlags { any: false },
+        );
+        assert!(
+            summary.contains("'/nonexistent tree/prefixes/my games/drive_c'"),
+            "the drive_c path is quoted whole:\n{summary}"
+        );
+        assert!(
+            summary.contains("--add '/nonexistent tree/prefixes/my games/drive_c'/"),
+            "…and the --add argument inherits the quoting:\n{summary}"
         );
     }
 

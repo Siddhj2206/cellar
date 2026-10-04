@@ -84,6 +84,16 @@ impl TreeStore {
         self.root.join("prefixes").join(slug)
     }
 
+    /// The `drive_c` root of one prefix — where an archive extracts and
+    /// where a `--add` path is rooted (ADR 0001's locked prefix layout).
+    /// Exposed as its own accessor because the extraction root is the tree's
+    /// rule, not presentation's: the app service extracts here, discovery
+    /// scans here, and a user told to `--add` from here needs the same path
+    /// the other two use.
+    pub fn prefix_drive_c(&self, slug: &str) -> PathBuf {
+        self.prefix_dir(slug).join("drive_c")
+    }
+
     /// The per-launch log directory (blueprint §7): a subdir of the
     /// disposable `cache/`, not a fifth top-level node — the doctor's
     /// directory sweep stays the four locked dirs (ADR 0001).
@@ -100,7 +110,7 @@ impl TreeStore {
     /// damage; discovery stays best-effort).
     fn menu_areas(&self, slug: &str) -> Vec<PathBuf> {
         const START_MENU: &str = "AppData/Roaming/Microsoft/Windows/Start Menu";
-        let drive_c = self.prefix_dir(slug).join("drive_c");
+        let drive_c = self.prefix_drive_c(slug);
         let mut areas = Vec::new();
         // Every user profile that exists — wine picks the user name; Cellar
         // must not guess which one an installer wrote to.
@@ -656,7 +666,7 @@ impl Storage for TreeStore {
         // once. Deterministic: areas in fixed order (sorted users,
         // per-user Desktop before Start Menu, then the all-users menu),
         // entries sorted within each. Never auto-registers (blueprint §8).
-        let drive_c = self.prefix_dir(&prefix.slug).join("drive_c");
+        let drive_c = self.prefix_drive_c(&prefix.slug);
         let mut candidates = Vec::new();
         let mut seen = BTreeSet::new();
         for area in self.menu_areas(&prefix.slug) {
