@@ -772,6 +772,11 @@ fn discard_download(artifact: &Path) {
 /// Returns whether this call RESUMED a partial (`from > 0`): a resumed
 /// download that later fails verification earns one automatic fresh
 /// restart, not a "corrupt download" verdict (#59).
+///
+/// A terminal fetch failure keeps a part the next run can resume — bytes
+/// *and* the validator sidecar #59 needs. A part missing either carries
+/// nothing reusable, so it goes: the disposable cache never accumulates
+/// debris from attempts that never landed resumable bytes (#46).
 fn download_resumable(
     source: &ArtifactSource,
     artifact: &Path,
@@ -803,11 +808,36 @@ fn download_resumable(
         from = 0;
     }
     let resumed = from > 0;
-    let fresh_validator = source
-        .stream_from(from, &mut out, progress, validator.as_deref())
-        .map_err(|error| {
-            StorageError::Artifact(format!("download to {}: {error}", part.display()))
-        })?;
+    let fresh_validator = match source.stream_from(from, &mut out, progress, validator.as_deref()) {
+        Ok(fresh_validator) => fresh_validator,
+        Err(error) => {
+            // A `.part` is resume material only when the next run can
+            // actually resume it, and #59 resumes on bytes *plus* a
+            // validator sidecar — a sidecar-less part is truncated at the
+            // next attempt regardless of its length. So the keep/discard
+            // test is "resumable", not "non-empty" (#46): bytes a failed
+            // attempt wrote without a sidecar are debris, exactly like an
+            // empty part, because nothing will ever read them.
+            //
+            // A size that cannot be read at all keeps the part: unmeasured
+            // is not the same as empty, and deletion is the irreversible
+            // branch.
+            let resumable = match out.metadata() {
+                Ok(status) => status.len() > 0 && validator.is_some(),
+                Err(_) => true,
+            };
+            if !resumable {
+                // Closed before the unlink so the removal works on
+                // platforms that refuse to delete an open file.
+                drop(out);
+                discard_part_and_meta(&part);
+            }
+            return Err(StorageError::Artifact(format!(
+                "download to {}: {error}",
+                part.display()
+            )));
+        }
+    };
     match fresh_validator {
         Some(value) => {
             let _ = fs::write(&meta, value);
@@ -844,7 +874,16 @@ fn fetch_checksum(
         InstallProgress::Download { .. } => {}
         other => progress(other),
     };
-    let _ = source.stream_from(0, &mut out, &mut filtered, None)?;
+    // A failed fetch leaves the checksum file truncated or empty, and the
+    // next run re-creates it from scratch anyway — the same debris the
+    // `.part` fix removes, in the same directory nothing sweeps (#46).
+    if let Err(error) = source.stream_from(0, &mut out, &mut filtered, None) {
+        // Closed before the unlink so the removal also works where deleting
+        // an open file is refused.
+        drop(out);
+        let _ = fs::remove_file(&file);
+        return Err(error);
+    }
     let text = fs::read_to_string(&file).map_err(storage_io(&file))?;
     for line in text.lines() {
         // `sha512sum` output: `<hex>  <name>` (two spaces) or `<hex> *<name>`.
@@ -2269,6 +2308,95 @@ mod tests {
                 .len(),
             1,
             "no retry for a fatal status"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_terminal_failure_that_landed_no_bytes_leaves_no_part_behind() {
+        // AC (#46): a failed attempt that never wrote a byte leaves nothing
+        // in the disposable cache — an empty `.part` can never resume, and
+        // the next run truncates it anyway.
+        let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("empty-part");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.tar.gz");
+        let partial = artifact.with_extension("part");
+        // Seeded empty part *and* sidecar: an earlier attempt wrote the
+        // sidecar but no body byte. Asserting the sidecar is gone is only
+        // meaningful when one existed.
+        fs::write(&partial, b"").expect("seed empty part");
+        fs::write(part_meta_path(&partial), "\"etag-empty\"").expect("seed sidecar");
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect_err("404 is fatal");
+        assert!(!partial.exists(), "no empty part in the cache");
+        assert!(!part_meta_path(&partial).exists(), "no sidecar either");
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_terminal_failure_keeps_a_part_that_can_still_resume() {
+        // AC (#46): the other half — bytes on disk are resume material for
+        // the next run (#59), so a fatal failure must not throw them away.
+        let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("kept-part");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.tar.gz");
+        let partial = artifact.with_extension("part");
+        // An earlier interrupted run left seven bytes plus the freshness
+        // sidecar that makes them resumable.
+        fs::write(&partial, b"1234567").expect("seed partial");
+        fs::write(part_meta_path(&partial), "\"etag-keep\"").expect("seed sidecar");
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect_err("404 is fatal");
+        assert_eq!(
+            fs::metadata(&partial).expect("the partial survives").len(),
+            7,
+            "the resumable bytes are kept for the next attempt"
+        );
+        assert!(
+            part_meta_path(&partial).exists(),
+            "the sidecar survives too — without it the bytes are not resumable"
+        );
+        drop(server); // the accept loop runs until process exit — joining would block forever
+    }
+
+    #[test]
+    fn a_terminal_failure_discards_a_part_no_sidecar_can_resume() {
+        // AC (#46), the case a length-only rule gets wrong: bytes on disk
+        // are resume material only alongside the validator #59 resumes on.
+        // Without a sidecar the next attempt truncates the part anyway, so
+        // keeping it leaves debris nothing will ever read.
+        let responses = Arc::new(std::sync::Mutex::new(vec![status_response(404)]));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, server) = serve_scripted(responses.clone(), requests.clone());
+        let root = root("part-without-sidecar");
+        fs::create_dir_all(&root).unwrap();
+        let artifact = root.join("artifact.tar.gz");
+        let partial = artifact.with_extension("part");
+        // Seeded bytes with no sidecar — the pre-#59 leftover shape.
+        fs::write(&partial, b"1234567").expect("seed partial");
+        download_resumable(
+            &ArtifactSource::Http(format!("http://127.0.0.1:{port}/artifact")),
+            &artifact,
+            &mut |_| {},
+        )
+        .expect_err("404 is fatal");
+        assert!(
+            !partial.exists(),
+            "unresumable bytes go the way empty ones do"
         );
         drop(server); // the accept loop runs until process exit — joining would block forever
     }
