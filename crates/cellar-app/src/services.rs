@@ -23,6 +23,12 @@
 //! sections — tree health, exe integrity, runner integrity, plan
 //! buildable, and desktop integration (#57) — each pass/fail with a fix
 //! hint, read-only.
+//!
+//! #41 closes the gap between the two everyday surfaces a deleted prefix
+//! showed on: [`PrefixService::bound_entries`] is what `prefix delete`
+//! names before removing a prefix entries still bind to, and
+//! [`EntryStatus::PrefixBroken`] stops `list` from reporting such an entry
+//! as launchable when it is not.
 
 use cellar_core::Prefix;
 use cellar_core::entities::{AppEntry, AppKind, Candidate, GraphicsSelection, Overrides};
@@ -47,23 +53,34 @@ use std::str::FromStr;
 use crate::archive::{ArchiveError, extract_zip};
 
 /// The check-phase status of a registered entry (blueprint §7: the check
-/// phase applied entry-wide). This slice checks the registered exe's
-/// presence; the runner-integrity and wrapper checks land with the launch
-/// slice (#28).
+/// phase applied entry-wide). This slice checks the bound prefix's
+/// readability and the registered exe's presence; the runner-integrity and
+/// wrapper checks land with the launch slice (#28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryStatus {
     Ok,
     /// The registered exe is missing from disk (deleted or moved) — the
     /// blueprint §7 disposition: re-register or uninstall.
     ExeMissing,
+    /// The bound prefix cannot be read: its directory is gone (a deleted
+    /// prefix — #41) or its `prefix.toml` is unreadable hand-edit damage
+    /// (#51). `ok` lies about an entry that cannot launch at all, and this
+    /// outranks [`EntryStatus::ExeMissing`] because that is the order the
+    /// launch pipeline fails in — a deleted prefix directory takes its exes
+    /// with it, so both are true at once and the prefix is what a launch
+    /// reports first. The §7 dispositions: recreate the prefix
+    /// (`cellar prefix create <slug>`), or uninstall the entry.
+    PrefixBroken,
 }
 
 impl EntryStatus {
-    /// The label for tables and JSON (stable output vocabulary).
+    /// The label for tables and JSON (stable output vocabulary — values are
+    /// only ever added, `docs/cli-json.md`).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::ExeMissing => "missing-exe",
+            Self::PrefixBroken => "broken-prefix",
         }
     }
 }
@@ -691,10 +708,12 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
     }
 
     /// Every registered entry with its status, the `cellar list` data
-    /// (blueprint §8: slug, kind, prefix, runner, status). The runner
-    /// column's chain includes the bound prefix's default (the rung #27
-    /// deferred to the launch slice); invalid hand-edited entries are
-    /// skipped — the doctor flags them (ADR 0001).
+    /// (blueprint §8: slug, kind, prefix, runner, status). The status
+    /// reports launchability — a healthy entry, a missing exe, or an
+    /// unreadable bound prefix (#41) — and the runner column's chain
+    /// includes the bound prefix's default (the rung #27 deferred to the
+    /// launch slice); invalid hand-edited entries are skipped — the doctor
+    /// flags them (ADR 0001).
     pub fn list(&self) -> Result<Vec<ListedEntry>, StorageError> {
         let entries = self.storage.list_apps()?;
         let missing: BTreeSet<String> = self
@@ -709,18 +728,26 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             // apply (glossary: Override); a broken prefix degrades the
             // column to the floor — list must still render, the doctor
             // flags the tree.
-            let bound = entry.overrides.prefix.as_deref().unwrap_or(&entry.prefix);
-            let prefix_runner = match self.storage.load_prefix(bound) {
-                Ok(prefix) => prefix.defaults.runner,
-                Err(_) => None,
+            let bound = bound_prefix_slug(&entry);
+            let (prefix_runner, prefix_readable) = match self.storage.load_prefix(bound) {
+                Ok(prefix) => (prefix.defaults.runner, true),
+                Err(_) => (None, false),
+            };
+            // #41: an entry whose bound prefix cannot be read is not
+            // launchable, so `ok` must stop claiming it is. The prefix
+            // verdict outranks the exe one — launch fails on the prefix
+            // first, and a deleted prefix directory takes its exes with it,
+            // so both are true at once for the everyday orphan.
+            let status = if !prefix_readable {
+                EntryStatus::PrefixBroken
+            } else if missing.contains(&entry.slug) {
+                EntryStatus::ExeMissing
+            } else {
+                EntryStatus::Ok
             };
             listed.push(ListedEntry {
-                status: if missing.contains(&entry.slug) {
-                    EntryStatus::ExeMissing
-                } else {
-                    EntryStatus::Ok
-                },
                 entry,
+                status,
                 prefix_runner,
             });
         }
@@ -1150,6 +1177,20 @@ fn is_exe(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
 }
 
+/// The prefix slug an entry binds to (glossary: `AppEntry` — "bound to
+/// exactly one prefix"; Override — the binding override picks which prefix's
+/// defaults apply, defaulting to the prefix that registered it). The single
+/// definition of the binding: `list`, the launch pipeline and
+/// [`PrefixService::bound_entries`] all read it, so they cannot drift into
+/// disagreeing about which entries a prefix owns (#41).
+fn bound_prefix_slug(entry: &AppEntry) -> &str {
+    entry
+        .overrides
+        .prefix
+        .as_deref()
+        .unwrap_or(entry.prefix.as_str())
+}
+
 /// Prefix lifecycle: create with slug naming and `-2` dedupe, list, delete
 /// with directory ownership (blueprint §6, ADR 0001).
 pub struct PrefixService<S: Storage> {
@@ -1182,8 +1223,23 @@ impl<S: Storage> PrefixService<S> {
         self.storage.list_prefixes()
     }
 
+    /// Every `AppEntry` bound to this prefix (glossary: `AppEntry`, `Prefix`) —
+    /// what `prefix delete` names before it removes the directory that ends
+    /// those bindings (#41). Deterministic order: storage order. Invalid
+    /// hand-edited entries are skipped — the doctor flags them (ADR 0001).
+    pub fn bound_entries(&self, slug: &str) -> Result<Vec<AppEntry>, StorageError> {
+        Ok(self
+            .storage
+            .list_apps()?
+            .into_iter()
+            .filter(|entry| bound_prefix_slug(entry) == slug)
+            .collect())
+    }
+
     /// Delete a prefix and exactly its directory — never more (ADR 0001
-    /// ownership).
+    /// ownership). The bindings it ends are the presentation's to confirm on
+    /// ([`PrefixService::bound_entries`]): deleting is never silently
+    /// allowed to orphan an entry, but it is never refused either (#41).
     pub fn delete(&self, slug: &str) -> Result<(), StorageError> {
         if !slug::is_valid_slug(slug) {
             return Err(StorageError::Invalid(format!(
@@ -1714,9 +1770,9 @@ fn damaged_slug_set<S: Storage>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactKind, DesktopSync, DoctorFinding, DoctorService, InstallError, InstallOutcome,
-        InstallResult, InstallService, LaunchApp, PrefixService, RunnerService, Storage,
-        empty_chain,
+        ArtifactKind, DesktopSync, DoctorFinding, DoctorService, EntryStatus, InstallError,
+        InstallOutcome, InstallResult, InstallService, LaunchApp, PrefixService, RunnerService,
+        Storage, empty_chain,
     };
 
     use std::collections::{BTreeMap, BTreeSet};
@@ -2977,6 +3033,14 @@ mod tests {
         let mock = MockStorage::new(health);
         mock.add_app(entry("balatro", "/games/balatro.exe"));
         mock.add_app(entry("warpinator", "/prefix/drive_c/warpinator.exe"));
+        // #41: the status reads the bound prefix too, so the fixture states
+        // the subject this test is about — a *readable* prefix — and leaves
+        // the unreadable case to the `broken-prefix` tests. The assertion
+        // itself is unchanged: this is the tree-wide exe check.
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
         let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
         let listed = service.list()?;
         let statuses: Vec<_> = listed
@@ -4475,6 +4539,120 @@ mod tests {
         assert_eq!(
             listed[0].prefix_runner, None,
             "a broken prefix degrades the column to the floor — the doctor flags it"
+        );
+        assert_eq!(
+            listed[0].status,
+            EntryStatus::PrefixBroken,
+            "#41: the same unreadable prefix also stops the status reading `ok`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_reports_an_unreadable_bound_prefix_as_broken_not_ok() -> anyhow::Result<()> {
+        // The #41 defect, seen from `list`: deleting the prefix directory
+        // took the exes with it, so the exe check alone still said `ok` and
+        // the lie only surfaced at launch.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_app(entry("warpinator", "/games/warpinator.exe"));
+        mock.mark_broken_prefix("default");
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
+        let listed = service.list()?;
+        let statuses: Vec<_> = listed
+            .iter()
+            .map(|listed| (listed.entry.slug.as_str(), listed.status.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ("balatro", "broken-prefix"),
+                ("warpinator", "broken-prefix")
+            ],
+            "an entry that cannot launch never reads `ok`"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn broken_prefix_outranks_missing_exe_the_way_launch_fails() -> anyhow::Result<()> {
+        // A deleted prefix directory removes the exes inside it, so both
+        // conditions hold at once. The launch pipeline fails on the prefix
+        // first (blueprint §7 phase order), so the status must name that —
+        // otherwise `list` and the launch error disagree about the cause.
+        let mut health = healthy_tree();
+        health.missing_exes.push("balatro".to_owned());
+        let mock = MockStorage::new(health);
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.mark_broken_prefix("default");
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
+        assert_eq!(
+            service.list()?[0].status,
+            EntryStatus::PrefixBroken,
+            "the prefix verdict wins — it is the first failure a launch reports"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_healthy_and_an_exe_missing_entry_keep_their_statuses() -> anyhow::Result<()> {
+        // The #41 addition is additive: an entry whose prefix reads fine is
+        // untouched — healthy stays `ok`, and a prefix that reads while its
+        // exe is gone still reads `missing-exe`.
+        let mut health = healthy_tree();
+        health.missing_exes.push("gone".to_owned());
+        let mock = MockStorage::new(health);
+        mock.add_app(entry("healthy", "/games/healthy.exe"));
+        mock.add_app(entry("gone", "/games/gone.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
+        let listed = service.list()?;
+        let statuses: Vec<_> = listed
+            .iter()
+            .map(|listed| (listed.entry.slug.as_str(), listed.status.as_str()))
+            .collect();
+        assert_eq!(
+            statuses,
+            [("healthy", "ok"), ("gone", "missing-exe")],
+            "only the unreadable-prefix case gained a value"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bound_entries_names_exactly_what_a_delete_would_orphan() -> anyhow::Result<()> {
+        // The #41 gate reads the binding the same way `list` and launch do
+        // (glossary: Override — the binding override wins over the
+        // registering prefix), so the named entries are the ones that stop
+        // launching — no more, no fewer.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let mut rebound = entry("helper", "/games/helper.exe");
+        rebound.overrides.prefix = Some("work".to_owned());
+        mock.add_app(rebound);
+        let service = PrefixService::new(mock);
+        let bound: Vec<_> = service
+            .bound_entries("default")?
+            .into_iter()
+            .map(|app| app.slug)
+            .collect();
+        assert_eq!(bound, ["balatro"], "the registering prefix's own entries");
+        let bound: Vec<_> = service
+            .bound_entries("work")?
+            .into_iter()
+            .map(|app| app.slug)
+            .collect();
+        assert_eq!(
+            bound,
+            ["helper"],
+            "the binding override's prefix owns the entry for this count"
+        );
+        assert!(
+            service.bound_entries("empty")?.is_empty(),
+            "a prefix with nothing bound asks nothing"
         );
         Ok(())
     }
