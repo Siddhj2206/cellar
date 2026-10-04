@@ -19,13 +19,14 @@
 //! files and never touch another program's). Icons live under the tree's
 //! `cache/icons/`, keyed by a hash of the canonical exe path — a rename
 //! reuses the icon (the identity is the exe), and a stale cache file can
-//! never be reused for a different exe.
+//! never be reused for a different exe. The naming rule itself lives in
+//! `core::icon_cache`, because the retention sweep has to recognize a live
+//! icon by the same name (#46).
 
 mod entry;
 mod icon;
 
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -99,12 +100,13 @@ impl DesktopService {
 
     /// The cache file for one exe: a hash of the canonical exe path
     /// (the identity, blueprint §6) as the file name — renames reuse the
-    /// icon, and a stale file is never picked up for a different exe.
+    /// icon, and a stale file is never picked up for a different exe. The
+    /// rule lives in `core::icon_cache` because the retention sweep derives
+    /// the same names to decide which cached icons are garbage (#46); two
+    /// derivations could drift, and the drift would delete live icons.
     fn icon_path(&self, exe: &Path) -> PathBuf {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        exe.hash(&mut hasher);
         self.icon_cache_dir()
-            .join(format!("{:016x}.png", hasher.finish()))
+            .join(cellar_core::icon_cache::file_name(exe))
     }
 }
 

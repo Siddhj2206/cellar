@@ -404,6 +404,31 @@ impl TreeStore {
             Err(err) => Err(io_err(&app.exe, &err)),
         }
     }
+
+    /// The icon cache file names the registered entries resolve to: one
+    /// `core::icon_cache` name per parsed `AppEntry`'s exe — the exact
+    /// derivation `cellar-desktop` writes them with, not a guess at a naming
+    /// scheme, so a name outside the set can never be resolved to (#46).
+    ///
+    /// `None` when the entry set cannot be trusted: an `apps/*.toml` that
+    /// fails to parse is skipped by [`Storage::list_apps`] while
+    /// [`Storage::list_app_slugs`] still counts it, so a shorter parsed list
+    /// than slug list means hand-edit damage (ADR 0001) — and then no exe is
+    /// known, so nothing can be declared garbage. The caller prunes no icon at
+    /// all, the same judgment `desktop sync` makes about a damaged entry's
+    /// launcher entry (#56). `Some(empty)` is the different, real case: no app
+    /// is registered, so every cached icon is debris.
+    fn live_icon_names(&self) -> Result<Option<BTreeSet<String>>, StorageError> {
+        let apps = self.list_apps()?;
+        if apps.len() != self.list_app_slugs()?.len() {
+            return Ok(None);
+        }
+        Ok(Some(
+            apps.iter()
+                .map(|app| cellar_core::icon_cache::file_name(&app.exe))
+                .collect(),
+        ))
+    }
 }
 
 impl cellar_core::ports::__sealed::Sealed for TreeStore {}
@@ -687,6 +712,30 @@ impl Storage for TreeStore {
 
     fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError> {
         crate::installer::inventory(&self.root)
+    }
+
+    fn sweep_cache(&self) -> Result<(), StorageError> {
+        // The retention sweep (#46). Two halves with two different liveness
+        // rules, both decided in `cache`; only the glue is here, because it
+        // is the one thing that needs the tree: which icons a registered
+        // entry resolves to.
+        self.ensure_tree()?;
+        crate::cache::sweep_launch_logs(&self.launch_logs_dir(), std::time::SystemTime::now())?;
+        // The cheap early-out, and it is worth having: parsing every
+        // `apps/*.toml` is the one real cost in this sweep, so a tree with
+        // nothing cached — empty or absent icon directory, which is every
+        // install whose exe carried no icon — never pays it.
+        let icons = self.root.join("cache/icons");
+        let cached = fs::read_dir(&icons).is_ok_and(|mut entries| entries.next().is_some());
+        // `None` from `live_icon_names` (a damaged app file) is not "no
+        // entries" — it is "we cannot tell", and the only honest reading of
+        // that is to prune no icon at all.
+        if cached {
+            if let Some(live) = self.live_icon_names()? {
+                crate::cache::sweep_orphan_icons(&icons, &live)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1168,6 +1217,152 @@ mod tests {
             file_text(&root, "prefixes/games/prefix.toml").starts_with("schema_version = 1"),
             "prefix.toml lacks the schema header"
         );
+        Ok(())
+    }
+
+    /// Register one app whose exe really exists on disk, so the tree is
+    /// healthy and the icon it would have cached is a *live* icon.
+    fn register_app(
+        store: &TreeStore,
+        root: &Path,
+        slug_name: &str,
+    ) -> Result<PathBuf, StorageError> {
+        let exe = root.join("drive_c").join(format!("{slug_name}.exe"));
+        fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(&exe, "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        store.save_app(&AppEntry {
+            slug: slug_name.to_owned(),
+            exe: exe.clone(),
+            kind: AppKind::Game,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        })?;
+        Ok(exe)
+    }
+
+    /// A cached icon under `root`'s cache, named exactly as `cellar-desktop`
+    /// would name it for `exe` — the liveness rule's own derivation (#46).
+    fn cache_icon(root: &Path, exe: &Path) -> PathBuf {
+        let icon = root
+            .join("cache/icons")
+            .join(cellar_core::icon_cache::file_name(exe));
+        fs::create_dir_all(icon.parent().unwrap_or(Path::new(".")))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        fs::write(&icon, "png").unwrap_or_else(|e| panic!("write {}: {e}", icon.display()));
+        icon
+    }
+
+    /// An age the retention sweep is allowed to consider removable.
+    fn aged() -> std::time::Duration {
+        crate::cache::LAUNCH_LOG_MIN_AGE + std::time::Duration::from_secs(86_400)
+    }
+
+    #[test]
+    fn the_cache_sweep_prunes_logs_and_orphan_icons_and_nothing_else() -> Result<(), StorageError> {
+        // The whole #46 contract at the adapter: aged logs past the per-slug
+        // count go, a live app keeps its icon, an unregistered exe's icon
+        // goes, and — the invariant that matters most — nothing outside
+        // `cache/` is touched, byte for byte.
+        let (store, root) = store("sweep");
+        store.create_prefix("default")?;
+        let exe = register_app(&store, &root, "balatro")?;
+        let live_icon = cache_icon(&root, &exe);
+        // An exe no entry points at: uninstalled without `cellar uninstall`,
+        // or moved since.
+        let orphan_icon = cache_icon(&root, Path::new("/gone/tool.exe"));
+        let logs = root.join("cache/launch-logs");
+        for rank in 0..(crate::cache::LAUNCH_LOGS_PER_SLUG + 2) {
+            crate::cache::write_aged_log(
+                &logs,
+                "balatro",
+                u64::try_from(rank).expect("fits"),
+                aged(),
+            );
+        }
+        crate::cache::write_aged_log(&logs, "warpinator", 7, aged());
+        // Authoritative state the sweep has no business rewriting.
+        let app_file = file_text(&root, "apps/balatro.toml");
+        let settings = file_text(&root, "settings.toml");
+        let prefix_file = file_text(&root, "prefixes/default/prefix.toml");
+        let inventory = root.join("runtime/providers.toml");
+        fs::write(&inventory, "schema_version = 1\n").unwrap_or_else(|e| panic!("write: {e}"));
+
+        store.sweep_cache()?;
+
+        let left: Vec<String> = fs::read_dir(&logs)
+            .unwrap_or_else(|e| panic!("read {logs:?}: {e}"))
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left.len(),
+            crate::cache::LAUNCH_LOGS_PER_SLUG + 1,
+            "the over-count slug keeps exactly its newest logs, the quiet slug keeps its one: \
+             {left:?}"
+        );
+        assert!(
+            !left.contains(&"balatro-0.log".to_owned())
+                && !left.contains(&"balatro-1.log".to_owned()),
+            "the two oldest of this slug are the garbage: {left:?}"
+        );
+        assert!(
+            left.contains(&"warpinator-7.log".to_owned()),
+            "another slug's single log is never a casualty: {left:?}"
+        );
+        assert!(live_icon.exists(), "a registered app keeps its icon");
+        assert!(
+            !orphan_icon.exists(),
+            "an unregistered exe's icon is garbage"
+        );
+        assert_eq!(
+            file_text(&root, "apps/balatro.toml"),
+            app_file,
+            "the sweep never rewrites entry data"
+        );
+        assert_eq!(file_text(&root, "settings.toml"), settings);
+        assert_eq!(
+            file_text(&root, "prefixes/default/prefix.toml"),
+            prefix_file
+        );
+        assert!(inventory.exists(), "the runtime inventory is untouched");
+        Ok(())
+    }
+
+    #[test]
+    fn a_damaged_app_file_spares_every_icon() -> Result<(), StorageError> {
+        // #56's rule, applied to the icon cache: an `apps/*.toml` that does
+        // not parse means the entry set cannot be trusted (which exe owned
+        // which icon?), so nothing is pruned until the user repairs it — the
+        // same judgment `desktop sync` makes about launcher entries.
+        let (store, root) = store("sweep-damaged");
+        store.create_prefix("default")?;
+        let exe = register_app(&store, &root, "balatro")?;
+        let icon = cache_icon(&root, &exe);
+        fs::write(root.join("apps/balatro.toml"), "not toml at all [[[")
+            .unwrap_or_else(|e| panic!("wreck: {e}"));
+        assert_eq!(store.list_apps()?.len(), 0, "the damage hides the entry");
+        store.sweep_cache()?;
+        assert!(
+            icon.exists(),
+            "the icon of an entry whose file is damaged stays put: {}",
+            icon.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sweeping_a_fresh_tree_is_a_no_op() -> Result<(), StorageError> {
+        // A tree that never launched and never installed: the sweep creates
+        // the tree like every other operation, finds nothing to prune, and
+        // says so without an error — the launch path must never see one.
+        let (store, root) = store("sweep-fresh");
+        store.sweep_cache()?;
+        assert!(root.join("cache/launch-logs").is_dir());
+        assert!(store.list_apps()?.is_empty());
         Ok(())
     }
 

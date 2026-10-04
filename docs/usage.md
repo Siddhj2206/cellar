@@ -105,6 +105,13 @@ flight; a leftover child process holding the output pipe (launcher helpers do th
 cellar prints `game exited; output truncated` on stderr and returns the game's exit code. A game
 killed by a signal exits `1` with the signal reported on stderr.
 
+That directory is swept as you launch, so it cannot grow forever: Cellar keeps the **ten most recent
+logs per app**, and never deletes one written in the last **four weeks** — the age floor is what
+keeps a bug report reproducible when it quotes the log path `--detach` printed weeks after the
+launch. Only a log past both the count and the age floor is removed, and the sweep says nothing
+about it: janitorial work, silent under `--quiet`, never something you have to run. Deleting
+`cache/` by hand is still always safe.
+
 The plan is resolved in a fixed order — app override → prefix default → kind default — and a failed
 Proton selection never silently falls back to wine. `--dry-run` shows exactly what would run,
 including the runner path and environment; paste `--dry-run --json` output when reporting launch
@@ -202,7 +209,9 @@ file-manager action on `.exe` files starts the same guided install flow as the C
 
 `cellar desktop sync` re-derives all of it — entries, icons, the association — from stored state and
 prunes stale entries left behind by renames or removals. It reads app state and never writes back
-into the tree. Icons live in the disposable cache; deleting any of `cache/` is always safe.
+into the tree. Icons live in the disposable cache; deleting any of `cache/` is always safe. An icon
+no registered app points at — uninstalled without `cellar uninstall`, or an exe that has since moved
+— is swept away the next time you launch anything, exactly as a launcher entry is pruned by sync.
 
 Entries embed the path of the Cellar binary that wrote them. If you move or rebuild that binary,
 the entries keep pointing at the old location — `cellar desktop sync` from the new location repoints
@@ -250,14 +259,18 @@ Everything lives under one root — `$XDG_DATA_HOME/cellar`, i.e. `~/.local/shar
 │   └── umu/<version>/
 └── cache/                     # disposable — always safe to delete
     ├── downloads/             # resumable partial downloads
-    ├── icons/                 # extracted icons
-    └── launch-logs/
+    ├── icons/                 # extracted icons (orphans swept on launch)
+    └── launch-logs/           # per-launch output (swept on launch)
 ```
 
 Launcher entries live beside the data root in `$XDG_DATA_HOME/applications/`. Everything except
 `cache/` is authoritative state and hand-editable TOML; unknown fields are ignored, and breaking
 changes carry a `schema_version`. Deleting a prefix removes exactly that prefix's directory;
 uninstalling removes exactly that app's file.
+
+Cellar prunes `cache/` for you — old launch logs and icons nothing refers to (see *Launching apps*
+above) — so the janitorial work is not yours. Doing it by hand is still safe: everything in there is
+re-derivable, and re-derived by the next `cellar desktop sync` or install.
 
 ## Design intent vs current behavior
 
