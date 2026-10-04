@@ -169,6 +169,26 @@ pub trait Storage: __sealed::Sealed + Send + Sync + Debug {
     /// — blueprint §6: the runtime directory is rebuildable from it): every
     /// record the pipeline recorded, deterministic order.
     fn managed_inventory(&self) -> Result<Vec<ManagedRecord>, StorageError>;
+
+    /// The disposable cache's retention sweep (#46): prune
+    /// `cache/launch-logs` to the newest logs per slug (never removing one
+    /// younger than the age floor) and remove the cached icons no registered
+    /// entry resolves to. The adapter owns both the cache layout and the
+    /// entry set, which is why the liveness rule can be derived from the
+    /// real icon naming rather than guessed.
+    ///
+    /// Strictly confined to `cache/launch-logs` and `cache/icons` — the
+    /// disposable-cache contract (ADR 0001) is untouched by it: no entry
+    /// data, no `prefixes/`, no `runtime/`, and no unsynced removal becoming
+    /// a durable write.
+    ///
+    /// Janitorial by contract, so the caller is expected to treat the result
+    /// as advisory: the launch path runs this opportunistically and swallows
+    /// the outcome, because a sweep that cannot prune its cache is never a
+    /// reason to fail a launch. The port still speaks real storage errors so
+    /// that a caller which does care — a test, or a future explicit
+    /// maintenance command — sees them.
+    fn sweep_cache(&self) -> Result<(), StorageError>;
 }
 
 /// Desktop integration: `.desktop` entries, Rust-native icon extraction and

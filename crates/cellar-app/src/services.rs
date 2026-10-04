@@ -1130,6 +1130,20 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
     /// `cache/launch-logs` (blueprint §7 naming; the directory is the
     /// adapter's layout via [`Storage::launch_logs_dir`]). Nothing spawns
     /// before the plan is frozen — `--dry-run` stays spawn-free.
+    ///
+    /// The disposable cache's retention sweep (#46) rides this path, because
+    /// a launch is the one command guaranteed to run often: a launch log per
+    /// run and an icon per app, with nothing ever collecting either. It runs
+    /// after the plan is frozen and before the log name is minted, so this
+    /// launch's own log cannot be among the sweep's candidates — and it runs
+    /// only here, never in `plan`, which keeps `--dry-run` a preview with no
+    /// side effects at all.
+    ///
+    /// Silent and never fatal, by design: the result is dropped on purpose
+    /// (janitorial work must not surface to a user, change an exit code, or
+    /// make a launch fail), and the workspace has no log sink that could take
+    /// it quietly instead. What it may remove is confined to `cache/` by the
+    /// adapter.
     pub fn spawn(
         &self,
         slug: &str,
@@ -1137,6 +1151,7 @@ impl<S: Storage, R: RunnerResolver> LaunchApp<S, R> {
         mode: LaunchMode,
     ) -> Result<SpawnedProcess, LaunchError> {
         let plan = self.plan(slug, args)?;
+        let _ = self.storage.sweep_cache();
         let log_path = launch_log_path(&self.storage, slug);
         cellar_launch::spawn(&plan, &log_path, mode)
     }
@@ -1757,6 +1772,14 @@ mod tests {
         /// The canned discovery scan (the flat scan's result for the
         /// session's running/extracting branches).
         candidates: Mutex<Vec<Candidate>>,
+        /// Cache sweeps the launch path asked for (#46) — counted, and
+        /// handed to tests as an `Arc` handle, so a test can see where the
+        /// janitorial call does and does not happen (the service owns the
+        /// storage it sweeps).
+        sweeps: Arc<Mutex<usize>>,
+        /// When set, `sweep_cache` fails with it: a launch must survive a
+        /// sweep that cannot prune.
+        sweep_failure: Option<StorageError>,
         /// Where per-launch logs go (the real store: the tree's
         /// `cache/launch-logs`); spawn tests point it at a temp dir.
         log_dir: PathBuf,
@@ -1779,6 +1802,8 @@ mod tests {
                 canonicalized: Mutex::new(Vec::new()),
                 missing_exes: Mutex::new(Vec::new()),
                 candidates: Mutex::new(Vec::new()),
+                sweeps: Arc::new(Mutex::new(0)),
+                sweep_failure: None,
                 log_dir: PathBuf::from("/mock/cache/launch-logs"),
                 prefix_base: PathBuf::from("/mock/prefixes"),
                 health,
@@ -1788,6 +1813,20 @@ mod tests {
         fn with_log_dir(mut self, log_dir: PathBuf) -> Self {
             self.log_dir = log_dir;
             self
+        }
+
+        /// A storage adapter whose retention sweep always fails (#46): the
+        /// launch path swallows the outcome, so this is the shape that must
+        /// still launch.
+        fn with_failing_sweep(mut self) -> Self {
+            self.sweep_failure = Some(StorageError::Io("the cache sweep failed".to_owned()));
+            self
+        }
+
+        /// A handle to that counter, for a test that hands the storage to a
+        /// service and then wants to read it back.
+        fn sweep_counter(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.sweeps)
         }
 
         fn with_prefix_base(mut self, prefix_base: PathBuf) -> Self {
@@ -2059,6 +2098,17 @@ mod tests {
                     install: format!("{provider}/{version}"),
                 })
                 .collect())
+        }
+
+        fn sweep_cache(&self) -> Result<(), StorageError> {
+            *self
+                .sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            match &self.sweep_failure {
+                Some(failure) => Err(failure.clone()),
+                None => Ok(()),
+            }
         }
     }
 
@@ -4413,6 +4463,120 @@ mod tests {
         let text = std::fs::read_to_string(log_path)?;
         assert!(text.contains("app-out"), "stdout missing:\n{text}");
         assert!(text.contains("app-err"), "stderr missing:\n{text}");
+        Ok(())
+    }
+
+    /// A scratch spawn fixture: a per-test directory, the configured stub
+    /// runner of [`write_stub_script`] (echo one line, exit 7 — so a spawn
+    /// test sees the exit code propagate raw), and a mock tree with one app
+    /// bound to one prefix whose runner is that stub. The caller wires the
+    /// storage into the service and keeps the sweep counter's handle.
+    #[cfg(unix)]
+    fn launching_storage(tag: &str) -> anyhow::Result<(MockStorage, PathBuf)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cellar-app-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let wine = dir.join("stub-wine");
+        write_stub_script(&wine, "echo \"app-out\"\nexit 7\n")?;
+        // The real store creates the log directory with the tree, and the
+        // execute phase opens the log before it spawns.
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs)?;
+        let mock = MockStorage::new(healthy_tree()).with_log_dir(logs);
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults {
+                runner: Some(RunnerSpec::new(RunnerFamily::Wine)),
+                ..PrefixDefaults::default()
+            },
+        });
+        Ok((mock, wine))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_launch_sweeps_the_disposable_cache_once() -> anyhow::Result<()> {
+        // #46: the sweep rides the launch path — the one command guaranteed
+        // to run often — once per launch, and before this launch's own log
+        // is minted, so a launch can never sweep its own log away.
+        let (mock, wine) = launching_storage("sweep-once")?;
+        let sweeps = mock.sweep_counter();
+        let service = LaunchApp::new(mock, StubResolver::new(Ok(wine_resolved_at(&wine))));
+        let process = service.spawn("balatro", &[], LaunchMode::Foreground)?;
+        let log_path = process.log_path().to_path_buf();
+        process.wait()?;
+        assert_eq!(
+            *sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "one launch, one opportunistic sweep"
+        );
+        assert!(
+            log_path.exists(),
+            "the launch's own log survives its own launch's sweep: {}",
+            log_path.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failing_cache_sweep_never_fails_the_launch() -> anyhow::Result<()> {
+        // Janitorial by contract: an adapter that cannot prune its cache is
+        // never a reason to fail a launch — the game still runs, and its exit
+        // code still propagates raw.
+        let (mock, wine) = launching_storage("sweep-failing")?;
+        let sweeps = mock.sweep_counter().clone();
+        let service = LaunchApp::new(
+            mock.with_failing_sweep(),
+            StubResolver::new(Ok(wine_resolved_at(&wine))),
+        );
+        let process = service.spawn("balatro", &[], LaunchMode::Foreground)?;
+        let status = process.wait()?;
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the stub's exit code propagates raw despite the failed sweep"
+        );
+        assert_eq!(
+            *sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1,
+            "the sweep was attempted, not skipped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_dry_run_never_sweeps_the_cache() -> anyhow::Result<()> {
+        // `plan` is the whole of `--dry-run` and stays a faithful preview: no
+        // spawn, and no janitorial work either — nothing the user did not ask
+        // for happens behind a flag that promises nothing runs.
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        let sweeps = mock.sweep_counter();
+        let service = LaunchApp::new(mock, StubResolver::ok());
+        service.plan("balatro", &[])?;
+        assert_eq!(
+            *sweeps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            0,
+            "a preview must not touch the tree, the cache included"
+        );
         Ok(())
     }
 

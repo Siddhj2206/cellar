@@ -10,10 +10,13 @@
 //! with #30; `.lnk` target decoding with #31; the managed-runner installer
 //! pipeline — fetch, verify, extract, flock, resumable cache, and the
 //! authoritative `runtime/providers.toml` inventory — lands with #34
-//! ([`installer`]).
+//! ([`installer`]). The disposable cache's retention sweep (#46) lands with
+//! [`cache`].
 
+pub mod cache;
 mod installer;
 mod lnk;
 pub mod tree;
 
+pub use cache::{LAUNCH_LOG_MIN_AGE, LAUNCH_LOGS_PER_SLUG};
 pub use tree::{SCHEMA_VERSION, TreeStore};

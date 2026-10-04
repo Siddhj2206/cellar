@@ -13,6 +13,8 @@
 //!   vocabulary, CONTEXT.md).
 //! - [`slug`] — tree file-name rules: slugify, validation, `-2` dedupe.
 //! - [`health`] — the `TreeHealth` report the doctor renders.
+//! - [`icon_cache`] — the icon cache's file name, shared by the adapter
+//!   that writes it and the sweep that prunes it (#46).
 //! - [`ports`] — the locked extension seam (ADR 0003): exactly five traits.
 //! - [`errors`] — pre-flight error families for the ports.
 
@@ -21,6 +23,7 @@ pub mod entities;
 pub mod errors;
 pub mod exec_lookup;
 pub mod health;
+pub mod icon_cache;
 pub mod manifest;
 pub mod ports;
 pub mod slug;
