@@ -1601,6 +1601,22 @@ impl<S: Storage, D: DesktopIntegrator, R: RunnerResolver> DoctorService<S, D, R>
                         family.as_str(),
                         family.as_str()
                     ),
+                    // #53: the read-only roots were read and held nothing
+                    // working. The problem line already names them (the
+                    // error's own Display), so the fix counts them and
+                    // offers the two honest routes: see what discovery
+                    // reads, or point at an install directly.
+                    UnresolvedCause::SearchedNothing { searched } => format!(
+                        "the {} read-only {} Cellar scans (named above) held no working install — \
+                         `cellar runner list` shows what they do hold, or pin this prefix to one \
+                         with `configured = {{ Path = \"…\" }}`",
+                        searched.len(),
+                        if searched.len() == 1 {
+                            "location"
+                        } else {
+                            "locations"
+                        }
+                    ),
                     // Discover-only families have no `runner install` — the
                     // verb derives from provider mode (trait membership), so
                     // a future discover-only family cannot reintroduce the
@@ -3704,6 +3720,53 @@ mod tests {
                 .fix
                 .contains("cellar runner install proton <version>"),
             "the managed verb survives: {}",
+            finding.fix
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_an_exhausted_steam_search_names_the_roots_read() -> anyhow::Result<()> {
+        // AC (#53): a Proton installed on a library Cellar did not scan is
+        // a discovery miss, not a missing install. Neither the finding's
+        // problem nor its fix may tell the user to install what they have;
+        // both name the roots read, and the fix points at the two honest
+        // routes (see what discovery reads, or pin the prefix).
+        let searched = vec![
+            PathBuf::from("/home/me/.steam/steam/steamapps/common"),
+            PathBuf::from("/mnt/games/SteamLibrary/steamapps/common"),
+        ];
+        let mock = MockStorage::new(healthy_tree());
+        mock.add_prefix(Prefix {
+            slug: "default".to_owned(),
+            defaults: PrefixDefaults::default(),
+        });
+        mock.add_app(entry("balatro", "/games/balatro.exe"));
+        let service = DoctorService::new(
+            mock,
+            StubDesktop::new(),
+            StubResolver::new(Err(ResolveError::Unresolvable {
+                family: RunnerFamily::Proton,
+                cause: UnresolvedCause::SearchedNothing {
+                    searched: searched.clone(),
+                },
+            })),
+        );
+        let report = service.check()?;
+        let finding = &report.sections[3].findings[0];
+        assert!(
+            finding
+                .problem
+                .contains("/mnt/games/SteamLibrary/steamapps/common")
+                && !finding.problem.contains("install it"),
+            "the problem names the roots and never says install: {}",
+            finding.problem
+        );
+        assert!(
+            finding.fix.contains("cellar runner list")
+                && finding.fix.contains("configured = { Path = \"…\" }")
+                && !finding.fix.contains("cellar runner install proton"),
+            "the fix offers the diagnostic surface and a pinned path, not a reinstall: {}",
             finding.fix
         );
         Ok(())

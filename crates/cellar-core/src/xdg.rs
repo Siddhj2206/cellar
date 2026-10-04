@@ -89,6 +89,19 @@ pub fn data_home() -> Result<PathBuf, DataHomeError> {
     )
 }
 
+/// The user's home directory as an absolute path, validated exactly like
+/// [`data_home`] validates it: tilde-expanded, absolute-required, named
+/// failure. The single authority for `$HOME`-derived paths, so the
+/// providers' `$HOME`-rooted discovery (#53) cannot quietly grow a
+/// `$PWD`-relative root of its own — a misconfigured environment must
+/// yield fewer roots, never a wrong one.
+pub fn home_with(home: Option<&str>) -> Result<PathBuf, DataHomeError> {
+    match home {
+        Some(home) if !home.is_empty() => validate("HOME", home, Some(home)),
+        _ => Err(DataHomeError::NotSet),
+    }
+}
+
 /// [`data_home`] with both variables injected — the seam that keeps the
 /// expansion/validation rules testable without touching the process
 /// environment.
@@ -98,12 +111,7 @@ pub fn data_home_with(
 ) -> Result<PathBuf, DataHomeError> {
     match xdg_data_home {
         Some(dir) if !dir.is_empty() => validate("XDG_DATA_HOME", dir, home),
-        _ => match home {
-            Some(home) if !home.is_empty() => {
-                validate("HOME", home, Some(home)).map(|home| home.join(".local/share"))
-            }
-            _ => Err(DataHomeError::NotSet),
-        },
+        _ => home_with(home).map(|home| home.join(".local/share")),
     }
 }
 
@@ -178,6 +186,39 @@ mod tests {
             data_home_with(Some(""), HOME).unwrap(),
             PathBuf::from("/home/sid/.local/share"),
             "empty means unset"
+        );
+    }
+
+    #[test]
+    fn home_is_its_own_authority() {
+        // The `$HOME`-derived paths discovery builds (Proton's Steam roots,
+        // #53) resolve through the same rules as `$XDG_DATA_HOME`, so a
+        // relative HOME yields *no* home root rather than a `$PWD`-relative
+        // one.
+        assert_eq!(home_with(HOME), Ok(PathBuf::from("/home/sid")));
+        // A literal `~` as HOME would expand against itself, so the
+        // absolute-required rule refuses it rather than inventing a root.
+        assert_eq!(
+            home_with(Some("~")),
+            Err(DataHomeError::NotAbsolute {
+                variable: "HOME",
+                value: "~".to_owned(),
+            })
+        );
+        assert_eq!(
+            home_with(Some("relhome")),
+            Err(DataHomeError::NotAbsolute {
+                variable: "HOME",
+                value: "relhome".to_owned(),
+            })
+        );
+        assert_eq!(home_with(None), Err(DataHomeError::NotSet));
+        assert_eq!(home_with(Some("")), Err(DataHomeError::NotSet));
+        // The data-home default is exactly home + the XDG share suffix.
+        assert_eq!(
+            data_home_with(None, HOME),
+            Ok(PathBuf::from("/home/sid/.local/share")),
+            "the fallback keeps composing from the home authority"
         );
     }
 

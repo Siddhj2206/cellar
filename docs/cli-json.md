@@ -128,6 +128,12 @@ state. `mode` is `"managed"` or `"discover-only"`; `version` is a string or `nul
 ]
 ```
 
+The shape is unchanged by how much Steam there is to find: discovery widens which Proton installs
+become rows, not what a row looks like. Each discovered install is **one** row at its canonical path,
+so a Proton reachable through two of the scanned Steam roots (`~/.steam/steam` is usually a symlink
+into `$XDG_DATA_HOME/Steam`) is not listed twice. `docs/usage.md` names the roots scanned and their
+order; a launch that resolves no Proton names those same roots in its error.
+
 ## `cellar doctor --json`
 
 The report mirrors the human sections exactly: `healthy` is the overall verdict (exit code 0/1),

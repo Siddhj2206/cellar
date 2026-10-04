@@ -190,6 +190,28 @@ honored; unset, Cellar connects directly.
 state — system wine and `umu-run` on `PATH`, plus Steam's Proton builds — shown strictly read-only.
 Cellar never modifies anything it discovers.
 
+**Where Cellar looks for Proton** — read-only, in this order, so a multi-library Steam resolves the
+same way on any host:
+
+1. every `compatibilitytools.d` — `$XDG_DATA_HOME/Steam`, `~/.steam/steam`, and Flatpak Steam's
+   `~/.var/app/com.valvesoftware.Steam/data/Steam` and `…/.local/share/Steam`;
+2. the main library's `steamapps/common` (`~/.steam/steam`, and the same directory under the XDG data
+   home, which is usually what that symlink resolves to);
+3. every additional library Steam records in `<steam-root>/steamapps/libraryfolders.vdf`, **in the
+   order that file lists them** (Steam's own priority order), reading each library's
+   `compatibilitytools.d` before its `steamapps/common`.
+
+Within one directory, Proton builds are listed name-sorted, and each is reported by its canonical
+path — a build reachable through two of the roots above (`~/.steam/steam` is usually a symlink into
+the XDG data home) is one row, not two. An entry only counts as a runner when it holds an executable
+`proton` script. A missing or malformed `libraryfolders.vdf` simply contributes nothing: the fixed
+roots still apply, and discovery never fails on it.
+
+If a launch cannot resolve a Proton, the failure names the roots that were read rather than
+suggesting an install — the usual cause is a working build on a directory Cellar was not pointed at,
+and the fix is `cellar runner list` (what those roots do hold) or pinning the prefix to the install
+directly with `runner = { family = "Proton", configured = { Path = "/path/to/proton" } }`.
+
 For Proton-family apps, launching goes through `umu-run` automatically: Cellar sets `GAMEID`,
 `WINEPREFIX`, `PROTONPATH`, and `PROTON_VERB` and lets umu handle its Steam Linux Runtime plumbing.
 If a prefix sets `graphics = "gamescope"`, gamescope wraps the launch outermost.
