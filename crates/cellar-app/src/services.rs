@@ -162,6 +162,15 @@ impl FromStr for ArtifactKind {
 /// with the fix where the pipeline defines one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
+    /// No entry is registered under this slug. `uninstall` names the
+    /// failure in the vocabulary `launch` already established — an app the
+    /// user named, not a tree path they never typed (#45). Its fix clause
+    /// is its own: the command asked to remove something, so the helpful
+    /// next step is listing what exists. `launch`'s equivalent stays
+    /// [`LaunchError::AppNotFound`], which needs a plan, not an uninstall.
+    AppNotFound {
+        slug: String,
+    },
     Storage(StorageError),
     /// The installer's plan could not be built, spawned, or captured — the
     /// launch pipeline's taxonomy (the installer running but failing is
@@ -208,6 +217,18 @@ impl From<DesktopError> for InstallError {
 impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // The `uninstall` half of #45: the vocabulary matches
+            // `LaunchError::AppNotFound` — same opening clause, so the two
+            // read as one language — but not its fix. `launch` wants the
+            // app to exist; `uninstall` was asked to remove something that
+            // is not there, so telling the user to register it is advice
+            // for the opposite intent. The action that helps is seeing
+            // what *is* registered.
+            Self::AppNotFound { slug } => write!(
+                f,
+                "no app '{slug}' is registered — nothing to uninstall; \
+                 `cellar list` shows what is"
+            ),
             Self::Storage(error) => write!(f, "{error}"),
             Self::Launch(error) => write!(f, "{error}"),
             Self::InstallerFailed { code, signal } => match (code, signal) {
@@ -718,8 +739,16 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             return Err(StorageError::Invalid(format!("invalid app slug {slug:?}")).into());
         }
         // The app's entry is needed for the cleanup — the entry and icon
-        // are derived from it.
-        let app = self.storage.load_app(slug)?;
+        // are derived from it. An unknown slug is this command's own
+        // failure, named in the presentation vocabulary (#45) rather than
+        // surfacing `not found: …/apps/<slug>.toml` — a path the user never
+        // typed and cannot act on.
+        let app = self.storage.load_app(slug).map_err(|err| match err {
+            StorageError::NotFound(_) => InstallError::AppNotFound {
+                slug: slug.to_owned(),
+            },
+            other => InstallError::Storage(other),
+        })?;
         self.storage.delete_app(slug)?;
         self.desktop.remove_entry(&app)?;
         Ok(())
@@ -2976,10 +3005,33 @@ mod tests {
             ["warpinator"],
             "exactly the requested entry is gone"
         );
-        assert!(matches!(
+        assert_eq!(
             service.uninstall("balatro"),
-            Err(InstallError::Storage(StorageError::NotFound(_)))
-        ));
+            Err(InstallError::AppNotFound {
+                slug: "balatro".to_owned()
+            }),
+            "uninstalling it twice is this command's own failure (#45)"
+        );
+        let spoken = service
+            .uninstall("balatro")
+            .expect_err("already removed")
+            .to_string();
+        assert!(
+            spoken.contains("no app 'balatro' is registered")
+                && spoken.contains("nothing to uninstall"),
+            "and it speaks the vocabulary `launch` established, with a fix \
+             that fits this command: {spoken}"
+        );
+        assert!(
+            !spoken.contains("register it with"),
+            "not launch's fix — `uninstall` was asked to remove something, \
+             so telling the user to register it is advice for the opposite \
+             intent: {spoken}"
+        );
+        assert!(
+            !spoken.contains("apps/") && !spoken.contains(".toml"),
+            "no tree path in the message the user reads: {spoken}"
+        );
         assert!(matches!(
             service.uninstall("../escape"),
             Err(InstallError::Storage(StorageError::Invalid(_)))

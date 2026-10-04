@@ -84,9 +84,13 @@ pub enum StorageError {
     Config(String),
     /// Underlying filesystem failure, with the offending path.
     Io(String),
-    /// A file exists but is not valid. Hand-edited files degrade to a
-    /// skipped entry flagged by doctor — never silently overwritten
-    /// (ADR 0001).
+    /// A file exists but is not valid, or a request names something that
+    /// cannot be one. The payload is a COMPLETE sentence — this variant is
+    /// rendered verbatim, with no prefix, so a message about a bad slug
+    /// does not come out as "invalid file at invalid app slug" and one
+    /// about a missing path is not misfiled as a file problem (#45).
+    /// Hand-edited files degrade to a skipped entry flagged by doctor —
+    /// never silently overwritten (ADR 0001).
     Invalid(String),
     /// The requested node does not exist.
     NotFound(String),
@@ -105,9 +109,12 @@ pub enum StorageError {
 impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Config(what) => write!(f, "{what}"),
+            // Rendered verbatim: `Config` and `Invalid` payloads are whole
+            // sentences, so no frame is bolted on. That is the #45 fix — the
+            // old "invalid file at …" prefix made a validation sentence read
+            // as "invalid file at invalid app slug …".
+            Self::Config(what) | Self::Invalid(what) => write!(f, "{what}"),
             Self::Io(path) => write!(f, "I/O failure at {path}"),
-            Self::Invalid(path) => write!(f, "invalid file at {path}"),
             Self::NotFound(path) => write!(f, "not found: {path}"),
             Self::Exists(path) => write!(f, "already exists: {path}"),
             Self::Artifact(what) => write!(f, "artifact failure: {what}"),
@@ -117,6 +124,59 @@ impl fmt::Display for StorageError {
 }
 
 impl std::error::Error for StorageError {}
+
+#[cfg(test)]
+mod tests {
+    use super::StorageError;
+
+    /// AC (#45): `Invalid` is rendered verbatim, so a validation sentence
+    /// reads as itself instead of being framed as a file problem.
+    #[test]
+    fn invalid_renders_its_payload_without_a_file_frame() {
+        assert_eq!(
+            StorageError::Invalid("invalid app slug \"Not A Slug!\"".to_owned()).to_string(),
+            "invalid app slug \"Not A Slug!\"",
+            "no doubled 'invalid file at invalid …'"
+        );
+        assert_eq!(
+            StorageError::Invalid("cannot form a prefix slug from \"###\"".to_owned()).to_string(),
+            "cannot form a prefix slug from \"###\"",
+            "no ungrammatical 'invalid file at cannot form …'"
+        );
+        assert_eq!(
+            StorageError::Invalid("/some/dir is not a file".to_owned()).to_string(),
+            "/some/dir is not a file",
+            "'file … is not a file' reads as written"
+        );
+    }
+
+    #[test]
+    fn every_invalid_payload_in_the_tree_reads_as_a_sentence() {
+        // The verbatim contract on `Invalid` is only as good as the payloads
+        // flowing into it, and nothing in the type enforces that (#45). This
+        // walks the real storage call sites through the real renderer: a
+        // payload that regresses to a bare path or a fragment fails here
+        // rather than in a user's terminal.
+        let sentences = [
+            "invalid app slug \"Not A Slug!\"",
+            "cannot form a prefix slug from \"###\"",
+            "/some/dir is not a file",
+            "/tmp/thing: unparseable header (bad TOML)",
+            "/tmp/prefix.toml: schema version 9 (the tree reads 1)",
+        ];
+        for payload in sentences {
+            let rendered = StorageError::Invalid(payload.to_owned()).to_string();
+            assert_eq!(
+                rendered, payload,
+                "rendered verbatim, so the payload must stand alone"
+            );
+            assert!(
+                !rendered.starts_with("invalid file at"),
+                "the frame is gone (#45): {rendered}"
+            );
+        }
+    }
+}
 
 /// Failures of the desktop integration port.
 #[derive(Debug, Clone, PartialEq, Eq)]
