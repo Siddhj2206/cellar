@@ -288,12 +288,17 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
     /// branches then collect the prefix's menu/desktop executable
     /// candidates for review; the review's confirmation registers them
     /// ([`InstallService::register_reviewed`]) — nothing auto-registers.
+    ///
+    /// `kind` is the user's explicit `--kind`, or `None` when the flag was
+    /// omitted: a new entry then takes [`AppKind::DEFAULT`], and an update
+    /// keeps the entry's own kind (#40 — the `--name` rule applied to
+    /// kind, since kind picks the defaults-floor runner).
     pub fn install(
         &self,
         path: &Path,
         prefix: &str,
         name: Option<&str>,
-        kind: AppKind,
+        kind: Option<AppKind>,
         artifact: ArtifactKind,
     ) -> Result<InstallOutcome, InstallError> {
         if !slug::is_valid_slug(prefix) {
@@ -407,6 +412,10 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
     /// write — a missing manual add or an unslugifiable label aborts the
     /// whole review, never a partial registration.
     ///
+    /// `kind` follows the install flag's rule: `None` (no `--kind`) gives a
+    /// new entry [`AppKind::DEFAULT`] and leaves an updated entry's kind
+    /// alone (#40).
+    ///
     /// Each registration also derives the entry's launcher artifacts
     /// (desktop integration, #33): any failure surfaces after the tree
     /// write — re-run the command or `desktop sync` to re-derive.
@@ -415,7 +424,7 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         session: &InstallOutcome,
         keep: &[Candidate],
         add: &[PathBuf],
-        kind: AppKind,
+        kind: Option<AppKind>,
     ) -> Result<Vec<InstallResult>, InstallError> {
         // Pre-flight: canonicalize every exe (the identity and existence
         // check), dedupe within the review, and judge every slug — all
@@ -475,7 +484,7 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         &self,
         canonical: &Path,
         prefix_slug: &str,
-        kind: AppKind,
+        kind: Option<AppKind>,
         base: &str,
         explicit_name: bool,
     ) -> Result<InstallResult, InstallError> {
@@ -484,9 +493,9 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
 
     /// The one-entry registration shared by the standalone branch (#27)
     /// and the session review (#31): identity is the canonical exe path —
-    /// an existing entry with the same exe is updated in place (kind,
-    /// prefix binding, this session's source artifact when there is one,
-    /// and — only when the caller names the update — the display name,
+    /// an existing entry with the same exe is updated in place (an explicit
+    /// `kind`, prefix binding, this session's source artifact when there is
+    /// one, and — only when the caller names the update — the display name,
     /// which renames the entry, #33), never duplicated; a fresh entry
     /// takes the deduped slug, the binding prefix, and the source
     /// metadata. Every registration closes with the entry's derived
@@ -496,11 +505,16 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
     /// Cellar" association (#55 — never only a sync-time artifact).
     /// Callers pre-flight: `base` is a pre-slugified display name and
     /// `canonical` a verified exe path.
+    ///
+    /// `kind: None` means the user named no kind: a new entry takes
+    /// [`AppKind::DEFAULT`], and an update keeps the kind the entry
+    /// already carries (#40) — only an explicit flag moves it, mirroring
+    /// how `--name` is guarded.
     fn register_one(
         &self,
         canonical: &Path,
         prefix_slug: &str,
-        kind: AppKind,
+        kind: Option<AppKind>,
         base: &str,
         source_installer: Option<PathBuf>,
         rename: bool,
@@ -518,7 +532,12 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             .find(|app| app.exe == canonical)
         {
             let old_slug = existing.slug.clone();
-            existing.kind = kind;
+            // An omitted `--kind` keeps the entry's kind (#40): kind picks
+            // the defaults-floor runner (Game → Proton, Tool → wine), so a
+            // silent reset would change how the app launches.
+            if let Some(kind) = kind {
+                existing.kind = kind;
+            }
             prefix_slug.clone_into(&mut existing.prefix);
             if source_installer.is_some() {
                 existing.source_installer = source_installer;
@@ -559,7 +578,7 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         let app = AppEntry {
             slug: slug::dedupe_slug(base, &taken),
             exe: canonical.to_path_buf(),
-            kind,
+            kind: kind.unwrap_or(AppKind::DEFAULT),
             prefix: prefix_slug.to_owned(),
             overrides: Overrides::default(),
             runner: None,
@@ -2108,7 +2127,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert!(!result.was_update);
@@ -2128,7 +2147,7 @@ mod tests {
                 Path::new("/games/balatro.exe"),
                 "default",
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Standalone,
             )?)
             .was_update,
@@ -2146,7 +2165,7 @@ mod tests {
             Path::new("/games/game.exe"),
             "default",
             Some("My Game"),
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert_eq!(
@@ -2164,7 +2183,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert!(!first.was_update);
@@ -2172,7 +2191,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Tool,
+            Some(AppKind::Tool),
             ArtifactKind::Standalone,
         )?);
         assert!(second.was_update);
@@ -2191,6 +2210,61 @@ mod tests {
     }
 
     #[test]
+    fn reinstalling_without_an_explicit_kind_keeps_the_entrys_kind() -> Result<(), InstallError> {
+        // #40: kind picks the defaults-floor runner (Game → Proton, Tool →
+        // wine), so a re-install that silently reset it would change how the
+        // app launches. Only an explicit flag moves it — the `--name` rule.
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
+        let first = registered(service.install(
+            Path::new("/games/mytool.exe"),
+            "default",
+            None,
+            Some(AppKind::Tool),
+            ArtifactKind::Standalone,
+        )?);
+        assert_eq!(first.entry.kind, AppKind::Tool);
+        let second = registered(service.install(
+            Path::new("/games/mytool.exe"),
+            "default",
+            None,
+            None,
+            ArtifactKind::Standalone,
+        )?);
+        assert!(second.was_update);
+        assert_eq!(
+            second.entry.kind,
+            AppKind::Tool,
+            "no --kind means keep, not reset to game"
+        );
+        // The other half of the rule: a NEW entry with no kind still gets
+        // the documented default.
+        let fresh = registered(service.install(
+            Path::new("/games/other.exe"),
+            "default",
+            None,
+            None,
+            ArtifactKind::Standalone,
+        )?);
+        assert!(!fresh.was_update);
+        assert_eq!(
+            fresh.entry.kind,
+            AppKind::DEFAULT,
+            "a new entry with no --kind is the blueprint's game default"
+        );
+        // And an explicit kind still moves it, in both directions.
+        let flipped = registered(service.install(
+            Path::new("/games/mytool.exe"),
+            "default",
+            None,
+            Some(AppKind::Game),
+            ArtifactKind::Standalone,
+        )?);
+        assert_eq!(flipped.entry.kind, AppKind::Game, "--kind game flips it");
+        Ok(())
+    }
+
+    #[test]
     fn reinstalling_rebinds_the_prefix() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
         let service = InstallService::new(mock, StubResolver::ok(), StubDesktop::new());
@@ -2198,14 +2272,14 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         let rebound = registered(service.install(
             Path::new("/games/balatro.exe"),
             "games",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert!(rebound.was_update);
@@ -2226,7 +2300,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert!(service.storage.created().is_empty());
@@ -2245,7 +2319,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?);
         assert_eq!(service.storage.created(), ["default"]);
@@ -2263,7 +2337,7 @@ mod tests {
                 Path::new("/games/readme.txt"),
                 "default",
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Standalone
             ),
             Err(InstallError::Storage(StorageError::Invalid(_)))
@@ -2274,7 +2348,7 @@ mod tests {
                 Path::new("/games/balatro.exe"),
                 "../escape",
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Installer
             ),
             Err(InstallError::Storage(StorageError::Invalid(_)))
@@ -2285,7 +2359,7 @@ mod tests {
                 Path::new("/games/balatro.exe"),
                 "default",
                 Some("!!!"),
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Standalone
             ),
             Err(InstallError::Storage(StorageError::Invalid(_)))
@@ -2318,7 +2392,7 @@ mod tests {
             log_path: None,
             artifact: Some(PathBuf::from("/tmp/setup.exe")),
         };
-        let results = service.register_reviewed(&outcome, &candidates, &[], AppKind::Game)?;
+        let results = service.register_reviewed(&outcome, &candidates, &[], Some(AppKind::Game))?;
         assert_eq!(results.len(), 5, "five confirmed candidates, five entries");
         assert!(
             results.iter().all(|result| !result.was_update),
@@ -2363,7 +2437,7 @@ mod tests {
             artifact: Some(PathBuf::from("/tmp/setup.exe")),
         };
         assert_eq!(
-            service.register_reviewed(&outcome, &[], &[], AppKind::Game)?,
+            service.register_reviewed(&outcome, &[], &[], Some(AppKind::Game))?,
             Vec::new(),
             "zero confirmed candidates, zero entries"
         );
@@ -2389,7 +2463,7 @@ mod tests {
             &outcome,
             &[],
             &[PathBuf::from("/prefix/drive_c/tools/helper.exe")],
-            AppKind::Tool,
+            Some(AppKind::Tool),
         )?;
         assert_eq!(results.len(), 1);
         let app = &results[0].entry;
@@ -2420,7 +2494,7 @@ mod tests {
             &outcome,
             &[candidate.clone(), candidate],
             &[PathBuf::from("/prefix/drive_c/game.exe")],
-            AppKind::Game,
+            Some(AppKind::Game),
         )?;
         assert_eq!(results.len(), 1, "the exe registers exactly once");
         assert_eq!(service.storage.list_apps()?.len(), 1);
@@ -2452,7 +2526,8 @@ mod tests {
             log_path: None,
             artifact: Some(PathBuf::from("/tmp/setup.exe")),
         };
-        let results = service.register_reviewed(&outcome, &[candidate], &[], AppKind::Game)?;
+        let results =
+            service.register_reviewed(&outcome, &[candidate], &[], Some(AppKind::Game))?;
         assert_eq!(results.len(), 1);
         assert!(results[0].was_update, "identity stays with the exe path");
         assert_eq!(
@@ -2502,7 +2577,7 @@ mod tests {
                 &outcome,
                 &keep,
                 &[PathBuf::from("/prefix/drive_c/gone.exe")],
-                AppKind::Game,
+                Some(AppKind::Game),
             )
             .expect_err("the missing add aborts the review");
         assert!(
@@ -2532,7 +2607,7 @@ mod tests {
                 &outcome,
                 &[],
                 &[PathBuf::from("/prefix/drive_c/!!!.exe")],
-                AppKind::Game,
+                Some(AppKind::Game),
             ),
             Err(InstallError::Storage(StorageError::Invalid(_)))
         ));
@@ -2578,7 +2653,7 @@ mod tests {
             Path::new("/tmp/setup.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Installer,
         )?;
         assert_eq!(
@@ -2632,7 +2707,7 @@ mod tests {
             Path::new("/tmp/setup.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Installer,
         )?;
         assert!(outcome.registrations.is_empty(), "nothing registers yet");
@@ -2688,7 +2763,7 @@ mod tests {
                 Path::new("/tmp/setup.exe"),
                 "default",
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Installer,
             )
             .expect_err("a failed installer aborts the session");
@@ -2737,7 +2812,7 @@ mod tests {
                     Path::new("/tmp/setup.exe"),
                     "default",
                     None,
-                    AppKind::Game,
+                    Some(AppKind::Game),
                     ArtifactKind::Installer,
                 )
                 .expect_err("resolution fails before any spawn");
@@ -2797,7 +2872,7 @@ mod tests {
             &bundle,
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Archive,
         )?;
         assert!(outcome.registrations.is_empty());
@@ -2843,7 +2918,7 @@ mod tests {
                 &bundle,
                 "default",
                 None,
-                AppKind::Game,
+                Some(AppKind::Game),
                 ArtifactKind::Archive,
             )
             .expect_err("traversal is refused");
@@ -2923,7 +2998,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?;
         assert_eq!(
@@ -2982,7 +3057,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             Some("Poker Night"),
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?;
         assert_eq!(
@@ -3022,14 +3097,14 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?;
         service.install(
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Tool,
+            Some(AppKind::Tool),
             ArtifactKind::Standalone,
         )?;
         assert_eq!(
@@ -3176,7 +3251,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             None,
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?;
         assert_eq!(
@@ -3189,7 +3264,7 @@ mod tests {
             Path::new("/games/balatro.exe"),
             "default",
             Some("Poker Night"),
-            AppKind::Game,
+            Some(AppKind::Game),
             ArtifactKind::Standalone,
         )?;
         assert_eq!(

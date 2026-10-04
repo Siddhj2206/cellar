@@ -99,6 +99,12 @@ pub enum AppKind {
 }
 
 impl AppKind {
+    /// The kind a NEW entry gets when the user named none (blueprint §8:
+    /// `game` is the install default). It is a creation-time default only —
+    /// re-installing an existing entry with no kind given keeps that entry's
+    /// own kind (#40), so this never silently re-flips one.
+    pub const DEFAULT: Self = Self::Game;
+
     /// The human label, e.g. for CLI flags and tables.
     pub const fn as_str(self) -> &'static str {
         match self {
