@@ -25,6 +25,12 @@ pub enum UnresolvedCause {
     /// A configured path was present but not an executable file before the
     /// order fell through — stale configuration, named exactly.
     StaleConfigured { path: PathBuf },
+    /// The order exhausted after reading *named* read-only host roots, and
+    /// those roots held nothing working — the places are named because the
+    /// usual cause is a working install Cellar did not look in the right
+    /// place for, not a missing one (#53). The list is what makes the
+    /// failure debuggable; `runner list` reads the same places.
+    SearchedNothing { searched: Vec<PathBuf> },
 }
 
 /// Failure resolving a runner spec (pre-flight; dispositions per blueprint
@@ -60,11 +66,34 @@ impl ResolveError {
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unresolvable { family, .. } => write!(
-                f,
-                "no {} runner could be resolved — install it or configure a path",
-                family.as_str()
-            ),
+            Self::Unresolvable { family, cause } => match cause {
+                // #53: a named search never tells a user to install what is
+                // already installed — it names the places that were read,
+                // and points at the diagnostic surface that lists what they
+                // did hold.
+                UnresolvedCause::SearchedNothing { searched } => {
+                    write!(
+                        f,
+                        "no {} runner could be resolved — Cellar read {} {} and none held a \
+                         working install, so this is a discovery miss rather than a missing \
+                         install: {}. `cellar runner list` lists every runner Cellar did find, \
+                         and `configured = {{ Path = … }}` pins a prefix to any install by path",
+                        family.as_str(),
+                        searched.len(),
+                        if searched.len() == 1 {
+                            "location"
+                        } else {
+                            "locations"
+                        },
+                        searched_places(searched)
+                    )
+                }
+                _ => write!(
+                    f,
+                    "no {} runner could be resolved — install it or configure a path",
+                    family.as_str()
+                ),
+            },
             Self::NotInstalled { family } => write!(
                 f,
                 "the {} runner is not installed or is corrupt — reinstall it",
@@ -75,6 +104,28 @@ impl fmt::Display for ResolveError {
 }
 
 impl std::error::Error for ResolveError {}
+
+/// Name the places a `SearchedNothing` cause read, in one clause. Long
+/// enough to be true, short enough to stay one line: the first few paths,
+/// then a count for the rest — `cellar runner list` and the JSON shapes are
+/// the exhaustive view.
+fn searched_places(searched: &[PathBuf]) -> String {
+    const NAMED: usize = 3;
+    let named: Vec<String> = searched
+        .iter()
+        .take(NAMED)
+        .map(|path| format!("`{}`", path.display()))
+        .collect();
+    let mut places = named.join(", ");
+    let rest = searched.len().saturating_sub(NAMED);
+    if rest > 0 {
+        use std::fmt::Write as _;
+
+        // Unreachable to fail on: writing into a String.
+        let _ = write!(places, " and {rest} more");
+    }
+    places
+}
 
 /// Failures of the storage port (file-tree CRUD, discovery, installer).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +178,81 @@ impl std::error::Error for StorageError {}
 
 #[cfg(test)]
 mod tests {
-    use super::StorageError;
+    use super::{ProviderMode, RunnerFamily};
+    use super::{ResolveError, StorageError, UnresolvedCause};
+
+    use std::path::PathBuf;
+
+    /// AC (#53): the unresolvable-Proton failure must not tell a user to
+    /// install something that is installed. When the provider can name the
+    /// places it read, it names them instead — that is the debuggable part.
+    #[test]
+    fn a_named_search_never_says_install_it() {
+        let err = ResolveError::Unresolvable {
+            family: RunnerFamily::Proton,
+            cause: UnresolvedCause::SearchedNothing {
+                searched: vec![
+                    PathBuf::from("/home/me/.steam/steam/steamapps/common"),
+                    PathBuf::from("/mnt/games/SteamLibrary/steamapps/common"),
+                ],
+            },
+        };
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("install it"),
+            "a discovery miss is not a missing install: {rendered}"
+        );
+        assert!(
+            rendered.contains("/mnt/games/SteamLibrary/steamapps/common")
+                && rendered.contains("/home/me/.steam/steam/steamapps/common"),
+            "the message names what was not searched: {rendered}"
+        );
+        assert!(
+            rendered.contains("cellar runner list"),
+            "the diagnostic surface is named: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_named_search_counts_the_roots_it_truncates() {
+        let searched = (0..5).map(|n| PathBuf::from(format!("/lib/{n}"))).collect();
+        let rendered = ResolveError::Unresolvable {
+            family: RunnerFamily::Proton,
+            cause: UnresolvedCause::SearchedNothing { searched },
+        }
+        .to_string();
+        assert!(
+            rendered.contains("`/lib/0`") && rendered.contains("and 2 more"),
+            "the tail is counted, not silently dropped: {rendered}"
+        );
+    }
+
+    /// The unnamed causes keep the install/configure wording — only a
+    /// provider that can name its search gets the new message.
+    #[test]
+    fn an_unnamed_search_keeps_the_install_wording() {
+        for cause in [
+            UnresolvedCause::NoneFound {
+                mode: ProviderMode::Managed,
+            },
+            UnresolvedCause::NoneFound {
+                mode: ProviderMode::DiscoverOnly,
+            },
+            UnresolvedCause::StaleConfigured {
+                path: PathBuf::from("/opt/wine"),
+            },
+        ] {
+            let rendered = ResolveError::Unresolvable {
+                family: RunnerFamily::Proton,
+                cause,
+            }
+            .to_string();
+            assert!(
+                rendered.contains("install it"),
+                "an unnamed exhaustion still suggests install/configure: {rendered}"
+            );
+        }
+    }
 
     /// AC (#45): `Invalid` is rendered verbatim, so a validation sentence
     /// reads as itself instead of being framed as a file problem.
