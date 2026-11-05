@@ -58,6 +58,13 @@
 //! stdout keeps yielding clean data under pipes. An omitted version pin
 //! — or the literal `latest` — resolves the provider's newest published
 //! release through its feed (#65) and installs that concrete tag.
+//!
+//! Deleting a populated prefix is no longer silent either (#41):
+//! `prefix delete` names the entries bound to the prefix on stderr and
+//! confirms on a terminal, `--force` skips the question (there is
+//! deliberately no `--no-input` here — a non-TTY cannot be asked, so it
+//! would do nothing), and `list` reports such an entry as `broken-prefix`
+//! rather than `ok`. Both halves are the ADR 0004 amendment recorded there.
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -290,15 +297,22 @@ enum PrefixCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Delete a prefix and exactly its directory.
+    /// Delete a prefix and exactly its directory. When entries still bind to
+    /// it, they are named and the delete is confirmed; `--force` skips the
+    /// question.
     #[command(
         display_name = "cellar",
         arg_required_else_help = true,
-        help_template = "{about-with-newline}Examples:\n  cellar prefix delete my-games\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
+        help_template = "{about-with-newline}Examples:\n  cellar prefix delete my-games\n  cellar prefix delete my-games --force\n{usage-heading}\n    {usage}\n\n{all-args}{after-help}"
     )]
     Delete {
         /// The prefix slug, as shown by `prefix list`.
         name: String,
+        /// Delete without the confirmation question, even when entries still
+        /// bind to the prefix — the scripted form. The bound entries are
+        /// still named on stderr; `--quiet` is what silences that.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1195,15 +1209,131 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 print!("{}", render_prefix_list(&prefixes, json, color)?);
                 Ok(ExitCode::SUCCESS)
             }
-            PrefixCommand::Delete { name } => {
-                let service = PrefixService::new(store.clone());
-                service.delete(&name)?;
-                narrate(quiet, format_args!("Deleted prefix '{name}'"));
-                Ok(ExitCode::SUCCESS)
-            }
+            PrefixCommand::Delete { name, force } => run_prefix_delete(&store, &name, force, quiet),
         },
         Command::Doctor(args) => run_doctor(&store, &desktop, args.json, color),
     }
+}
+
+/// What `cellar prefix delete` does about the entries bound to the prefix
+/// (#41), split from the I/O so the decision is pinnable without a terminal.
+/// The naming always happens when entries are bound — it *is* the warning,
+/// and it is narration, so `--quiet` (not `--force`) is its lever. `ask` is
+/// the y/N question, and only a terminal is ever given one: `--force` and a
+/// non-TTY stdin both skip it, so a script can never block on a read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeleteGate {
+    /// Nothing is bound to the prefix: nothing to name, nothing to ask.
+    Unbound,
+    /// Entries are bound: name them, then ask unless the caller cannot.
+    Bound { slugs: Vec<String>, ask: bool },
+}
+
+/// The pure decision behind [`run_prefix_delete`]: the bound entries as
+/// names, and whether they can be put to a question.
+fn prefix_delete_gate(entries: &[AppEntry], interactive: bool) -> DeleteGate {
+    if entries.is_empty() {
+        return DeleteGate::Unbound;
+    }
+    DeleteGate::Bound {
+        slugs: entries.iter().map(|entry| entry.slug.clone()).collect(),
+        ask: interactive,
+    }
+}
+
+/// The `cellar prefix delete` handler (#41): removing a prefix that entries
+/// still bind to ends those bindings, so they are named — with what it costs
+/// and how to undo it — and the delete is confirmed. Three deliberate
+/// stances:
+///
+/// - **Never refused.** Refusing without `--force` would break every scripted
+///   delete of a populated prefix, and ADR 0004 gives behaviour no
+///   deprecation window.
+/// - **Never silent.** The naming is the warning, and it prints whether the
+///   question was asked, skipped by `--force`, or impossible (no terminal).
+///   `--quiet` is the documented way to ask for no narration.
+/// - **Never a hang.** No terminal, no question: the read never happens.
+///
+/// A declined confirmation is a plain outcome with exit 0, the same shape the
+/// install review's declined registration takes (blueprint §8: nothing
+/// happens without confirmation, and declining is choosing, not failing).
+fn run_prefix_delete(
+    store: &TreeStore,
+    name: &str,
+    force: bool,
+    quiet: bool,
+) -> anyhow::Result<ExitCode> {
+    // Interactive iff stdin is a TTY and `--force` is absent — the same gate
+    // `install` uses, minus `--no-input`: on this command that flag would
+    // change nothing (a non-TTY already cannot be asked), and ADR 0004's
+    // semantics rule refuses a flag that would do nothing.
+    let interactive = std::io::stdin().is_terminal() && !force;
+    let service = PrefixService::new(store.clone());
+    if let DeleteGate::Bound { slugs, ask } =
+        prefix_delete_gate(&service.bound_entries(name)?, interactive)
+    {
+        narrate_err(
+            quiet,
+            format_args!("{}", bound_entries_warning(name, &slugs)),
+        );
+        if ask && !confirm_prefix_delete(name)? {
+            narrate(quiet, format_args!("{}", render_delete_declined()));
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    service.delete(name)?;
+    narrate(quiet, format_args!("Deleted prefix '{name}'"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What a declined `prefix delete` reports, as a function so the wording is
+/// pinnable. Deliberately the shape the install review's declined
+/// registration already uses (blueprint §8: nothing happens without
+/// confirmation, and declining is a choice, not a failure) — and exit 0.
+fn render_delete_declined() -> String {
+    "Deleted nothing — the confirmation was declined".to_owned()
+}
+
+/// The `#41` bound-entry warning, verbatim: how many entries bind to the
+/// prefix, which ones, what deleting costs, and the two ways back. On stderr
+/// (a consequence of the action, not delivered data) and second-person
+/// imperative like every other fix hint in the tree's vocabulary. The second
+/// line speaks of "that prefix" and "the entries" rather than pronouns, so
+/// one wording holds at every count.
+fn bound_entries_warning(slug: &str, slugs: &[String]) -> String {
+    let (binds, subject) = if slugs.len() == 1 {
+        ("binds", "entry")
+    } else {
+        ("bind", "entries")
+    };
+    format!(
+        "{} {subject} {binds} to prefix '{slug}': {}\n\
+         Nothing in that prefix launches once it is gone — recreate it with \
+         `cellar prefix create {slug}`, or uninstall the {subject} with `cellar uninstall <slug>`.",
+        slugs.len(),
+        slugs.join(", ")
+    )
+}
+
+/// The `#41` y/N gate. The warning above has already named the entries and
+/// what the delete costs, so the question carries only the decision; same
+/// shape and same answer vocabulary as [`confirm_registration`] — empty and
+/// `n` decline.
+fn confirm_prefix_delete(slug: &str) -> anyhow::Result<bool> {
+    loop {
+        print!("{}", prefix_delete_prompt(slug));
+        flush_stdout()?;
+        match parse_yes_no(&read_line()?) {
+            Some(answer) => return Ok(answer),
+            None => eprintln!("cellar: answer y or n"),
+        }
+    }
+}
+
+/// The `#41` question, verbatim, as a function so the wording is pinnable:
+/// the prompt itself is written to stdout, which no test owns.
+fn prefix_delete_prompt(slug: &str) -> String {
+    format!("Delete prefix '{slug}' anyway? [y/N]: ")
 }
 
 /// The doctor handler (blueprint §8): the sectioned report — tree health,
@@ -1937,6 +2067,18 @@ fn prompt_artifact_kind(path: &Path) -> anyhow::Result<ArtifactKind> {
     }
 }
 
+/// One y/N answer, in the vocabulary every confirmation in this binary
+/// accepts: empty and `n`/`no` decline, `y`/`yes` confirm, anything else is
+/// re-asked (never guessed). One definition, so the install review's gate
+/// and `prefix delete`'s (#41) can never answer the same prompt differently.
+fn parse_yes_no(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "n" | "no" => Some(false),
+        "y" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
 /// The y/N registration gate for prompted decisions ("nothing registers
 /// without confirmation", blueprint §8).
 fn confirm_registration(count: usize, prefix_slug: &str) -> anyhow::Result<bool> {
@@ -1944,10 +2086,9 @@ fn confirm_registration(count: usize, prefix_slug: &str) -> anyhow::Result<bool>
     loop {
         print!("Register {count} {noun} in prefix '{prefix_slug}'? [y/N]: ");
         flush_stdout()?;
-        match read_line()?.trim().to_ascii_lowercase().as_str() {
-            "" | "n" | "no" => return Ok(false),
-            "y" | "yes" => return Ok(true),
-            _ => eprintln!("cellar: answer y or n"),
+        match parse_yes_no(&read_line()?) {
+            Some(answer) => return Ok(answer),
+            None => eprintln!("cellar: answer y or n"),
         }
     }
 }
@@ -2127,13 +2268,20 @@ fn runner_for(entry: &AppEntry, prefix_runner: Option<&cellar_core::RunnerSpec>)
     entry.kind.default_family().as_str().to_owned()
 }
 
-/// The status cell's color signal: `ok` green, `missing-exe` amber; an
-/// unknown future status fails closed to red — the table's only colored
-/// column (plain under a pipe or `NO_COLOR`).
+/// The status cell's color signal: `ok` green, `missing-exe` amber,
+/// `broken-prefix` red (#41 — the entry cannot launch at all, which is worse
+/// than a missing exe); an unknown future status fails closed to red too —
+/// the table's only colored column (plain under a pipe or `NO_COLOR`).
+// `broken-prefix` deliberately repeats the wildcard's arm rather than being
+// left to it: a value someone chose for this table should be *named* here,
+// so the next reader sees the decision instead of inferring it from a
+// catch-all, and a future status that is not red has somewhere obvious to go.
+#[allow(clippy::match_same_arms)]
 fn status_color(status: &str) -> &'static str {
     match status {
         "ok" => GREEN,
         "missing-exe" => YELLOW,
+        "broken-prefix" => RED,
         _ => RED,
     }
 }
@@ -2407,6 +2555,115 @@ mod tests {
     }
 
     #[test]
+    fn prefix_delete_parses_force_and_refuses_a_do_nothing_no_input() {
+        // #41: `--force` is the non-interactive skip, and it is the *only*
+        // lever. `--no-input` is deliberately absent here: a non-TTY stdin
+        // already cannot be asked, so the flag would do nothing on this
+        // command — and ADR 0004's semantics rule refuses a flag that would
+        // do nothing (it is a usage error, not silently accepted).
+        let cli = Cli::try_parse_from(["cellar", "prefix", "delete", "games", "--force"])
+            .unwrap_or_else(|e| panic!("parse: {e}"));
+        let Command::Prefix(PrefixArgs {
+            command: PrefixCommand::Delete { name, force },
+        }) = cli.command
+        else {
+            panic!("unexpected command");
+        };
+        assert_eq!(name, "games");
+        assert!(force, "--force parses");
+        assert!(
+            Cli::try_parse_from(["cellar", "prefix", "delete", "games", "--no-input"]).is_err(),
+            "there is no --no-input on prefix delete — the TTY check is the lever"
+        );
+    }
+
+    #[test]
+    fn prefix_delete_asks_only_when_somebody_can_answer() {
+        // #41: warn-then-confirm, and never a hang. `--force` (or a piped
+        // stdin — the caller decides via `interactive`) skips the question;
+        // the *naming* is the warning and happens either way.
+        let entries = [
+            listed_entry("balatro", AppKind::Game, EntryStatus::Ok).entry,
+            listed_entry("helper", AppKind::Tool, EntryStatus::Ok).entry,
+        ];
+        assert_eq!(
+            prefix_delete_gate(&[], true),
+            DeleteGate::Unbound,
+            "nothing bound asks nothing"
+        );
+        assert_eq!(
+            prefix_delete_gate(&entries, true),
+            DeleteGate::Bound {
+                slugs: vec!["balatro".to_owned(), "helper".to_owned()],
+                ask: true,
+            },
+            "a terminal is asked, and the entries are named by slug"
+        );
+        assert_eq!(
+            prefix_delete_gate(&entries, false),
+            DeleteGate::Bound {
+                slugs: vec!["balatro".to_owned(), "helper".to_owned()],
+                ask: false,
+            },
+            "without a terminal the read never happens"
+        );
+    }
+
+    #[test]
+    fn the_bound_entry_warning_is_pinned_verbatim() {
+        // #41's whole user-visible surface, pinned: the count, the slugs,
+        // the consequence, and both ways back. A drifted word here is the
+        // difference between a warning and a shrug.
+        assert_eq!(
+            bound_entries_warning("work", &["tool".to_owned()]),
+            "1 entry binds to prefix 'work': tool\n\
+             Nothing in that prefix launches once it is gone — recreate it with \
+             `cellar prefix create work`, or uninstall the entry with `cellar uninstall <slug>`."
+        );
+        assert_eq!(
+            bound_entries_warning("work", &["helper".to_owned(), "tool".to_owned()]),
+            "2 entries bind to prefix 'work': helper, tool\n\
+             Nothing in that prefix launches once it is gone — recreate it with \
+             `cellar prefix create work`, or uninstall the entries with `cellar uninstall <slug>`."
+        );
+        assert_eq!(
+            prefix_delete_prompt("work"),
+            "Delete prefix 'work' anyway? [y/N]: ",
+            "the question names the prefix and defaults to declining"
+        );
+    }
+
+    #[test]
+    fn the_confirmation_vocabulary_is_shared_by_every_gate() {
+        // Both y/N gates read one answer vocabulary: declining is the empty
+        // line as well as `n`, and a typo is re-asked rather than guessed.
+        for declined in ["", "  ", "n", "no", "N", "NO"] {
+            assert_eq!(parse_yes_no(declined), Some(false), "{declined:?} declines");
+        }
+        for confirmed in ["y", "yes", "Y", "YES", " Yes "] {
+            assert_eq!(
+                parse_yes_no(confirmed),
+                Some(true),
+                "{confirmed:?} confirms"
+            );
+        }
+        assert_eq!(parse_yes_no("maybe"), None, "never guessed");
+    }
+
+    #[test]
+    fn a_declined_confirmation_deletes_nothing() {
+        // #41: the gate's whole value is that "no" is honoured — the decline
+        // path is a plain outcome (exit 0, `Deleted nothing`), the same shape
+        // the install review's declined registration takes.
+        let answer = parse_yes_no("no").expect("a decision");
+        assert!(!answer, "declining must not delete");
+        assert!(
+            render_delete_declined().contains("Deleted nothing — the confirmation was declined"),
+            "and it says so in the same vocabulary as the review's decline"
+        );
+    }
+
+    #[test]
     fn usage_errors_exit_with_code_two() {
         assert!(Cli::try_parse_from(["cellar", "prefix", "bogus"]).is_err());
         assert!(Cli::try_parse_from(["cellar"]).is_err());
@@ -2526,6 +2783,10 @@ mod tests {
     fn status_colors_map_known_statuses_and_fail_closed() {
         assert_eq!(status_color("ok"), "32");
         assert_eq!(status_color("missing-exe"), "33");
+        // #41: an unreadable bound prefix is red on purpose — the entry
+        // cannot launch at all, which is strictly worse than a missing exe —
+        // and it is named rather than left to the fail-closed fallback.
+        assert_eq!(status_color("broken-prefix"), "31");
         assert_eq!(status_color("broken-future-status"), "31");
     }
 
@@ -3550,6 +3811,25 @@ mod tests {
     }
 
     #[test]
+    fn an_orphans_prefix_renders_as_broken_prefix_in_both_renderings() -> anyhow::Result<()> {
+        // #41: the value has to be *visible* — the human table is where the
+        // lie used to be read, and the `--json` shape is contractual
+        // (`docs/cli-json.md`), so both must carry the same word.
+        let listed = listed_entry("balatro", AppKind::Game, EntryStatus::PrefixBroken);
+        let human = render_app_list(std::slice::from_ref(&listed), false, false)?;
+        assert!(
+            human.contains("broken-prefix"),
+            "the table names the unreadable prefix:\n{human}"
+        );
+        let json = render_app_list(&[listed], true, false)?;
+        assert!(
+            json.contains("\"status\": \"broken-prefix\""),
+            "and the machine shape carries the same value:\n{json}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn runner_column_honors_override_then_prefix_default_then_preset() {
         let entry = listed_entry("balatro", AppKind::Game, EntryStatus::Ok).entry;
         assert_eq!(
@@ -3676,6 +3956,66 @@ mod tests {
         assert_eq!(service.list()?.len(), 2);
         service.delete("my-games")?;
         assert_eq!(service.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_populated_prefix_leaves_list_reporting_broken_prefix() -> anyhow::Result<()> {
+        // #41, end to end on a real tree: the issue's transcript. The delete
+        // succeeds (never refused — scripted deletes keep working), the gate
+        // names what it orphaned, and `list` stops claiming the orphan can
+        // launch. One test for both halves of the same defect.
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cellar-cli-e2e-orphan-{}-{seq}",
+            std::process::id()
+        ));
+        let store = TreeStore::new(root.clone());
+        PrefixService::new(store.clone()).create("work")?;
+        let exe = root.join("drive_c/tool.exe");
+        std::fs::create_dir_all(exe.parent().unwrap_or(Path::new(".")))
+            .unwrap_or_else(|e| panic!("mkdir: {e}"));
+        std::fs::write(&exe, "MZ").unwrap_or_else(|e| panic!("write: {e}"));
+        let service = InstallService::new(
+            store.clone(),
+            ResolverSet::new(all_resolvers(&store.data_root().join("runtime"))),
+            test_desktop(&store),
+        );
+        only_registration(service.install(
+            &exe,
+            "work",
+            None,
+            Some(AppKind::Tool),
+            ArtifactKind::Standalone,
+        )?);
+
+        // The gate reads the same binding launch does: one entry, named.
+        let prefixes = PrefixService::new(store.clone());
+        assert_eq!(
+            prefixes
+                .bound_entries("work")?
+                .iter()
+                .map(|app| app.slug.as_str())
+                .collect::<Vec<_>>(),
+            ["tool"],
+            "the entry bound to the prefix is what the delete would orphan"
+        );
+        prefixes.delete("work")?;
+        assert!(
+            !store.prefix_dir("work").exists(),
+            "exactly that prefix's directory is gone"
+        );
+        let listed = service.list()?;
+        assert_eq!(
+            listed[0].status,
+            EntryStatus::PrefixBroken,
+            "#41: the orphan no longer reads `ok` — that was the lie"
+        );
+        let human = render_app_list(&listed, false, false)?;
+        assert!(
+            human.contains("broken-prefix"),
+            "and the everyday surface says so:\n{human}"
+        );
         Ok(())
     }
 

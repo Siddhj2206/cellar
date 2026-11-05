@@ -124,9 +124,19 @@ game's, and pass through untouched.
 
 ## Listing and removing — `cellar list`, `cellar uninstall`
 
-`cellar list` shows every registered app: slug, kind, prefix, runner, and status. A status of
-`missing-exe` means the registered executable was deleted or moved on disk — re-register it or
-uninstall the entry.
+`cellar list` shows every registered app: slug, kind, prefix, runner, and status. The status says
+whether the app can launch:
+
+- `ok` — the bound prefix reads and the registered executable is there.
+- `missing-exe` — the registered executable was deleted or moved on disk — re-register it or
+  uninstall the entry.
+- `broken-prefix` — the prefix the app binds to cannot be read at all: its directory is gone
+  (usually a `prefix delete`) or its `prefix.toml` is damaged. Nothing in that prefix launches;
+  recreate the prefix with `cellar prefix create <slug>`, or uninstall the entry. When both this
+  and `missing-exe` apply, this one is reported — it is the first thing a launch fails on.
+
+New status values may be added over time, so a script should treat anything that is not `ok` as
+"needs attention" rather than matching an exact list.
 
 `cellar uninstall <slug>` removes the entry, its per-app overrides, and the app's launcher entry and
 cached icon. **Cellar never deletes the app's own files** — they stay until you remove them.
@@ -138,6 +148,25 @@ cellar prefix create my-games     # slugified; clashes dedupe as my-games-2
 cellar prefix list                # defaults shown; --json available
 cellar prefix delete my-games     # removes exactly this prefix's directory
 ```
+
+Deleting a prefix that apps still bind to ends those bindings, so Cellar names them and asks
+first:
+
+```
+2 entries bind to prefix 'work': balatro, tool
+Nothing in that prefix launches once it is gone — recreate it with `cellar prefix create work`, or uninstall the entries with `cellar uninstall <slug>`.
+Delete prefix 'work' anyway? [y/N]:
+```
+
+Answering no deletes nothing and exits 0. Two things to know about the non-interactive case:
+
+- **It never refuses.** `cellar prefix delete work` deletes the prefix whether or not anything is
+  bound to it — the entries are announced on stderr, not used to block you.
+- **It never hangs.** With no terminal to ask on (a script, a pipe), there is no question; the
+  announcement is the whole report and the delete proceeds. `--force` is the flag that skips the
+  question when you *do* have a terminal, and it is the only such flag — `--no-input` does not
+  exist on this command because there is nothing left for it to suppress. `--quiet` silences the
+  announcement along with all other narration.
 
 Each prefix is a directory under `prefixes/<slug>/` containing a hand-editable `prefix.toml` next to
 the actual Wine environment (`drive_c`). Defaults apply to every app bound to the prefix unless the
@@ -232,6 +261,8 @@ scriptable health check.
   and errors still print.
 - `--json` on `list`, `prefix list`, `runner list`, `doctor`, and `launch --dry-run`; shapes are
   contractual and documented in [`cli-json.md`](cli-json.md).
+- `list`'s `status` values are an open set — treat anything that is not `ok` as needing attention
+  rather than matching an exact list.
 - Color appears only on a terminal without `NO_COLOR`; piped stdout is always plain.
 - `-h/--help` and `--version` work on every command; help leads with examples.
 

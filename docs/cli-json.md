@@ -12,7 +12,13 @@ when absent (`skip_serializing_if`), except where noted — the samples below sh
 ## `cellar list --json`
 
 One object per registered app: the entry's fields plus its current `status` (the check phase's
-verdict: `"ok"` or `"missing-exe"`).
+verdict: `"ok"`, `"missing-exe"`, or `"broken-prefix"`).
+
+`"broken-prefix"` (#41) means the entry's bound prefix cannot be read — its directory is gone (a
+deleted prefix) or its `prefix.toml` is unreadable hand-edit damage. The app cannot launch at all.
+It outranks `"missing-exe"` when both hold (a deleted prefix directory takes its exes with it),
+because that is the order the launch pipeline fails in: recreate the prefix with
+`cellar prefix create <slug>`, or uninstall the entry.
 
 ```json
 [
@@ -59,7 +65,7 @@ Vocabulary (the machine tags are the serde defaults — capitalized exactly as s
 | field | values |
 | --- | --- |
 | `kind` | `"game"` \| `"tool"` (`rename_all = "lowercase"`) |
-| `status` | `"ok"` \| `"missing-exe"` |
+| `status` | `"ok"` \| `"missing-exe"` \| `"broken-prefix"` |
 | `overrides.prefix` | string, omitted when absent |
 | `overrides.runner` | a runner spec (below), omitted when absent |
 | `overrides.env` | `{ "VAR": "value" }`, omitted when empty |
@@ -205,3 +211,11 @@ serde-default capitalized tags: `"Display"` (gamescope) → `"Container"` (umu) 
 These shapes are contractual (ADR 0004): scripts may parse them. Fields are added over time;
 renames or removals happen only through deprecation, never silently. The same rules apply to the
 human output contract — exit codes, `--quiet`, and `NO_COLOR` — documented in ADR 0004.
+
+**Open-ended value sets.** `status` is the one field whose *values* grow, not just its fields:
+`"broken-prefix"` joined `"ok"` and `"missing-exe"` in #41 and further values will follow as the
+check phase learns more preconditions. Consumers **MUST** tolerate unknown `status` values —
+treat them as "not `ok`" and let the unknown fall through to a generic branch, never to a
+hard-coded `else` that assumes the last value Cellar shipped. No value is ever renamed or
+withdrawn, so an unknown one is never a rename in disguise. The same rule covers any future
+enumerated value in these shapes.
