@@ -569,7 +569,18 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
                 existing.slug.clone()
             };
             let renamed = existing.slug != old_slug;
-            self.storage.save_app(&existing)?;
+            if renamed {
+                // A rename moves the entry to a *new* file name, so it is
+                // a claim, not an upsert: the dedupe above read a snapshot,
+                // and a concurrent registration may have taken that name in
+                // between. Claiming re-dedupes against the live slug set and
+                // retries rather than clobbering the other entry (#60) —
+                // `renamed_slug`'s `old_slug` exclusion keeps our own file
+                // out of the domain.
+                self.claim_slug(&mut existing, Some(&old_slug))?;
+            } else {
+                self.storage.save_app(&existing)?;
+            }
             if renamed {
                 // The new name is saved first; the old file drops after
                 // — a crash in between leaves a duplicated entry
@@ -593,11 +604,16 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
         } else {
             None
         };
-        // The dedupe domain is every app file stem — a broken hand-edited
-        // entry is sidestepped, never overwritten (ADR 0001).
-        let taken: BTreeSet<String> = self.storage.list_app_slugs()?.into_iter().collect();
-        let app = AppEntry {
-            slug: slug::dedupe_slug(base, &taken),
+        // A fresh entry claims its slug rather than deduping a snapshot
+        // and saving (#60): two processes registering the same display name
+        // used to both compute `base` from the same `list_app_slugs()` and
+        // then overwrite each other, so eight concurrent registrations
+        // collapsed onto one file with zero errors — seven registered exes
+        // with no AppEntry anywhere, invisible to `doctor`. The claim makes
+        // the loser re-dedupe against the live set and retry, the same
+        // shape `create_prefix` already uses for its directory.
+        let mut app = AppEntry {
+            slug: base.to_owned(),
             exe: canonical.to_path_buf(),
             kind: kind.unwrap_or(AppKind::DEFAULT),
             prefix: prefix_slug.to_owned(),
@@ -606,7 +622,7 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             source_installer,
             installed_at: None,
         };
-        self.storage.save_app(&app)?;
+        self.claim_slug(&mut app, None)?;
         let icon = self.desktop.install_icon(&app.exe)?;
         self.desktop
             .create_entry(&app, previous_slug, icon.as_deref())?;
@@ -618,7 +634,16 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             was_update: false,
         })
     }
+}
 
+/// How many times a registration re-dedupes after losing a slug claim
+/// (#60) before giving up loudly. A single loss is normal — a second Cellar
+/// process registering at the same moment — so the bound exists to turn a
+/// pathological name into a refusal, not to bound contention. Far above any
+/// realistic `-2`/`-3` run.
+const MAX_CLAIM_ATTEMPTS: usize = 64;
+
+impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D> {
     /// The entry's slug after a rename: the display name's slug, deduped
     /// against every other app file stem — the entry's own file is being
     /// replaced, so its own name is never a clash.
@@ -630,6 +655,52 @@ impl<S: Storage, R: RunnerResolver, D: DesktopIntegrator> InstallService<S, R, D
             .filter(|taken| taken != &entry.slug)
             .collect();
         Ok(slug::dedupe_slug(base, &taken))
+    }
+
+    /// Claim `entry`'s file name, re-deduping and retrying whenever the
+    /// claim is lost to a concurrent registration (#60).
+    ///
+    /// The first attempt uses `entry.slug` as given; each retry re-reads
+    /// the live slug set and recomputes from `base`, so the sequence is
+    /// `base`, `base-2`, `base-3`, … exactly as a single-process dedupe
+    /// would produce — the fix changes *when* the set is read, not what it
+    /// yields. `excluding` is a slug held off-limits to the dedupe domain:
+    /// the entry's own file during a rename, which is about to be replaced.
+    /// The loop terminates because each lost claim means some other writer
+    /// created the file, so the set grows by at least one each round; a
+    /// pathologically long name exits through `dedupe_slug`'s documented
+    /// `MAX_LEN` overflow, which the claim's validation rejects loudly
+    /// rather than colliding.
+    fn claim_slug(
+        &self,
+        entry: &mut AppEntry,
+        excluding: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let base = entry.slug.clone();
+        // Each lost claim means another writer created the file, so the
+        // recomputed name advances through `base-2`, `base-3`, … The
+        // bound is a backstop, not the expected path: it turns a name that
+        // cannot be claimed (a pathological near-`MAX_LEN` base, say) into
+        // a loud refusal rather than a spin.
+        for _ in 0..MAX_CLAIM_ATTEMPTS {
+            match self.storage.claim_app(entry) {
+                Ok(()) => return Ok(()),
+                // Lost the race — re-dedupe against the current slug set.
+                Err(StorageError::Exists(_)) => {}
+                Err(err) => return Err(err),
+            }
+            let taken: BTreeSet<String> = self
+                .storage
+                .list_app_slugs()?
+                .into_iter()
+                .filter(|slug| Some(slug.as_str()) != excluding)
+                .collect();
+            entry.slug = slug::dedupe_slug(&base, &taken);
+        }
+        Err(StorageError::Invalid(format!(
+            "cannot claim a slug for {base:?} after {MAX_CLAIM_ATTEMPTS} attempts \
+             — every deduped name is already taken"
+        )))
     }
 
     /// The installer branch (blueprint §8 step 2: "installer: run inside
@@ -1739,24 +1810,27 @@ mod tests {
     /// live here, saves and deletes mutate it), canned tree health, and
     /// call recordings for the service calls. `Mutex` interior so the double
     /// meets the port's `Send + Sync` bound.
-    #[derive(Debug)]
+    /// `apps` is shared rather than owned so a test can keep a handle on
+    /// the registry across the service that writes it — the #60 tests
+    /// stand in for a second process claiming a slug mid-registration.
+    #[derive(Debug, Clone)]
     struct MockStorage {
-        created: Mutex<Vec<String>>,
-        deleted: Mutex<Vec<String>>,
+        created: Arc<Mutex<Vec<String>>>,
+        deleted: Arc<Mutex<Vec<String>>>,
         /// `(provider, version)` pairs a `runner install` asked for.
-        install_records: Mutex<Vec<(String, String)>>,
-        prefixes: Mutex<Vec<Prefix>>,
-        apps: Mutex<Vec<AppEntry>>,
+        install_records: Arc<Mutex<Vec<(String, String)>>>,
+        prefixes: Arc<Mutex<Vec<Prefix>>>,
+        apps: Arc<Mutex<Vec<AppEntry>>>,
         /// App slugs claimed by hand-edited files — the dedupe domain.
-        taken_app_slugs: Mutex<Vec<String>>,
+        taken_app_slugs: Arc<Mutex<Vec<String>>>,
         /// Prefix slugs whose file is broken (loads yield `Invalid`).
-        broken_prefixes: Mutex<Vec<String>>,
-        canonicalized: Mutex<Vec<PathBuf>>,
+        broken_prefixes: Arc<Mutex<Vec<String>>>,
+        canonicalized: Arc<Mutex<Vec<PathBuf>>>,
         /// Exe paths that fail the launch check (canonicalize → `NotFound`).
-        missing_exes: Mutex<Vec<PathBuf>>,
+        missing_exes: Arc<Mutex<Vec<PathBuf>>>,
         /// The canned discovery scan (the flat scan's result for the
         /// session's running/extracting branches).
-        candidates: Mutex<Vec<Candidate>>,
+        candidates: Arc<Mutex<Vec<Candidate>>>,
         /// Where per-launch logs go (the real store: the tree's
         /// `cache/launch-logs`); spawn tests point it at a temp dir.
         log_dir: PathBuf,
@@ -1769,16 +1843,16 @@ mod tests {
     impl MockStorage {
         fn new(health: TreeHealth) -> Self {
             Self {
-                created: Mutex::new(Vec::new()),
-                deleted: Mutex::new(Vec::new()),
-                install_records: Mutex::new(Vec::new()),
-                prefixes: Mutex::new(Vec::new()),
-                apps: Mutex::new(Vec::new()),
-                taken_app_slugs: Mutex::new(Vec::new()),
-                broken_prefixes: Mutex::new(Vec::new()),
-                canonicalized: Mutex::new(Vec::new()),
-                missing_exes: Mutex::new(Vec::new()),
-                candidates: Mutex::new(Vec::new()),
+                created: Arc::new(Mutex::new(Vec::new())),
+                deleted: Arc::new(Mutex::new(Vec::new())),
+                install_records: Arc::new(Mutex::new(Vec::new())),
+                prefixes: Arc::new(Mutex::new(Vec::new())),
+                apps: Arc::new(Mutex::new(Vec::new())),
+                taken_app_slugs: Arc::new(Mutex::new(Vec::new())),
+                broken_prefixes: Arc::new(Mutex::new(Vec::new())),
+                canonicalized: Arc::new(Mutex::new(Vec::new())),
+                missing_exes: Arc::new(Mutex::new(Vec::new())),
+                candidates: Arc::new(Mutex::new(Vec::new())),
                 log_dir: PathBuf::from("/mock/cache/launch-logs"),
                 prefix_base: PathBuf::from("/mock/prefixes"),
                 health,
@@ -1979,6 +2053,30 @@ mod tests {
             Ok(())
         }
 
+        /// The exclusive half of the mock's upsert, mirroring the real
+        /// store: the claim is refused when the name is already on disk,
+        /// which in the mock is both a live entry and a hand-edited file
+        /// injected into the dedupe domain (#60). Sequential tests take
+        /// the single-writer path (the claim never loses), so this only
+        /// has to be correct.
+        fn claim_app(&self, app: &AppEntry) -> Result<(), StorageError> {
+            let mut apps = self
+                .apps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let claimed = self
+                .taken_app_slugs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|taken| taken == &app.slug);
+            if claimed || apps.iter().any(|existing| existing.slug == app.slug) {
+                return Err(StorageError::Exists(format!("app {}", app.slug)));
+            }
+            apps.push(app.clone());
+            Ok(())
+        }
+
         fn delete_app(&self, slug: &str) -> Result<(), StorageError> {
             let mut apps = self
                 .apps
@@ -1993,12 +2091,29 @@ mod tests {
             }
         }
 
+        /// The real store reads `apps/`, so the dedupe domain is every live
+        /// entry's slug *plus* the hand-edited ones the tests inject —
+        /// never the injected list alone. That union is what makes a claim
+        /// visible to the next retry (#60): the mock has to model the file
+        /// appearing, not just the caller's original snapshot.
         fn list_app_slugs(&self) -> Result<Vec<String>, StorageError> {
-            Ok(self
-                .taken_app_slugs
+            let mut slugs: BTreeSet<String> = self
+                .apps
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone())
+                .iter()
+                .map(|app| app.slug.clone())
+                .chain(
+                    self.taken_app_slugs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .iter()
+                        .cloned(),
+                )
+                .collect();
+            // Sorted for the same reason the real walk is: deterministic
+            // dedupe output regardless of insertion order.
+            Ok(std::mem::take(&mut slugs).into_iter().collect())
         }
 
         fn canonicalize_exe(&self, path: &Path) -> Result<PathBuf, StorageError> {
@@ -2148,6 +2263,22 @@ mod tests {
         registrations.pop().expect("length asserted above")
     }
 
+    /// Stand in for another process that claimed `slug` in between a
+    /// registration's dedupe snapshot and its write (#60): a live entry
+    /// under that name, owned by a different exe.
+    fn entry_named(slug: &str) -> AppEntry {
+        AppEntry {
+            slug: slug.to_owned(),
+            exe: PathBuf::from("/games/other.exe"),
+            kind: AppKind::Game,
+            prefix: "default".to_owned(),
+            overrides: Overrides::default(),
+            runner: None,
+            source_installer: None,
+            installed_at: None,
+        }
+    }
+
     #[test]
     fn install_registers_a_new_entry_without_executing() -> Result<(), InstallError> {
         let mock = MockStorage::new(healthy_tree());
@@ -2200,6 +2331,108 @@ mod tests {
         assert_eq!(
             result.entry.slug, "my-game-3",
             "-2 dedupe against the slug domain"
+        );
+        Ok(())
+    }
+
+    /// #60: the service dedupes a snapshot, then claims — so the file the
+    /// entry lands in is decided by the claim, not by the snapshot read.
+    /// A registration whose desired slug is already claimed takes the next
+    /// free one instead of overwriting the incumbent.
+    #[test]
+    fn a_registration_whose_slug_is_claimed_takes_the_next_free_one() -> Result<(), InstallError> {
+        let mock = MockStorage::new(healthy_tree());
+        // The slug domain says `mygame` is free...
+        mock.take_app_slugs(&[]);
+        let service = InstallService::new(mock.clone(), StubResolver::ok(), StubDesktop::new());
+        // ...but another process claims it in between. The claim, not the
+        // snapshot, has the last word.
+        mock.claim_app(&entry_named("mygame"))?;
+        let result = registered(service.install(
+            Path::new("/games/game.exe"),
+            "default",
+            Some("Mygame"),
+            Some(AppKind::Game),
+            ArtifactKind::Standalone,
+        )?);
+        assert_eq!(
+            result.entry.slug, "mygame-2",
+            "a lost claim must re-dedupe, never clobber the incumbent"
+        );
+        // The incumbent is intact and readable: a lost claim is a retry
+        // signal, never a silent overwrite.
+        assert_eq!(
+            mock.load_app("mygame")?.exe,
+            PathBuf::from("/games/other.exe"),
+            "the claimed entry must be untouched"
+        );
+        Ok(())
+    }
+
+    /// #60: a rename moves the entry to a *new* file name, so it claims
+    /// rather than upserts. Without that, a rename racing a fresh
+    /// registration of the same name overwrote whichever wrote last.
+    #[test]
+    fn a_rename_whose_slug_is_claimed_takes_the_next_free_one() -> Result<(), InstallError> {
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock.clone(), StubResolver::ok(), StubDesktop::new());
+        let first = registered(service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            None,
+            Some(AppKind::Game),
+            ArtifactKind::Standalone,
+        )?);
+        // Another process claims the name the user is renaming to.
+        mock.claim_app(&entry_named("renamed"))?;
+        let renamed = registered(service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            Some("Renamed"),
+            Some(AppKind::Game),
+            ArtifactKind::Standalone,
+        )?);
+        assert!(renamed.was_update);
+        assert_eq!(
+            renamed.entry.slug, "renamed-2",
+            "a rename must claim its new file name"
+        );
+        // The old file is gone and the other entry survives — the rename
+        // landed somewhere, not on top of the claim.
+        assert!(mock.load_app(&first.entry.slug).is_err());
+        assert_eq!(
+            mock.load_app("renamed")?.exe,
+            PathBuf::from("/games/other.exe")
+        );
+        Ok(())
+    }
+
+    /// The update path keeps its shape (#60): a re-install that does not
+    /// rename is still the plain upsert through `save_app`, so an existing
+    /// entry is refreshed in place rather than deduped onto a new file.
+    #[test]
+    fn a_non_rename_update_still_upserts_its_own_slug() -> Result<(), InstallError> {
+        let mock = MockStorage::new(healthy_tree());
+        let service = InstallService::new(mock.clone(), StubResolver::ok(), StubDesktop::new());
+        let first = registered(service.install(
+            Path::new("/games/balatro.exe"),
+            "default",
+            None,
+            Some(AppKind::Game),
+            ArtifactKind::Standalone,
+        )?);
+        let again = registered(service.install(
+            Path::new("/games/balatro.exe"),
+            "other",
+            None,
+            Some(AppKind::Tool),
+            ArtifactKind::Standalone,
+        )?);
+        assert_eq!(again.entry.slug, first.entry.slug);
+        assert_eq!(
+            mock.list_apps()?.len(),
+            1,
+            "an update must not create a second entry"
         );
         Ok(())
     }

@@ -6,6 +6,8 @@ Amendment (2026-08, implemented in #28): `Storage` gains `prefix_dir()` — pure
 
 Second amendment (2026-08, implemented in #29): `Storage` gains `launch_logs_dir()` — pure layout math for the execute phase's per-launch output (`cache/launch-logs`, blueprint §7: disposable). Same reasoning as `prefix_dir`: layout knowledge stays in the adapter, sealed methods are non-breaking, still exactly five sealed traits.
 
+Third amendment (2026-10, implemented in #60): `Storage` gains `claim_app()` — the exclusive create behind a new app-file name (ADR 0001's claim). A port method rather than an app-service helper because the claim *is* a filesystem primitive, the same way `create_prefix`'s directory is: putting it in `app` would mean the retry loop asked the adapter to re-derive a policy the port owns. Still a non-breaking sealed addition, still exactly five sealed traits.
+
 Cellar's extension surface is exactly five sealed traits in `core::ports` — `RunnerResolver`, `ManagedRunner` (declarative `manifest()`; Managed vs Discover-only is trait membership), `WrapperContributor` (with a `Layer` enum ordering the chain; env contracts are wrapper data, not launch machinery), `Storage` (file-tree mapping, `.lnk` discovery, and the shared `Installer` pipeline under one port — one external system, one port), and `DesktopIntegrator` — implemented by the provider crates, `cellar-storage`, and `cellar-desktop`. Install strategies, components, runtime plugins, and any `Platform` abstraction are deliberately not ports. Cellar is Linux-first; a future macOS edition enters through the existing seams (additive provider crates, per-platform storage/desktop implementations), never a platform trait.
 
 ## Considered options
