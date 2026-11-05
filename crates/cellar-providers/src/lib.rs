@@ -142,27 +142,17 @@ pub fn steam_protons() -> Vec<SteamProton> {
 
 /// The Steam compatibility-dir discovery roots (research #18: the
 /// `compatibilitytools.d` layout and Steam's own `common/Proton *`
-/// installs) derived from the environment — host state the proton
-/// provider reads read-only.
+/// installs; widened in #53 to Flatpak Steam and to every library Steam
+/// records in `libraryfolders.vdf`) — the proton provider's own root
+/// derivation, delegated rather than restated: one place decides where
+/// discovery looks, so `runner list`'s rows and the launch resolver can
+/// never enumerate different roots.
+///
+/// The validated core resolution (#61) still governs: no `$PWD`-relative
+/// fallback, and a misconfigured environment yields *fewer* roots, never a
+/// wrong one.
 pub fn steam_roots() -> Vec<std::path::PathBuf> {
-    // The validated core resolution (#61): no $PWD-relative fallback.
-    // When the environment is misconfigured the scan roots are simply
-    // absent — the CLI's own store construction has already died with
-    // exit 2 by the time anything reaches here.
-    let Ok(data) = cellar_core::xdg::data_home() else {
-        return Vec::new();
-    };
-    let mut roots = vec![data.join("Steam").join("compatibilitytools.d")];
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(
-            std::path::PathBuf::from(home)
-                .join(".steam")
-                .join("steam")
-                .join("steamapps")
-                .join("common"),
-        );
-    }
-    roots
+    cellar_provider_proton::steam_roots_from_env()
 }
 
 #[cfg(test)]
@@ -240,6 +230,33 @@ mod tests {
         let resolver_ids: Vec<_> = all_resolvers(&runtime).iter().map(|r| r.id()).collect();
         assert_eq!(resolver_ids, ["proton", "umu", "wine"]);
         assert_eq!(all_managed().len(), 2);
+    }
+
+    #[test]
+    fn the_registry_does_not_restate_the_steam_roots() {
+        // #53's premise was a *list of two* roots drifting away from
+        // Steam's real layout. One authority now decides where discovery
+        // looks, so the rows `runner list` shows and the roots the resolver
+        // scans cannot diverge — this fails if anyone re-inlines a list
+        // here.
+        assert_eq!(
+            steam_roots(),
+            cellar_provider_proton::steam_roots_from_env()
+        );
+    }
+
+    #[test]
+    fn discovered_steam_protons_are_unique() {
+        // The dedupe runs on canonical paths (#53): whatever this host has
+        // — symlinked roots, several libraries — one install is one row.
+        let mut seen = std::collections::HashSet::new();
+        for proton in steam_protons() {
+            let dir = std::fs::canonicalize(&proton.dir).unwrap_or_else(|_| proton.dir.clone());
+            assert!(
+                seen.insert(dir.clone()),
+                "duplicate discover-only row: {dir:?}"
+            );
+        }
     }
 
     #[test]
